@@ -297,6 +297,24 @@ def test_agent_replies_to_persona_alias_prefix_as_direct_address(tmp_path):
     assert len(model.messages) == 1
 
 
+def test_agent_rewrites_dead_end_status_echo(tmp_path):
+    agent, _store, model = build_agent_with_profile(
+        tmp_path,
+        "- 姓名：楠霜楠灯。\n- 常用称呼：楠、楠楠、楠灯、nanato、楠bot。\n",
+    )
+    model.replies = ["下班了啊", "下班了就歇会吧"]
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="tester", message="nanato 我下班了"))
+
+    assert result.action == "reply"
+    assert result.reply == "下班了就歇会吧"
+    assert result.metadata["interaction_plan"]["message_kind"] == "life_status"
+    assert result.metadata["quality_review"]["rewrite_needed"]
+    assert result.metadata["quality_rewrite_used"]
+    assert result.metadata["pre_quality_reply"] == "下班了啊"
+    assert len(model.messages) == 2
+
+
 def test_agent_does_not_treat_alias_in_prompt_injection_as_direct_call(tmp_path):
     agent, _store, model = build_agent_with_profile(
         tmp_path,

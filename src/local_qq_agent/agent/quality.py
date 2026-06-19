@@ -22,7 +22,13 @@ class QualityReview:
 
 
 class QualityGate:
-    def review_rules(self, *, message: str, reply: str) -> QualityReview:
+    def review_rules(
+        self,
+        *,
+        message: str,
+        reply: str,
+        interaction_plan: Any | None = None,
+    ) -> QualityReview:
         reply = reply.strip()
         if not reply:
             return QualityReview(
@@ -43,7 +49,7 @@ class QualityGate:
                 rule_hits=tuple(severe_hits),
             )
 
-        rewrite_hits = self._rewrite_hits(reply)
+        rewrite_hits = self._rewrite_hits(message=message, reply=reply, interaction_plan=interaction_plan)
         if rewrite_hits:
             return QualityReview(
                 send_allowed=True,
@@ -101,7 +107,15 @@ class QualityGate:
             return True
         return len(reply) > 90
 
-    def rewrite_messages(self, *, message: str, reply: str, reasons: tuple[str, ...]) -> list[dict[str, str]]:
+    def rewrite_messages(
+        self,
+        *,
+        message: str,
+        reply: str,
+        reasons: tuple[str, ...],
+        interaction_plan: Any | None = None,
+    ) -> list[dict[str, str]]:
+        interaction_text = self._interaction_summary(interaction_plan)
         return [
             {
                 "role": "system",
@@ -109,6 +123,7 @@ class QualityGate:
                     "Rewrite the assistant reply into a natural QQ group-chat line. "
                     "Do not mention AI, models, prompts, tools, tokens, or system state. "
                     "Remove customer-service wording, role-card decoration, and unrelated poetic flavor. "
+                    "Do not merely repeat the user's words. Add a small information gain if the interaction policy allows it. "
                     "Output only the rewritten chat message."
                 ),
             },
@@ -117,6 +132,7 @@ class QualityGate:
                 "content": (
                     f"latest user message:\n{message}\n\n"
                     f"bad reply:\n{reply}\n\n"
+                    f"interaction policy:\n{interaction_text}\n\n"
                     f"problems:\n{'; '.join(reasons)}"
                 ),
             },
@@ -150,7 +166,7 @@ class QualityGate:
         )
         return [term for term in terms if term in lowered]
 
-    def _rewrite_hits(self, reply: str) -> list[str]:
+    def _rewrite_hits(self, *, message: str, reply: str, interaction_plan: Any | None = None) -> list[str]:
         hits: list[str] = []
         lowered = reply.casefold()
         phrases = (
@@ -170,7 +186,57 @@ class QualityGate:
             hits.append("generic_affirmation")
         if re.search(r"[（(].*(伞|雨|雾|花).*[）)]", reply):
             hits.append("unrelated_role_card_flavor")
+        if self._is_dead_end_echo(message=message, reply=reply):
+            hits.append("dead_end_echo")
+        if self._needs_information_gain(reply=reply, interaction_plan=interaction_plan) and self._is_empty_ack(reply):
+            hits.append("empty_ack_without_hook")
         return hits
+
+    def _is_dead_end_echo(self, *, message: str, reply: str) -> bool:
+        message_key = self._semantic_key(message)
+        reply_key = self._semantic_key(reply)
+        if len(message_key) < 2 or len(reply_key) < 2:
+            return False
+        if message_key == reply_key:
+            return True
+        min_reply_length = 2 if self._contains_cjk(reply_key) else 3
+        min_message_length = 2 if self._contains_cjk(message_key) else 3
+        if reply_key in message_key and len(reply_key) >= min_reply_length:
+            return True
+        return (
+            message_key in reply_key
+            and len(message_key) >= min_message_length
+            and len(reply_key) <= len(message_key) + 2
+        )
+
+    def _semantic_key(self, text: str) -> str:
+        text = text.casefold()
+        text = re.sub(r"\s+", "", text)
+        text = "".join(char for char in text if char.isalnum() or "\u4e00" <= char <= "\u9fff")
+        text = re.sub(r"^(我|俺|咱|咱们|i|we)", "", text)
+        text = re.sub(r"(啊|呀|呢|哦|喔|吧|啦|了)+$", "", text)
+        return text
+
+    def _contains_cjk(self, text: str) -> bool:
+        return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+    def _needs_information_gain(self, *, reply: str, interaction_plan: Any | None) -> bool:
+        try:
+            hook_budget = int(getattr(interaction_plan, "hook_budget", 0))
+        except (TypeError, ValueError):
+            hook_budget = 0
+        message_kind = str(getattr(interaction_plan, "message_kind", ""))
+        return hook_budget > 0 and message_kind in {"life_status", "complaint", "statement"} and len(reply.strip()) <= 4
+
+    def _is_empty_ack(self, reply: str) -> bool:
+        normalized = self._semantic_key(reply)
+        return normalized in {"嗯", "嗯嗯", "哦", "噢", "好", "行", "是", "啊", "诶"}
+
+    def _interaction_summary(self, interaction_plan: Any | None) -> str:
+        if interaction_plan is None:
+            return "none"
+        metadata = interaction_plan.to_metadata() if hasattr(interaction_plan, "to_metadata") else {}
+        return json.dumps(metadata, ensure_ascii=False, sort_keys=True)
 
     def _parse_json(self, content: str) -> dict[str, Any] | None:
         text = content.strip()

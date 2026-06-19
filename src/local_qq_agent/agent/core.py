@@ -19,9 +19,10 @@ from local_qq_agent.agent.commands import (
 )
 from local_qq_agent.agent.context import ContextBuilder
 from local_qq_agent.agent.dialogue_state import DialogueState, DialogueStateTracker
+from local_qq_agent.agent.interaction import InteractionPlan, InteractionPolicy
 from local_qq_agent.agent.memory_capture import MemoryCapturePolicy
 from local_qq_agent.agent.persona import PersonaGuard
-from local_qq_agent.agent.quality import QualityGate
+from local_qq_agent.agent.quality import QualityGate, QualityReview
 from local_qq_agent.agent.social_state import SocialStateTracker
 from local_qq_agent.agent.turns import CleanTurn, clean_turn_text
 from local_qq_agent.memory.store import SQLiteMemoryStore
@@ -147,6 +148,7 @@ class LocalAgent:
         self.quality_gate = quality_gate or QualityGate()
         self.memory_capture_policy = MemoryCapturePolicy()
         self.dialogue_state = DialogueStateTracker(store)
+        self.interaction_policy = InteractionPolicy()
         self.placeholder_delay_seconds = 25.0
 
     @property
@@ -891,6 +893,14 @@ class LocalAgent:
         web_query = self._web_query_for_turn(user_name, message, reply_to_bot=reply_to_bot)
         web_context = await self._web_context_for(web_query) if web_query else self._empty_web_context("not_needed_before_provider")
         combined_external_context = self._combined_external_context(external_context, web_context.context)
+        interaction_plan = self._interaction_plan_for(
+            message=message,
+            social_snapshot=social_snapshot,
+            gate=None,
+            dialogue_state=dialogue_state,
+            turn=turn,
+            reply_to_bot=reply_to_bot,
+        )
         thinking_directive = (
             "Provider decision mode: return structured JSON only. "
             "Decide reply/no_reply before writing a reply. "
@@ -903,6 +913,7 @@ class LocalAgent:
             fast_reply=False,
             thinking_directive=thinking_directive,
             dialogue_state=dialogue_state,
+            interaction_plan=interaction_plan,
         )
         decision_messages = [
             *built_context.messages,
@@ -938,6 +949,7 @@ class LocalAgent:
             {"requested_thinking_level": parsed.thinking_level, "thinking_level": 0, "complexity_level": 0},
             turn,
             dialogue_state,
+            interaction_plan,
         )
 
         try:
@@ -1016,6 +1028,16 @@ class LocalAgent:
         action = "reply" if decision.get("action") == "reply" and str(decision.get("reply", "")).strip() else "no_reply"
         reply = self.persona_guard.clean_reply(str(decision.get("reply", "")).strip()) if action == "reply" else ""
         reason = str(decision.get("reason", "provider_decision")).strip() or "provider_decision"
+        quality_metadata: dict[str, Any] = {}
+        if action == "reply":
+            reply, quality_metadata = await self._quality_checked_reply(
+                message=message,
+                reply=reply,
+                interaction_plan=interaction_plan,
+            )
+            if not reply:
+                action = "no_reply"
+                reason = "quality_blocked"
         web_sources = decision.get("sources") if isinstance(decision.get("sources"), list) else []
         if not web_sources and web_context.sources:
             web_sources = [source.to_dict() for source in web_context.sources]
@@ -1025,6 +1047,7 @@ class LocalAgent:
             **common_metadata,
             "cleaned_reply": reply,
             "provider_decision_json": decision,
+            **quality_metadata,
             **web_metadata,
             "web_used": bool(web_metadata.get("web_used")) or provider_used_web,
             "local_time_used": bool(web_metadata.get("local_time_used")),
@@ -1117,6 +1140,14 @@ class LocalAgent:
             model_max_tokens = self._max_tokens_for_thinking(thinking_level)
             thinking_plan = {**thinking_plan, "thinking_level": thinking_level, "pragmatic_raise": True}
 
+        interaction_plan = self._interaction_plan_for(
+            message=message,
+            social_snapshot=social_snapshot,
+            gate=gate,
+            dialogue_state=dialogue_state,
+            turn=turn,
+            reply_to_bot=bool(turn and turn.references_bot),
+        )
         built_context = self.context_builder.build(
             user_name,
             message,
@@ -1124,6 +1155,7 @@ class LocalAgent:
             fast_reply=fast_reply,
             thinking_directive=thinking_directive,
             dialogue_state=dialogue_state,
+            interaction_plan=interaction_plan,
         )
         final_messages = self._final_messages(
             built_context.messages,
@@ -1132,6 +1164,7 @@ class LocalAgent:
             math_context=math_context,
             thinking_directive=thinking_directive,
             dialogue_state=dialogue_state,
+            interaction_plan=interaction_plan,
         )
 
         try:
@@ -1156,6 +1189,7 @@ class LocalAgent:
                     thinking_plan,
                     turn,
                     dialogue_state,
+                    interaction_plan,
                 ),
                 **web_context.to_metadata(),
                 **math_context.to_metadata(),
@@ -1183,6 +1217,16 @@ class LocalAgent:
         reply = self.persona_guard.clean_reply(raw_reply)
         action = "reply" if reply else "no_reply"
         reason = gate.reason if gate else "model_reply"
+        quality_metadata: dict[str, Any] = {}
+        if action == "reply":
+            reply, quality_metadata = await self._quality_checked_reply(
+                message=message,
+                reply=reply,
+                interaction_plan=interaction_plan,
+            )
+            if not reply:
+                action = "no_reply"
+                reason = "quality_blocked"
         metadata = {
             "model": model_reply.model,
             "latency_seconds": round(model_reply.latency_seconds, 3),
@@ -1209,7 +1253,9 @@ class LocalAgent:
                 thinking_plan,
                 turn,
                 dialogue_state,
+                interaction_plan,
             ),
+            **quality_metadata,
             **web_context.to_metadata(),
             **math_context.to_metadata(),
             **placeholder_metadata,
@@ -1234,6 +1280,83 @@ class LocalAgent:
             metadata=metadata,
         )
 
+    def _interaction_plan_for(
+        self,
+        *,
+        message: str,
+        social_snapshot: dict[str, Any] | None,
+        gate: GateDecision | None,
+        dialogue_state: DialogueState | None,
+        turn: CleanTurn | None,
+        reply_to_bot: bool,
+    ) -> InteractionPlan:
+        gate_metadata = gate.to_metadata() if gate else None
+        return self.interaction_policy.plan(
+            message=message,
+            social_snapshot=social_snapshot,
+            gate_metadata=gate_metadata,
+            dialogue_state=dialogue_state,
+            direct_address=self._direct_character_address(message) is not None,
+            reply_to_bot=reply_to_bot or bool(turn and turn.references_bot),
+        )
+
+    async def _quality_checked_reply(
+        self,
+        *,
+        message: str,
+        reply: str,
+        interaction_plan: InteractionPlan,
+    ) -> tuple[str, dict[str, Any]]:
+        review = self.quality_gate.review_rules(
+            message=message,
+            reply=reply,
+            interaction_plan=interaction_plan,
+        )
+        metadata: dict[str, Any] = {
+            "quality_review": review.to_metadata(),
+            "quality_rewrite_used": False,
+        }
+        if not review.send_allowed:
+            return "", metadata
+        if not review.rewrite_needed:
+            return reply, metadata
+
+        metadata["pre_quality_reply"] = reply
+        try:
+            rewrite_reply = await self.final_model_client.chat(
+                self.quality_gate.rewrite_messages(
+                    message=message,
+                    reply=reply,
+                    reasons=review.reasons,
+                    interaction_plan=interaction_plan,
+                ),
+                max_tokens=96,
+            )
+        except Exception as error:
+            metadata["quality_rewrite_error"] = str(error)
+            return ("", metadata) if self._must_rewrite(review) else (reply, metadata)
+
+        rewritten = self.persona_guard.clean_reply(self._reply_from_model_content(rewrite_reply.content))
+        second_review = self.quality_gate.review_rules(
+            message=message,
+            reply=rewritten,
+            interaction_plan=interaction_plan,
+        )
+        metadata.update(
+            {
+                "quality_rewrite_used": True,
+                "quality_rewrite_raw": rewrite_reply.content,
+                "quality_rewrite_reply": rewritten,
+                "quality_second_review": second_review.to_metadata(),
+            }
+        )
+        if rewritten and second_review.send_allowed and not second_review.rewrite_needed:
+            return rewritten, metadata
+        return ("", metadata) if self._must_rewrite(review) else (reply, metadata)
+
+    def _must_rewrite(self, review: QualityReview) -> bool:
+        return bool({"dead_end_echo", "empty_ack_without_hook"} & set(review.rule_hits))
+
     def _base_metadata(
         self,
         user_name: str,
@@ -1249,6 +1372,7 @@ class LocalAgent:
         thinking_plan: dict[str, Any] | None = None,
         turn: CleanTurn | None = None,
         dialogue_state: DialogueState | None = None,
+        interaction_plan: InteractionPlan | None = None,
     ) -> dict[str, Any]:
         command_metadata = self._command_metadata(parsed) if parsed is not None else {}
         plan = thinking_plan or {
@@ -1264,6 +1388,7 @@ class LocalAgent:
                 "count": len(memory_lines),
             },
             "dialogue_state": dialogue_state.to_metadata() if dialogue_state else None,
+            "interaction_plan": interaction_plan.to_metadata() if interaction_plan else None,
             "turn_cleaning": turn.to_metadata() if turn else None,
             "gate_decision": gate.to_metadata() if gate else None,
             "persona_boundary_hit": persona_boundary_hit,
@@ -1683,6 +1808,7 @@ class LocalAgent:
         math_context: MathContext,
         thinking_directive: str,
         dialogue_state: DialogueState | None = None,
+        interaction_plan: InteractionPlan | None = None,
     ) -> list[dict[str, str]]:
         messages = [dict(message) for message in base_messages]
         if len(messages) < 2:
@@ -1690,10 +1816,12 @@ class LocalAgent:
 
         gate_text = gate.to_metadata() if gate else {"action": "reply", "reason": "simulate"}
         dialogue_text = dialogue_state.to_metadata() if dialogue_state else {"obligation": "none"}
+        interaction_text = interaction_plan.to_metadata() if interaction_plan else {"mode": "unspecified"}
         final_instruction = (
             "\n\nAttention gate selected reply. Now write only the final QQ message text.\n"
             f"gate: {json.dumps(gate_text, ensure_ascii=False)}\n"
             f"dialogue_state: {json.dumps(dialogue_text, ensure_ascii=False)}\n"
+            f"interaction_plan: {json.dumps(interaction_text, ensure_ascii=False)}\n"
             f"thinking_directive: {thinking_directive}\n"
             f"web_used: {str(web_context.used).lower()}\n"
             f"web_query: {web_context.query}\n"
@@ -1705,6 +1833,9 @@ class LocalAgent:
             "If dialogue_state says answer_required or repair_required, answer the concrete pending question directly. "
             "If the user asks what/which/kind about what the character said, use recent_agent_replies and recent messages to resolve it. "
             "If the previous answer was unclear or contradictory, repair it naturally; do not dodge, deny the topic, or reinterpret an ordinary object question as abstract without clear evidence. "
+            "Short does not mean dead-end. When interaction_plan hook_budget is above 0, add one small information gain instead of merely repeating the user's words. "
+            "Information gain can be a tiny reaction, concrete detail, light tease, context connection, or one low-pressure follow-up. "
+            "When hook_budget is 0, stay minimal and do not force a new topic. "
             "先读语气和上下文：判断最新消息是认真请求、讽刺、反问、抱怨、玩笑还是试探。"
             "如果一句话表面像技术问题，但上下文已经说明它是在讽刺或表达不满，不要写教程式回答。"
             "讽刺已经清楚时，不能只回一个“诶？”或类似困惑标记；要短短接住真正的矛盾。"
