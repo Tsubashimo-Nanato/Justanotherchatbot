@@ -12,6 +12,7 @@ import unicodedata
 
 from local_qq_agent.agent.commands import parse_message_commands
 from local_qq_agent.agent.context import ContextBuilder
+from local_qq_agent.agent.memory_capture import MemoryCapturePolicy
 from local_qq_agent.agent.persona import PersonaGuard
 from local_qq_agent.agent.quality import QualityGate
 from local_qq_agent.agent.social_state import SocialStateTracker
@@ -137,6 +138,7 @@ class LocalAgent:
         self.feedback_export_path = feedback_export_path or self._default_feedback_export_path()
         self.model_status_provider = model_status_provider or (lambda: {})
         self.quality_gate = quality_gate or QualityGate()
+        self.memory_capture_policy = MemoryCapturePolicy()
 
     @property
     def model_client(self):
@@ -1182,43 +1184,38 @@ class LocalAgent:
         )
 
     def _maybe_store_user_memory(self, user_name: str, message: str) -> None:
-        summary = self._explicit_memory_summary(message)
-        if not summary:
-            summary = self._mapping_memory_summary(message)
-        if not summary:
+        captures = self.memory_capture_policy.capture(message)
+        if not captures:
             return
 
-        self.store.add_memory(
-            kind="fact",
-            summary=f"{user_name}: {summary}",
-            confidence=0.6,
-            metadata={"source": "explicit_user_message"},
-        )
-
-    def _explicit_memory_summary(self, message: str) -> str:
-        for marker in ("记住", "记一下", "remember"):
-            index = message.casefold().find(marker.casefold())
-            if index < 0:
+        saved: list[dict[str, Any]] = []
+        for capture in captures:
+            summary = f"{user_name}: {capture.summary}"
+            if self._memory_summary_exists(summary):
                 continue
-            summary = message[index + len(marker) :].strip(" ：:，,。.")
-            if summary:
-                return summary
-        return ""
+            memory = self.store.add_memory(
+                kind=capture.kind,
+                summary=summary,
+                confidence=capture.confidence,
+                metadata={
+                    **capture.to_metadata(),
+                    "source": "auto_memory_capture",
+                    "user_name": user_name,
+                    "original_message": message[:500],
+                },
+            )
+            saved.append({"id": memory.id, "kind": memory.kind, "summary": memory.summary})
 
-    def _mapping_memory_summary(self, message: str) -> str:
-        match = re.search(
-            r"(?P<key>[A-Za-z0-9_\-\u4e00-\u9fff]{1,24})\s*(?:代表|是|=|:|：|means|is)\s*(?P<value>[0-9][0-9A-Za-z_\-\s,，]*)",
-            message,
-            re.IGNORECASE,
-        )
-        if not match:
-            return ""
+        if saved:
+            self.store.append_event(
+                source="agent",
+                kind="memory_auto_capture",
+                content=f"Captured {len(saved)} memory item(s) from {user_name}",
+                metadata={"user_name": user_name, "memory_ids": [item["id"] for item in saved], "items": saved},
+            )
 
-        key = match.group("key").strip()
-        value = re.sub(r"\s+", " ", match.group("value")).strip(" ，,.。")
-        if not key or not value:
-            return ""
-        return f"{key} represents {value}"
+    def _memory_summary_exists(self, summary: str) -> bool:
+        return any(memory.summary == summary for memory in self.store.search_memories(summary, limit=1))
 
     def _memory_clear_query(self, message: str) -> str:
         text = message.strip()

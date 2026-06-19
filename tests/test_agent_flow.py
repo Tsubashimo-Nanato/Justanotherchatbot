@@ -327,6 +327,36 @@ def test_agent_clears_matching_memory_without_model(tmp_path):
     assert store.recent_events()[-2].kind == "memory_clear"
 
 
+def test_agent_auto_captures_ordinary_user_memory(tmp_path):
+    agent, store = build_agent(tmp_path)
+
+    asyncio.run(agent.simulate(user_name="tester", message="I love eating pasta"))
+    asyncio.run(agent.simulate(user_name="tester", message="I am going to the doctors today"))
+    asyncio.run(agent.simulate(user_name="tester", message="I had curry for dinner"))
+
+    memories = store.recent_memories(limit=10)
+    summaries = [memory.summary for memory in memories]
+    kinds = {memory.summary: memory.kind for memory in memories}
+
+    assert "tester: likes: eating pasta" in summaries
+    assert "tester: plans or current activity: the doctors today" in summaries
+    assert "tester: recent personal context: curry for dinner" in summaries
+    assert kinds["tester: likes: eating pasta"] == "preference"
+    assert kinds["tester: plans or current activity: the doctors today"] == "plan"
+    assert kinds["tester: recent personal context: curry for dinner"] == "working_context"
+    assert any(event.kind == "memory_auto_capture" for event in store.recent_events())
+
+
+def test_agent_dedupes_auto_captured_memory(tmp_path):
+    agent, store = build_agent(tmp_path)
+
+    asyncio.run(agent.simulate(user_name="tester", message="I love eating pasta"))
+    asyncio.run(agent.simulate(user_name="tester", message="I love eating pasta"))
+
+    memories = [memory for memory in store.recent_memories(limit=10) if memory.summary == "tester: likes: eating pasta"]
+    assert len(memories) == 1
+
+
 def test_agent_status_skips_model_and_reports_runtime_state(tmp_path):
     agent, _store = build_agent(tmp_path)
     agent.model_client = FailingModelClient()
