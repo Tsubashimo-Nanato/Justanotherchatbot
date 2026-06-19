@@ -1,0 +1,16 @@
+active_provider: hybrid
+grok:
+  base_url: https://api.x.ai/v1
+  model: grok-4.3
+  timeout_seconds: 180
+  max_tokens: 512
+  enable_web_search: true
+budget:
+  smoke_daily_token_budget: 1000000
+  degrade_at_ratio: 0.8
+runtime:
+  per_message_input_token_budget: 12000
+  enforce_input_budget: true
+safety:
+  require_duplicate_soak_for_cloud_loop: true
+  duplicate_soak_passed: true

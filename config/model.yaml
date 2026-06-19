@@ -1,0 +1,164 @@
+active_profile: qwen3-30b-iq2m-hybrid-high
+profiles:
+  qwen3-14b-q4:
+    provider:
+      base_url: http://127.0.0.1:18080/v1
+      api_key: local-demo
+      model: Qwen3-14B-Q4_K_M
+      timeout_seconds: 90
+    generation:
+      temperature: 0.7
+      top_p: 0.9
+      max_tokens: 96
+      context_tokens_target: 8192
+      context_tokens_fallback: 4096
+    download:
+      repo_id: Qwen/Qwen3-14B-GGUF
+      filename: Qwen3-14B-Q4_K_M.gguf
+      target_path: models/Qwen3-14B-Q4_K_M.gguf
+    server:
+      host: 127.0.0.1
+      port: 18080
+      n_ctx: 8192
+      n_gpu_layers: -1
+      n_batch: 512
+  qwen3-30b-a3b-instruct-2507-q4:
+    provider:
+      base_url: http://127.0.0.1:18080/v1
+      api_key: local-demo
+      model: Qwen3-30B-A3B-Instruct-2507-Q4_K_M
+      timeout_seconds: 150
+    generation:
+      temperature: 0.65
+      top_p: 0.9
+      max_tokens: 160
+      context_tokens_target: 8192
+      context_tokens_fallback: 4096
+    download:
+      repo_id: bartowski/Qwen_Qwen3-30B-A3B-Instruct-2507-GGUF
+      filename: Qwen_Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf
+      target_path: models/Qwen_Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf
+    server:
+      host: 127.0.0.1
+      port: 18080
+      n_ctx: 8192
+      n_gpu_layers: -1
+      n_batch: 512
+  qwen3-30b-a3b-instruct-2507-iq2m:
+    provider:
+      base_url: http://127.0.0.1:18080/v1
+      api_key: local-demo
+      model: Qwen3-30B-A3B-Instruct-2507-IQ2_M
+      timeout_seconds: 120
+    generation:
+      temperature: 0.65
+      top_p: 0.9
+      max_tokens: 160
+      context_tokens_target: 8192
+      context_tokens_fallback: 4096
+    download:
+      repo_id: bartowski/Qwen_Qwen3-30B-A3B-Instruct-2507-GGUF
+      filename: Qwen_Qwen3-30B-A3B-Instruct-2507-IQ2_M.gguf
+      target_path: models/Qwen_Qwen3-30B-A3B-Instruct-2507-IQ2_M.gguf
+    server:
+      host: 127.0.0.1
+      port: 18080
+      n_ctx: 8192
+      n_gpu_layers: -1
+      n_batch: 512
+  qwen3-30b-iq2m-full-gpu:
+    provider:
+      base_url: http://127.0.0.1:18080/v1
+      api_key: local-demo
+      model: Qwen3-30B-A3B-Instruct-2507-IQ2_M
+      timeout_seconds: 120
+    generation:
+      temperature: 0.65
+      top_p: 0.9
+      max_tokens: 160
+      context_tokens_target: 8192
+      context_tokens_fallback: 4096
+    download:
+      repo_id: bartowski/Qwen_Qwen3-30B-A3B-Instruct-2507-GGUF
+      filename: Qwen_Qwen3-30B-A3B-Instruct-2507-IQ2_M.gguf
+      target_path: models/Qwen_Qwen3-30B-A3B-Instruct-2507-IQ2_M.gguf
+    server:
+      host: 127.0.0.1
+      port: 18080
+      n_ctx: 8192
+      n_gpu_layers: -1
+      n_batch: 512
+      threads: 12
+      threads_batch: 24
+  qwen3-30b-iq2m-hybrid-high:
+    provider:
+      base_url: http://127.0.0.1:18080/v1
+      api_key: local-demo
+      model: Qwen3-30B-A3B-Instruct-2507-IQ2_M
+      timeout_seconds: 150
+    generation:
+      temperature: 0.65
+      top_p: 0.9
+      max_tokens: 160
+      context_tokens_target: 8192
+      context_tokens_fallback: 4096
+    download:
+      repo_id: bartowski/Qwen_Qwen3-30B-A3B-Instruct-2507-GGUF
+      filename: Qwen_Qwen3-30B-A3B-Instruct-2507-IQ2_M.gguf
+      target_path: models/Qwen_Qwen3-30B-A3B-Instruct-2507-IQ2_M.gguf
+    server:
+      host: 127.0.0.1
+      port: 18080
+      n_ctx: 8192
+      n_gpu_layers: 36
+      n_batch: 512
+      threads: 12
+      threads_batch: 24
+  qwen3-30b-iq2m-hybrid-medium:
+    provider:
+      base_url: http://127.0.0.1:18080/v1
+      api_key: local-demo
+      model: Qwen3-30B-A3B-Instruct-2507-IQ2_M
+      timeout_seconds: 180
+    generation:
+      temperature: 0.65
+      top_p: 0.9
+      max_tokens: 160
+      context_tokens_target: 8192
+      context_tokens_fallback: 4096
+    download:
+      repo_id: bartowski/Qwen_Qwen3-30B-A3B-Instruct-2507-GGUF
+      filename: Qwen_Qwen3-30B-A3B-Instruct-2507-IQ2_M.gguf
+      target_path: models/Qwen_Qwen3-30B-A3B-Instruct-2507-IQ2_M.gguf
+    server:
+      host: 127.0.0.1
+      port: 18080
+      n_ctx: 8192
+      n_gpu_layers: 20
+      n_batch: 512
+      threads: 12
+      threads_batch: 24
+  qwen3-30b-iq2m-cpu-ram:
+    provider:
+      base_url: http://127.0.0.1:18080/v1
+      api_key: local-demo
+      model: Qwen3-30B-A3B-Instruct-2507-IQ2_M
+      timeout_seconds: 240
+    generation:
+      temperature: 0.65
+      top_p: 0.9
+      max_tokens: 160
+      context_tokens_target: 8192
+      context_tokens_fallback: 4096
+    download:
+      repo_id: bartowski/Qwen_Qwen3-30B-A3B-Instruct-2507-GGUF
+      filename: Qwen_Qwen3-30B-A3B-Instruct-2507-IQ2_M.gguf
+      target_path: models/Qwen_Qwen3-30B-A3B-Instruct-2507-IQ2_M.gguf
+    server:
+      host: 127.0.0.1
+      port: 18080
+      n_ctx: 8192
+      n_gpu_layers: 0
+      n_batch: 512
+      threads: 12
+      threads_batch: 24

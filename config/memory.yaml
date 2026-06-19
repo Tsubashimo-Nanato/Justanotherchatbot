@@ -1,0 +1,12 @@
+database_path: "personality/nanato/memory/runtime/agent_memory.sqlite3"
+recent_event_limit: 30
+memory_search_limit: 8
+long_term_memory_kinds:
+  - "profile"
+  - "relationship"
+  - "preference"
+  - "taboo"
+  - "episode"
+  - "procedural"
+  - "behavior_feedback"
+  - "working_context"

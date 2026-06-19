@@ -1,0 +1,18 @@
+window_title_regex: "QQ"
+expected_group_name: "CHANGE_ME_TEST_GROUP"
+target_sender_name: "CHANGE_ME_TARGET_USER"
+bot_sender_name: "CHANGE_ME_BOT_NAME"
+bot_sender_aliases:
+  - "CHANGE_ME_BOT_ALIAS"
+dry_run: true
+send_requires_armed: true
+verify_after_send: true
+probe_max_depth: 6
+probe_max_children: 450
+poll_interval_seconds: 1.0
+idle_poll_interval_seconds: 5.0
+idle_poll_after_ticks: 3
+max_messages_per_tick: 1
+ignore_existing_on_start: true
+read_timeout_seconds: 8.0
+duplicate_suppression_seconds: 3600.0

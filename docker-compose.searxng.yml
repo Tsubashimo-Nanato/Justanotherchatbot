@@ -1,0 +1,13 @@
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: local-qq-agent-searxng
+    ports:
+      - "127.0.0.1:8888:8080"
+    volumes:
+      - ./docker/searxng:/etc/searxng:rw
+    environment:
+      - BASE_URL=http://127.0.0.1:8888/
+      - INSTANCE_NAME=local-qq-agent
+    restart: unless-stopped
+

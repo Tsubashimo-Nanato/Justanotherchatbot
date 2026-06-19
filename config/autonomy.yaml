@@ -1,0 +1,6 @@
+mode: "manual-demo"
+min_seconds_between_messages: 90
+max_messages_per_hour: 12
+allow_spontaneous_topics: false
+require_human_trigger_for_demo: true
+
