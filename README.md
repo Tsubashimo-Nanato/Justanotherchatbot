@@ -163,6 +163,26 @@ Recent messages from the target user are projected as compact style samples. The
 
 Social profiles are created automatically from visible QQ sender names and interaction events. The debug UI Social panel lists detected users, lets you select one, and edits that user's runtime affinity/profile separately from global mood and global affinity. The target user starts at high affinity by config/runtime seeding; other discovered users start neutral unless memory already says otherwise.
 
+## Automatic Memory Capture
+
+The agent stores every visible QQ turn as an event for short-term context. It also runs a lightweight memory-capture policy over ordinary user messages so users do not have to explicitly say "remember this" for every useful fact.
+
+The first capture policy handles:
+
+- explicit memory requests such as `remember blue means 114514`;
+- symbolic mappings such as `blue means 114514`;
+- durable preferences such as `I love eating pasta`;
+- dated plans or appointments such as `I am going to the doctors today`;
+- short-term personal context such as `I had curry for dinner`.
+
+Stable preferences and plans become durable SQLite memories. Recent meals/status updates become `working_context` memories with lower confidence so they can appear in near-term context without being treated as permanent personality facts. Duplicate summaries are suppressed before writing.
+
+## Slow Reply Placeholders
+
+The QQ loop does not send a waiting line just because a web/tool call is possible. A placeholder is only scheduled for replies predicted to exceed the configured delay window, currently 25 seconds, and it is sent only if the final answer has not completed by then. If the search/model reply finishes before the delay, the placeholder task is cancelled and no extra QQ message is sent.
+
+Placeholders are generic deterministic lines such as `我看一下` or `Let me think`; they are not generated from the user's actual query. This prevents the local placeholder path from hallucinating an answer before the web/tool result is available.
+
 Run-stop logs are `RunSessionLog` artifacts, not raw database dumps. They keep only training-useful events such as clean user messages, bot replies, no-reply decisions, placeholders, behavior feedback, and compact web/tool summaries. They deliberately exclude prompts, API keys, raw provider traces, SQLite dumps, model files, and private reference material.
 
 The current style-learning path is an iteration harness:

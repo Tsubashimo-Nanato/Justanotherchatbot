@@ -77,6 +77,15 @@ def optional_string_tuple(data: dict[str, Any], key: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in value if item.strip())
 
 
+def optional_path(data: dict[str, Any], key: str) -> Path | None:
+    value = data.get(key)
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ConfigError(f"{key} must be a path string")
+    return project_path(value)
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     active_profile: str
@@ -190,6 +199,9 @@ class PersonaConfig:
     style_learning_target_user: str = ""
     base_anchor_weight: str = "normal"
     proactive_topic_bias: float = 0.35
+    style_learning_auto_distill: bool = False
+    style_learning_generated_anchor_path: Path | None = None
+    style_learning_run_log_dir: Path | None = None
 
     @classmethod
     def load(cls, path: str | Path = "config/persona.yaml") -> "PersonaConfig":
@@ -221,6 +233,9 @@ class PersonaConfig:
             style_learning_target_user=str(style_learning.get("target_user", "")).strip(),
             base_anchor_weight=str(style_learning.get("base_anchor_weight", "normal")).strip() or "normal",
             proactive_topic_bias=min(max(optional_float(style_learning, "proactive_topic_bias", 0.35), 0.0), 1.0),
+            style_learning_auto_distill=optional_bool(style_learning, "auto_distill_on_start", False),
+            style_learning_generated_anchor_path=optional_path(style_learning, "generated_anchor_path"),
+            style_learning_run_log_dir=optional_path(style_learning, "run_log_dir"),
         )
 
 
@@ -269,6 +284,9 @@ class QQConfig:
     @classmethod
     def load(cls, path: str | Path = "config/qq.yaml") -> "QQConfig":
         raw = read_yaml(path)
+        local_path = Path(path).with_name(f"{Path(path).stem}.local.yaml")
+        if local_path.exists():
+            raw = {**raw, **read_yaml(local_path)}
         return cls(
             window_title_regex=require_string(raw, "window_title_regex"),
             expected_group_name=str(raw.get("expected_group_name", "")),

@@ -4,6 +4,7 @@ import json
 import math
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -11,6 +12,7 @@ from local_qq_agent.config import ModelConfig, ProviderConfig
 from local_qq_agent.model.openai_client import ModelReply, tokens_per_second
 from local_qq_agent.provider.tracing import ProviderTrace, ProviderTraceStore
 from local_qq_agent.provider.usage import ProviderUsageLedger
+from local_qq_agent.web import WebContext, WebSource
 
 
 DECISION_SCHEMA: dict[str, Any] = {
@@ -150,6 +152,110 @@ class GrokClient:
             payload = dict(payload)
             payload.pop("tools", None)
             return await self._stream_chat_with_compat(payload, trace=trace, operation="decision_retry_no_web")
+
+    async def web_search_context(self, query: str, *, max_tokens: int = 220) -> WebContext:
+        query = " ".join(query.split()).strip()
+        if not query:
+            return WebContext(used=False, query="", context="", reason="empty_query")
+        if not self.api_key:
+            return WebContext(used=False, query=query, context="", reason="xai_api_key_missing", error="XAI_API_KEY is not configured")
+
+        payload = {
+            "model": self.provider_config.grok_model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Use web_search for this current external-fact query. "
+                        "Return a concise evidence summary with any useful source URLs.\n"
+                        f"Query: {query}"
+                    ),
+                }
+            ],
+            "tools": [{"type": "web_search"}],
+            "tool_choice": "required",
+            "max_output_tokens": max_tokens,
+            "store": False,
+            "temperature": self.model_config.temperature,
+            "top_p": self.model_config.top_p,
+        }
+        trace = self.traces.start(
+            provider=self.provider_name,
+            model=self.provider_config.grok_model,
+            operation="web_search",
+            metadata={"query": query, "max_output_tokens": max_tokens, "endpoint": "responses"},
+        )
+        started_at = time.perf_counter()
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        trace.add("api_request_started", "Responses web_search request started.", {"query": query})
+        try:
+            async with httpx.AsyncClient(timeout=self.provider_config.grok_timeout_seconds) as client:
+                response = await client.post(
+                    f"{self.provider_config.grok_base_url}/responses",
+                    headers=headers,
+                    json=payload,
+                )
+            if response.status_code >= 400:
+                body = response.text[:1000]
+                trace.finish(error=body)
+                return WebContext(
+                    used=False,
+                    query=query,
+                    context="",
+                    latency_seconds=round(time.perf_counter() - started_at, 3),
+                    reason="provider_web_search_failed",
+                    error=body,
+                    search_used=True,
+                )
+            data = response.json()
+        except Exception as error:
+            trace.finish(error=str(error))
+            return WebContext(
+                used=False,
+                query=query,
+                context="",
+                latency_seconds=round(time.perf_counter() - started_at, 3),
+                reason="provider_web_search_error",
+                error=str(error),
+                search_used=True,
+            )
+
+        text, sources, tool_calls = _responses_web_context(data)
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        trace.add(
+            "final_output",
+            "Responses web_search completed.",
+            {
+                "usage": usage,
+                "server_side_tool_calls": tool_calls,
+                "source_count": len(sources),
+                "content_preview": text[:800],
+            },
+        )
+        trace.finish()
+        self.usage.record(
+            provider=self.provider_name,
+            model=str(data.get("model", self.provider_config.grok_model)),
+            usage=usage,
+            trace_id=trace.trace_id,
+            operation="web_search",
+        )
+
+        context = _format_provider_web_context(query, text, sources)
+        return WebContext(
+            used=bool(text or sources or tool_calls),
+            query=query,
+            context=context,
+            sources=sources[:8],
+            latency_seconds=round(time.perf_counter() - started_at, 3),
+            reason="provider_responses_web_search",
+            local_time_used=False,
+            search_used=bool(tool_calls or sources),
+            browser_used=False,
+        )
 
     def cloud_loop_preflight(self) -> dict[str, Any]:
         usage = self.usage.snapshot()
@@ -373,6 +479,85 @@ def _json_chunk(data: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return decoded if isinstance(decoded, dict) else None
+
+
+def _responses_web_context(data: dict[str, Any]) -> tuple[str, list[WebSource], int]:
+    output = data.get("output")
+    if not isinstance(output, list):
+        return "", [], 0
+
+    text_parts: list[str] = []
+    source_urls: list[str] = []
+    tool_calls = 0
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "web_search_call":
+            tool_calls += 1
+            action = item.get("action") if isinstance(item.get("action"), dict) else {}
+            for source in action.get("sources", []) or []:
+                if isinstance(source, dict):
+                    url = str(source.get("url", "")).strip()
+                    if url:
+                        source_urls.append(url)
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content", []) or []:
+            if not isinstance(content, dict):
+                continue
+            text = str(content.get("text", "")).strip()
+            if text:
+                text_parts.append(text)
+            for annotation in content.get("annotations", []) or []:
+                if isinstance(annotation, dict):
+                    url = str(annotation.get("url", "")).strip()
+                    if url:
+                        source_urls.append(url)
+
+    text = "\n".join(text_parts).strip()
+    unique_urls = _unique_strings(source_urls)
+    sources = [
+        WebSource(
+            title=_source_title(url),
+            url=url,
+            content=text[:1200],
+            source_type="xai_web_search",
+        )
+        for url in unique_urls
+    ]
+    return text, sources, tool_calls
+
+
+def _format_provider_web_context(query: str, text: str, sources: list[WebSource]) -> str:
+    parts = [f"Provider web search query: {query}"]
+    if text:
+        parts.append("Provider web search summary:\n" + text)
+    if sources:
+        lines = ["Provider web search sources:"]
+        for index, source in enumerate(sources[:8], start=1):
+            lines.append(f"[{index}] {source.title}")
+            lines.append(f"URL: {source.url}")
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts).strip()
+
+
+def _source_title(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return url[:120]
+    return parsed.netloc or url[:120]
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def estimate_input_tokens(messages: list[dict[str, str]]) -> int:

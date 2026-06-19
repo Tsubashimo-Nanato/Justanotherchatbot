@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from local_qq_agent.agent.persona import PersonaGuard
 from local_qq_agent.agent.social_state import SocialStateTracker
@@ -16,6 +17,7 @@ class BuiltContext:
     messages: list[dict[str, str]]
     memory_lines: list[str]
     recent_lines: list[str]
+    dialogue_lines: list[str]
 
 
 class ContextBuilder:
@@ -37,6 +39,7 @@ class ContextBuilder:
         *,
         fast_reply: bool = False,
         thinking_directive: str = "",
+        dialogue_state: Any | None = None,
     ) -> BuiltContext:
         memory_records = self.store.search_memories(user_message, limit=6)
         recent_memories = self.store.recent_memories(limit=6)
@@ -46,6 +49,7 @@ class ContextBuilder:
         memory_lines = self._memory_lines([*memory_records, *recent_memories])
         memory_lines.extend(f"social_state: {line}" for line in social_snapshot.prompt_lines())
         memory_lines.extend(self._style_sample_lines(recent_events))
+        dialogue_lines = list(getattr(dialogue_state, "lines", ()) or ())
         recent_lines = self._recent_conversation_lines(recent_events)
 
         fast_rule = ""
@@ -64,7 +68,13 @@ class ContextBuilder:
             f"{fast_rule}\n"
             f"{thinking_directive}"
         )
-        user_prompt = self._build_user_prompt(user_name, user_message, recent_lines, external_context)
+        user_prompt = self._build_user_prompt(
+            user_name,
+            user_message,
+            recent_lines,
+            external_context,
+            dialogue_lines,
+        )
 
         return BuiltContext(
             messages=[
@@ -73,6 +83,7 @@ class ContextBuilder:
             ],
             memory_lines=memory_lines,
             recent_lines=recent_lines,
+            dialogue_lines=dialogue_lines,
         )
 
     def _memory_lines(self, memories) -> list[str]:
@@ -139,12 +150,15 @@ class ContextBuilder:
         user_message: str,
         recent_lines: list[str],
         external_context: str,
+        dialogue_lines: list[str],
     ) -> str:
         recent_text = "\n".join(recent_lines[-RECENT_CONTEXT_LIMIT:]) if recent_lines else "none"
         external_text = external_context.strip() or "none"
+        dialogue_text = "\n".join(dialogue_lines) if dialogue_lines else "none"
         return (
             "Current group context:\n"
             f"recent messages:\n{recent_text}\n\n"
+            f"dialogue state:\n{dialogue_text}\n\n"
             f"external/tool evidence:\n{external_text}\n\n"
             f"latest sender: {user_name}\n"
             f"latest message: {user_message}\n\n"

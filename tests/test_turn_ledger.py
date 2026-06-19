@@ -74,3 +74,33 @@ def test_turn_ledger_allows_different_clean_turn():
     )
 
     assert ledger.can_enqueue(second, "fp-2")
+
+
+def test_turn_ledger_tracks_wait_and_answer_outputs_once():
+    ledger = TurnLedger(ttl_seconds=3600)
+    turn_id = "sender|hello"
+    ledger.observe(
+        turn_id=turn_id,
+        sender="sender",
+        clean_text="hello",
+        raw_text="hello",
+        fingerprint="fp-1",
+        references_bot=False,
+    )
+
+    assert ledger.can_send_wait(turn_id, "fp-1")
+    ledger.mark_wait_attempted(turn_id, text="one moment")
+    assert not ledger.can_send_wait(turn_id, "fp-1")
+    ledger.mark_wait_result(turn_id, sent=True, result={"sent": True, "reason": "sent"})
+
+    assert ledger.can_send_answer(turn_id, "fp-1")
+    ledger.mark_answer_result(turn_id, sent=True, result={"sent": True, "reason": "sent"}, text="final")
+    assert not ledger.can_send_answer(turn_id, "fp-1")
+
+    summary = ledger.summary()
+    assert summary["response_counts"] == {
+        "wait_attempted": 1,
+        "wait_sent": 1,
+        "answer_attempted": 1,
+        "answer_sent": 1,
+    }

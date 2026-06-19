@@ -109,6 +109,44 @@ def test_debug_is_standalone_command():
     assert parsed.command_suffixes == (".debug",)
 
 
+def test_log_alias_resolves_to_debug_standalone_command():
+    parsed = parse_message_commands(".log")
+
+    assert parsed.diagnostic_requested
+    assert parsed.content == ""
+    assert parsed.command_suffixes == (".debug",)
+    assert parsed.command_resolution_notice == "Command resolved: .log -> .debug"
+    assert parsed.command_resolution["source"] == "alias"
+
+
+def test_log_alias_after_qq_quote_merge_is_standalone_command():
+    parsed = parse_message_commands("quoted old reply\n.log")
+
+    assert parsed.diagnostic_requested
+    assert parsed.content == ""
+    assert parsed.command_suffixes == (".debug",)
+    assert parsed.command_resolution_notice == "Command resolved: .log -> .debug"
+
+
+def test_force_alias_resolves_to_enforce_suffix():
+    parsed = parse_message_commands("answer this .force")
+
+    assert parsed.content == "answer this"
+    assert parsed.enforced
+    assert parsed.command_suffixes == (".enforce",)
+    assert parsed.command_resolution_notice == "Command resolved: .force -> .enforce"
+
+
+def test_combined_debug_force_alias_command_line():
+    parsed = parse_message_commands(".debug .force")
+
+    assert parsed.content == ""
+    assert parsed.diagnostic_requested
+    assert parsed.enforced
+    assert parsed.command_suffixes == (".debug", ".enforce")
+    assert parsed.command_resolution_notice == "Command resolved: .debug .force -> .debug .enforce"
+
+
 def test_status_suffix_is_plain_text():
     parsed = parse_message_commands("show this .status")
 

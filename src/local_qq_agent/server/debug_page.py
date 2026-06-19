@@ -809,15 +809,214 @@ qwen3-30b-iq2m-cpu-ram</textarea>
     function renderOutputLog() {
       const blocks = [];
       for (const entry of outputEntries.values()) {
-        const value = entry.value || {};
-        const operation = value.operation || "log";
-        const state = value.state || "snapshot";
-        const elapsed = value.elapsed_seconds !== undefined ? ` elapsed=${value.elapsed_seconds}s` : "";
-        blocks.push(`=== ${entry.timestamp} ${operation} ${state}${elapsed} ===\\n${JSON.stringify(value, null, 2)}`);
+        blocks.push(formatOutputEntry(entry));
       }
       const element = document.getElementById("output");
       element.textContent = blocks.join("\\n\\n");
       scrollToBottom(element);
+    }
+
+    function formatOutputEntry(entry) {
+      const value = entry.value || {};
+      const operation = value.operation || "log";
+      const state = value.state || "snapshot";
+      const elapsed = value.elapsed_seconds !== undefined ? ` elapsed=${value.elapsed_seconds}s` : "";
+      const lines = [`=== ${entry.timestamp} ${operation} ${state}${elapsed} ===`];
+      lines.push(...summarizeOutputPayload(value));
+      return lines.filter((line) => line !== null && line !== undefined && line !== "").join("\\n");
+    }
+
+    function summarizeOutputPayload(value) {
+      if (!value || typeof value !== "object") {
+        return [String(value ?? "")];
+      }
+      if (value.state === "running") {
+        return [`${value.operation || "operation"} running... ${value.elapsed_seconds ?? "?"}s`];
+      }
+      if (value.state === "error") {
+        return [`error: ${shortLine(value.error || "unknown")}`];
+      }
+
+      const operation = value.operation || "";
+      const result = value.result !== undefined ? value.result : value;
+      if (operation.startsWith("loop_") || result?.recent_decisions || result?.activity) {
+        return summarizeLoopOutput(result);
+      }
+      if (operation === "events" || Array.isArray(result?.events) || Array.isArray(result)) {
+        return summarizeEventsOutput(result);
+      }
+      if (result?.action !== undefined && (result?.reply !== undefined || result?.reason !== undefined)) {
+        return summarizeAgentResult(result);
+      }
+      if (operation === "qq_read") {
+        return summarizeQqRead(result);
+      }
+      if (operation === "qq_send") {
+        return summarizeQqSend(result);
+      }
+      if (operation === "provider_status" || operation === "provider_switch" || operation === "provider_key") {
+        return summarizeProviderOutput(result);
+      }
+      return summarizeGenericOutput(operation, result);
+    }
+
+    function summarizeLoopOutput(result) {
+      const activity = result?.activity || {};
+      const recent = result?.recent_decisions || result?.handled || [];
+      const latest = recent.length ? recent[recent.length - 1] : null;
+      const lines = [
+        `loop: running=${result?.running ?? "?"} stage=${activity.stage || "unknown"}`,
+        `queue: pending=${result?.pending_message_count ?? 0} queued=${result?.queued_message_count ?? 0} inflight=${result?.inflight_message_count ?? 0}`,
+      ];
+      if (activity.sender_name || activity.message_text) {
+        lines.push(`active: ${activity.sender_name || "unknown"}: ${shortLine(activity.message_text || "")}`);
+      }
+      if (activity.detail) {
+        lines.push(`detail: ${shortLine(activity.detail)}`);
+      }
+      if (latest) {
+        lines.push("latest decision:");
+        lines.push(...summarizeDecision(latest).map((line) => `  ${line}`));
+      } else if (result?.reason) {
+        lines.push(`reason: ${shortLine(result.reason)}`);
+      }
+      return lines;
+    }
+
+    function summarizeDecision(decision) {
+      const metadata = decision.metadata || {};
+      const lines = [
+        `from: ${decision.sender_name || "unknown"}`,
+        `msg: ${shortLine(decision.message_text || "")}`,
+        `decision: ${decision.action || "?"} reason=${shortLine(decision.reason || "")}`,
+        `send: ${decision.sent ?? false} ${decision.send_reason || ""}`.trim(),
+      ];
+      const reply = metadata.cleaned_reply || metadata.agent_reply || "";
+      if (reply) {
+        lines.push(`reply: ${shortLine(reply)}`);
+      }
+      const tokenLine = formatTokenLine(metadata);
+      if (tokenLine) {
+        lines.push(tokenLine);
+      }
+      if (metadata.web_used !== undefined || metadata.search_used !== undefined || metadata.web_query) {
+        lines.push(`web: used=${metadata.web_used ?? false} search=${metadata.search_used ?? false} query=${shortLine(metadata.web_query || "")}`);
+      }
+      if (metadata.message_identity) {
+        lines.push(`turn: ${shortLine(metadata.message_identity)}`);
+      }
+      if (metadata.provider_trace_id) {
+        lines.push(`trace: ${metadata.provider_trace_id}`);
+      }
+      return lines;
+    }
+
+    function summarizeAgentResult(result) {
+      const metadata = result.metadata || {};
+      const lines = [
+        `decision: ${result.action || "?"} reason=${shortLine(result.reason || "")}`,
+        `sent: ${result.sent ?? "n/a"}`,
+      ];
+      if (result.reply) {
+        lines.push(`reply: ${shortLine(result.reply)}`);
+      }
+      const tokenLine = formatTokenLine(metadata);
+      if (tokenLine) {
+        lines.push(tokenLine);
+      }
+      if (metadata.web_used !== undefined || metadata.search_used !== undefined || metadata.web_query) {
+        lines.push(`web: used=${metadata.web_used ?? false} search=${metadata.search_used ?? false} query=${shortLine(metadata.web_query || "")}`);
+      }
+      if (metadata.provider_trace_id) {
+        lines.push(`trace: ${metadata.provider_trace_id}`);
+      }
+      return lines;
+    }
+
+    function summarizeEventsOutput(result) {
+      const events = Array.isArray(result) ? result : (result?.events || result?.recent_events || []);
+      if (!Array.isArray(events) || !events.length) {
+        return ["events: none"];
+      }
+      return events.slice(-12).map((event) => {
+        const time = event.created_at || event.timestamp || "";
+        const source = event.source || "";
+        const kind = event.kind || "";
+        const content = event.content || event.message || "";
+        return `${time} ${source} ${kind}: ${shortLine(content)}`.trim();
+      });
+    }
+
+    function summarizeQqRead(result) {
+      return [
+        `group: active=${result?.active_group_name || "unknown"} expected=${result?.expected_group_name || "unset"} matched=${result?.group_matched ?? "?"}`,
+        `messages: visible=${(result?.visible_items || []).length} target=${(result?.target_messages || []).length}`,
+      ];
+    }
+
+    function summarizeQqSend(result) {
+      if (!result?.sent) {
+        return [
+          `send blocked: ${result?.reason || "unknown"}`,
+          `group: active=${result?.verification?.active_group_name || "unknown"} expected=${result?.verification?.expected_group_name || "unset"}`,
+        ];
+      }
+      return [
+        "send: ok",
+        `duration: ${result.duration_seconds ?? "?"}s`,
+        `group: ${result?.verification?.active_group_name || "unknown"}`,
+      ];
+    }
+
+    function summarizeProviderOutput(result) {
+      const provider = result?.provider || result || {};
+      const budget = provider.budget || {};
+      const grok = provider.grok || {};
+      return [
+        `provider: ${provider.active_provider || "unknown"} model=${grok.model || "unknown"}`,
+        `api key: ${grok.api_key_configured ? grok.api_key_masked || "configured" : "missing"}`,
+        `usage: prompt=${formatInteger(budget.prompt_tokens)} completion=${formatInteger(budget.completion_tokens)} total=${formatInteger(budget.total_tokens)}`,
+      ];
+    }
+
+    function summarizeGenericOutput(operation, result) {
+      if (!result || typeof result !== "object") {
+        return [`${operation || "operation"}: ${String(result ?? "done")}`];
+      }
+      const hidden = new Set(["visible_items", "raw", "metadata", "send_result", "verification"]);
+      const keys = Object.keys(result).filter((key) => !hidden.has(key));
+      const lines = [`${operation || "operation"} completed.`];
+      for (const key of keys.slice(0, 8)) {
+        const value = result[key];
+        if (value === null || value === undefined || typeof value === "object") {
+          continue;
+        }
+        lines.push(`${key}: ${shortLine(String(value))}`);
+      }
+      lines.push("raw details: use Logs / Status JSON for full metadata.");
+      return lines;
+    }
+
+    function formatTokenLine(metadata) {
+      if (!metadata) {
+        return "";
+      }
+      const tps = metadata.tokens_per_second || {};
+      const prompt = metadata.prompt_tokens ?? metadata.usage?.prompt_tokens;
+      const completion = metadata.completion_tokens ?? metadata.usage?.completion_tokens;
+      const total = metadata.total_tokens ?? metadata.usage?.total_tokens;
+      if (prompt === undefined && completion === undefined && total === undefined) {
+        return "";
+      }
+      return `tokens: prompt=${prompt ?? "?"} completion=${completion ?? "?"} total=${total ?? "?"} tok/s=${tps.completion_tokens ?? "?"}`;
+    }
+
+    function shortLine(value, maxLength = 220) {
+      const text = String(value ?? "").replace(/\\s+/g, " ").trim();
+      if (text.length <= maxLength) {
+        return text;
+      }
+      return `${text.slice(0, maxLength)}...`;
     }
 
     function showMemory(value) {
@@ -1088,7 +1287,7 @@ qwen3-30b-iq2m-cpu-ram</textarea>
           `completion tok/s: ${tps.completion_tokens ?? "unknown"}`,
           `tokens: prompt ${metadata.prompt_tokens ?? "?"}, completion ${metadata.completion_tokens ?? "?"}, total ${metadata.total_tokens ?? "?"}`,
           "",
-          "Raw model content is in Output JSON: result.metadata.raw_model_content"
+          "Raw model content is available from Logs / event metadata."
         ].join("\\n");
       }
       if (operation === "qq_send") {
@@ -1100,14 +1299,14 @@ qwen3-30b-iq2m-cpu-ram</textarea>
             `expected group: ${verification.expected_group_name ?? "unknown"}`,
             `active group: ${verification.active_group_name ?? "unknown"}`,
             "",
-            "Full send result is in Output JSON."
+            "Full send result is available from Logs / Status JSON."
           ].join("\\n");
         }
         return [
           "QQ send succeeded.",
           `elapsed: ${elapsed}s`,
           `duration: ${result.duration_seconds ?? "unknown"}s`,
-          `active group: ${verification.window_title ?? verification.active_group_name ?? "unknown"}`
+          `active group: ${verification.active_group_name ?? "unknown"}`
         ].join("\\n");
       }
       if (operation === "qq_read") {
@@ -1133,7 +1332,7 @@ qwen3-30b-iq2m-cpu-ram</textarea>
             `sent: ${last.sent ?? "unknown"}`,
             `send reason: ${last.send_reason || "unknown"}`,
             "",
-            "Full loop state is in Output JSON."
+            "Full loop state is available from Logs / Status JSON."
           ].join("\\n");
         }
         return [
@@ -1141,7 +1340,7 @@ qwen3-30b-iq2m-cpu-ram</textarea>
           `running: ${result.running ?? "unknown"}`,
           `reason: ${result.reason || "no new target messages"}`,
           "",
-          "Full loop state is in Output JSON."
+          "Full loop state is available from Logs / Status JSON."
         ].join("\\n");
       }
       if (operation === "model_runtime") {
@@ -1255,7 +1454,7 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         ].join("\\n");
       }
       if (operation === "provider_traces" || operation === "provider_latest_trace") {
-        return `${operation} finished in ${elapsed}s. Trace data is in Output JSON.`;
+        return `${operation} finished in ${elapsed}s. Trace data is available from Logs / Status JSON.`;
       }
       if (operation === "agent_settings" || operation === "agent_settings_update") {
         return [
@@ -1290,7 +1489,7 @@ qwen3-30b-iq2m-cpu-ram</textarea>
           "Watch runtime logs for the restart."
         ].join("\\n");
       }
-      return `${operation} finished in ${elapsed}s. Details are in Output JSON.`;
+      return `${operation} finished in ${elapsed}s. Details are available from Logs / Status JSON.`;
     }
 
     function updateSettingLabels() {

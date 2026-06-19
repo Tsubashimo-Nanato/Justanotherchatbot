@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 import re
@@ -94,14 +94,8 @@ class AgentLoop:
         self._qq_io_lock = asyncio.Lock()
         self._processor_wakeup = asyncio.Event()
         self._stop_requested = False
-        self._processed_fingerprints: set[str] = set()
         self._context_fingerprints: set[str] = set()
-        self._processed_text_times: dict[str, float] = {}
-        self._processed_message_times: dict[str, float] = {}
         self._pending_messages: deque[CleanedQQMessage] = deque()
-        self._queued_message_ids: set[str] = set()
-        self._inflight_message_ids: set[str] = set()
-        self._placeholder_message_times: dict[str, float] = {}
         self._turn_ledger = TurnLedger(ttl_seconds=config.duplicate_suppression_seconds)
         self._active_message: dict[str, Any] | None = None
         self._sent_texts: list[str] = []
@@ -117,6 +111,7 @@ class AgentLoop:
     def status(self) -> dict[str, Any]:
         task_done = self._task.done() if self._task else True
         processor_done = self._processor_task.done() if self._processor_task else True
+        ledger_summary = self._turn_ledger.summary()
         return {
             "running": self.running,
             "task_done": task_done,
@@ -133,18 +128,15 @@ class AgentLoop:
             "ignore_existing_on_start": self.config.ignore_existing_on_start,
             "target_sender_name": self.config.target_sender_name,
             "expected_group_name": self.config.expected_group_name,
-            "processed_count": len(self._processed_fingerprints),
             "context_seen_count": len(self._context_fingerprints),
-            "text_seen_count": len(self._processed_text_times),
-            "message_seen_count": len(self._processed_message_times),
             "pending_message_count": len(self._pending_messages),
-            "queued_message_count": len(self._queued_message_ids),
-            "inflight_message_count": len(self._inflight_message_ids),
-            "placeholder_seen_count": len(self._placeholder_message_times),
-            "ledger": self._turn_ledger.summary(),
+            "queued_message_count": len(self._turn_ledger.active_ids("queued")),
+            "inflight_message_count": len(self._turn_ledger.active_ids("inflight")),
+            "placeholder_seen_count": ledger_summary["response_counts"]["wait_attempted"],
+            "ledger": ledger_summary,
             "active_message": dict(self._active_message) if self._active_message else None,
             "pending_messages": [self._message_status(message) for message in list(self._pending_messages)[:20]],
-            "inflight_message_ids": sorted(self._inflight_message_ids),
+            "inflight_message_ids": self._turn_ledger.active_ids("inflight"),
             "tick_busy": self._tick_lock.locked(),
             "stop_requested": self._stop_requested,
             "active_instance": self._is_active_instance(),
@@ -544,11 +536,9 @@ class AgentLoop:
         while self._pending_messages:
             message = self._pending_messages.popleft()
             identity = message.identity
-            self._queued_message_ids.discard(identity)
             if self._message_seen(message.sender_name, message.text, message.fingerprint):
                 continue
 
-            self._inflight_message_ids.add(identity)
             self._turn_ledger.mark_inflight(
                 identity,
                 metadata={"fingerprint": message.fingerprint, "raw_message_text": message.raw_text},
@@ -581,7 +571,6 @@ class AgentLoop:
                 self._remember_seen_message(message.sender_name, message.text, message.fingerprint)
                 raise
             finally:
-                self._inflight_message_ids.discard(identity)
                 self._active_message = None
 
         return None
@@ -605,6 +594,7 @@ class AgentLoop:
                 placeholder=placeholder,
             ),
             reply_to_bot=message.references_bot,
+            record_incoming_event=False,
         )
         elapsed = time.perf_counter() - started_at
         self._set_activity(
@@ -676,6 +666,38 @@ class AgentLoop:
                 return decision
 
             outgoing = self._outgoing_text(result, elapsed)
+            if not self._turn_ledger.can_send_answer(message.identity, message.fingerprint):
+                decision = LoopDecision(
+                    created_at=time.time(),
+                    message_text=text,
+                    sender_name=sender_name,
+                    action="skip",
+                    reason="answer_already_attempted_for_message",
+                    sent=False,
+                    send_reason="answer_already_attempted_for_message",
+                    elapsed_seconds=round(time.perf_counter() - started_at, 3),
+                    metadata={
+                        **result.metadata,
+                        "agent_action": result.action,
+                        "agent_reason": result.reason,
+                        "agent_reply": result.reply,
+                        "message_identity": message.identity,
+                        "source_fingerprint": message.fingerprint,
+                        "raw_message_text": message.raw_text,
+                        "loop_turn_cleaning": message.turn.to_metadata(),
+                    },
+                )
+                self._remember_decision(decision)
+                self._remember_seen_message(sender_name, text, message.fingerprint)
+                self._set_activity(
+                    stage="send_blocked",
+                    detail="Final answer was already attempted for this message.",
+                    sender_name=sender_name,
+                    message_text=text,
+                    metadata=asdict(decision),
+                )
+                return decision
+
             self._set_activity(
                 stage="sending",
                 detail="Sending reply through QQ adapter.",
@@ -694,6 +716,12 @@ class AgentLoop:
             )
             sent = bool(send_result.get("sent"))
             send_reason = str(send_result.get("reason", "unknown"))
+            self._turn_ledger.mark_answer_result(
+                message.identity,
+                sent=sent,
+                result=send_result,
+                text=outgoing,
+            )
             if sent:
                 self._sent_texts.append(outgoing)
                 self._sent_texts = self._sent_texts[-20:]
@@ -746,13 +774,17 @@ class AgentLoop:
             return {"sent": False, "reason": "loop_stopped_before_placeholder"}
 
         cleaned = message if isinstance(message, CleanedQQMessage) else self._clean_visible_message(message)
-        if self._placeholder_already_sent(cleaned.identity):
+        if not self._turn_ledger.can_send_wait(cleaned.identity, cleaned.fingerprint):
             return {
                 "sent": False,
                 "reason": "placeholder_already_sent_for_message",
                 "message_identity": cleaned.identity,
             }
-        self._remember_placeholder(cleaned.identity)
+        self._turn_ledger.mark_wait_attempted(
+            cleaned.identity,
+            text=placeholder,
+            metadata={"fingerprint": cleaned.fingerprint, "raw_message_text": cleaned.raw_text},
+        )
 
         self._set_activity(
             stage="sending_placeholder",
@@ -766,6 +798,7 @@ class AgentLoop:
             text=placeholder,
             stage="placeholder",
         )
+        self._turn_ledger.mark_wait_result(cleaned.identity, sent=bool(result.get("sent")), result=result)
         if result.get("sent"):
             self._sent_texts.append(placeholder)
             self._sent_texts = self._sent_texts[-20:]
@@ -969,8 +1002,7 @@ class AgentLoop:
 
     def _unseen_target_messages(self, messages: list[QQChatMessage]) -> list[QQChatMessage]:
         candidates: list[QQChatMessage] = []
-        for message in messages:
-            cleaned = self._clean_visible_message(message)
+        for cleaned in self._cleaned_visible_messages(messages):
             if not cleaned.text:
                 self._remember_seen_message(cleaned.sender_name, cleaned.text, cleaned.fingerprint)
                 continue
@@ -984,13 +1016,12 @@ class AgentLoop:
             if self._looks_like_own_visible_message(cleaned):
                 self._remember_seen_message(cleaned.sender_name, cleaned.text, cleaned.fingerprint)
                 continue
-            candidates.append(message)
+            candidates.append(cleaned.raw)
         return candidates
 
     def _enqueue_visible_targets(self, messages: list[QQChatMessage]) -> list[CleanedQQMessage]:
         enqueued: list[CleanedQQMessage] = []
-        for message in messages:
-            cleaned = self._clean_visible_message(message)
+        for cleaned in self._cleaned_visible_messages(messages):
             if not cleaned.text:
                 self._remember_seen_message(cleaned.sender_name, cleaned.text, cleaned.fingerprint)
                 continue
@@ -1006,7 +1037,6 @@ class AgentLoop:
                 continue
 
             self._pending_messages.append(cleaned)
-            self._queued_message_ids.add(cleaned.identity)
             self._turn_ledger.mark_queued(
                 cleaned.identity,
                 metadata={"fingerprint": cleaned.fingerprint, "raw_message_text": cleaned.raw_text},
@@ -1025,6 +1055,36 @@ class AgentLoop:
                 },
             )
         return enqueued
+
+    def _cleaned_visible_messages(self, messages: list[QQChatMessage]) -> list[CleanedQQMessage]:
+        cleaned = [self._clean_visible_message(message) for message in messages]
+        return self._drop_visible_quote_duplicates(cleaned)
+
+    def _drop_visible_quote_duplicates(self, messages: list[CleanedQQMessage]) -> list[CleanedQQMessage]:
+        by_text: dict[str, list[CleanedQQMessage]] = defaultdict(list)
+        for message in messages:
+            if message.text:
+                by_text[self._stable_text(message.text)].append(message)
+
+        dropped_fingerprints: set[str] = set()
+        for siblings in by_text.values():
+            clean_senders = {
+                self._stable_text(message.sender_name)
+                for message in siblings
+                if not message.turn.removed_lines and self._stable_text(message.raw_text) == self._stable_text(message.text)
+            }
+            if not clean_senders:
+                continue
+            for message in siblings:
+                if not message.turn.removed_lines:
+                    continue
+                removed_senders = {self._stable_text(line) for line in message.turn.removed_lines}
+                if removed_senders & clean_senders:
+                    dropped_fingerprints.add(message.fingerprint)
+
+        if not dropped_fingerprints:
+            return messages
+        return [message for message in messages if message.fingerprint not in dropped_fingerprints]
 
     def _clean_visible_message(self, message: QQChatMessage) -> CleanedQQMessage:
         turn = clean_turn_text(
@@ -1104,10 +1164,9 @@ class AgentLoop:
             )
 
     def _record_visible_context(self, messages: list[QQChatMessage]) -> None:
-        for message in messages:
-            if self._is_bot_sender(message.sender_name):
+        for cleaned in self._cleaned_visible_messages(messages):
+            if self._is_bot_sender(cleaned.sender_name):
                 continue
-            cleaned = self._clean_visible_message(message)
             if self._message_queued(cleaned) or self._message_seen(cleaned.sender_name, cleaned.text, cleaned.fingerprint):
                 continue
             if self._looks_like_own_visible_message(cleaned):
@@ -1132,6 +1191,11 @@ class AgentLoop:
         if cleaned.fingerprint in self._context_fingerprints:
             return
         self._context_fingerprints.add(cleaned.fingerprint)
+        if agent_action == "context_only":
+            self._turn_ledger.mark_context_only(
+                cleaned.identity,
+                metadata={"fingerprint": cleaned.fingerprint, "agent_reason": agent_reason},
+            )
         self.store.append_event(
             source=cleaned.sender_name,
             kind="group_message",
@@ -1259,12 +1323,35 @@ class AgentLoop:
     def _remember_decision(self, decision: LoopDecision) -> None:
         self._decisions.append(decision)
         self._decisions = self._decisions[-50:]
+        metadata = asdict(decision)
+        metadata.update(self._decision_index_fields(decision.metadata))
         self.store.append_event(
             source="loop",
             kind="loop_decision",
             content=f"{decision.action}: {decision.reason}",
-            metadata=asdict(decision),
+            metadata=metadata,
         )
+
+    def _decision_index_fields(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        keys = (
+            "message_identity",
+            "source_fingerprint",
+            "provider_trace_id",
+            "assistant_event_id",
+            "latency_seconds",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "thinking_level",
+            "requested_thinking_level",
+            "web_used",
+            "search_used",
+            "local_time_used",
+            "web_query",
+            "agent_action",
+            "agent_reason",
+        )
+        return {key: metadata[key] for key in keys if key in metadata}
 
     def _looks_like_own_reply(self, text: str) -> bool:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -1326,6 +1413,7 @@ class AgentLoop:
             "gate_decision",
             "placeholder_sent",
             "placeholder_text",
+            "placeholder_send_result",
             "web_used",
             "local_time_used",
             "search_used",
@@ -1346,6 +1434,8 @@ class AgentLoop:
             "provider_trace_id",
             "provider_parse_status",
             "provider_decision_json",
+            "command_resolution_notice",
+            "command_resolution",
         )
         result: dict[str, Any] = {}
         for key in allowed:
@@ -1369,31 +1459,12 @@ class AgentLoop:
         return value
 
     def _message_seen(self, sender_name: str, text: str, fingerprint: str) -> bool:
-        self._prune_seen_messages()
         identity = self._message_identity(sender_name, text)
-        if self._turn_ledger.is_closed(identity, fingerprint):
-            return True
-        if fingerprint in self._processed_fingerprints:
-            return True
-        if identity in self._processed_message_times:
-            return True
-        return self._text_key(sender_name, text) in self._processed_text_times
-
-    def _placeholder_already_sent(self, identity: str) -> bool:
-        self._prune_placeholder_messages()
-        return identity in self._placeholder_message_times
-
-    def _remember_placeholder(self, identity: str) -> None:
-        self._prune_placeholder_messages()
-        self._placeholder_message_times[identity] = time.time()
+        return self._turn_ledger.is_closed(identity, fingerprint)
 
     def _message_queued(self, message: QQChatMessage | CleanedQQMessage) -> bool:
         cleaned = message if isinstance(message, CleanedQQMessage) else self._clean_visible_message(message)
-        return (
-            cleaned.identity in self._queued_message_ids
-            or cleaned.identity in self._inflight_message_ids
-            or not self._turn_ledger.can_enqueue(cleaned.identity, cleaned.fingerprint)
-        )
+        return not self._turn_ledger.can_enqueue(cleaned.identity, cleaned.fingerprint)
 
     def _same_sender(self, value: str, target: str) -> bool:
         normalized = value.strip()
@@ -1407,34 +1478,21 @@ class AgentLoop:
         return any(self._same_sender(sender_name, name) for name in names if name.strip())
 
     def _remember_seen_message(self, sender_name: str, text: str, fingerprint: str) -> None:
-        seen_at = time.time()
         identity = self._message_identity(sender_name, text)
-        self._processed_fingerprints.add(fingerprint)
-        self._processed_text_times[self._text_key(sender_name, text)] = seen_at
-        self._processed_message_times[identity] = seen_at
+        self._turn_ledger.observe(
+            turn_id=identity,
+            sender=sender_name,
+            clean_text=text,
+            raw_text=text,
+            fingerprint=fingerprint,
+            references_bot=False,
+        )
         self._turn_ledger.mark_completed(identity, metadata={"fingerprint": fingerprint})
 
     def _clear_pending_messages(self) -> None:
         self._pending_messages.clear()
-        self._queued_message_ids.clear()
-        self._inflight_message_ids.clear()
         self._turn_ledger.clear_active()
         self._active_message = None
-
-    def _prune_seen_messages(self) -> None:
-        cutoff = time.time() - max(self.config.duplicate_suppression_seconds, 120.0)
-        self._processed_text_times = {
-            key: seen_at for key, seen_at in self._processed_text_times.items() if seen_at >= cutoff
-        }
-        self._processed_message_times = {
-            key: seen_at for key, seen_at in self._processed_message_times.items() if seen_at >= cutoff
-        }
-
-    def _prune_placeholder_messages(self) -> None:
-        cutoff = time.time() - max(self.config.duplicate_suppression_seconds, 120.0)
-        self._placeholder_message_times = {
-            key: sent_at for key, sent_at in self._placeholder_message_times.items() if sent_at >= cutoff
-        }
 
     def _text_key(self, sender_name: str, text: str) -> str:
         return self._message_identity(sender_name, text)
@@ -1477,7 +1535,6 @@ class AgentLoop:
                 or str(decision_metadata.get("message_identity", ""))
                 or self._message_identity(sender_name, message_text)
             )
-            self._processed_message_times[identity] = seen_at
             self._turn_ledger.observe(
                 turn_id=identity,
                 sender=sender_name,

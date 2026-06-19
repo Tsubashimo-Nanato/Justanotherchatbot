@@ -67,8 +67,14 @@ class WebResearcher:
             "新闻",
             "最新",
             "今天",
+            "明天",
             "现在",
             "天气",
+            "气温",
+            "温度",
+            "下雨",
+            "降雨",
+            "预报",
             "日期",
             "几号",
             "几点",
@@ -76,7 +82,11 @@ class WebResearcher:
             "latest",
             "news",
             "weather",
+            "forecast",
+            "temperature",
+            "rain",
             "today",
+            "tomorrow",
             "now",
         )
         return any(trigger in text for trigger in triggers)
@@ -155,7 +165,19 @@ class WebResearcher:
             return f"{compact} site:wikipedia.org"
         if "新闻" in compact or "latest" in compact.casefold() or "news" in compact.casefold():
             return compact
-        if "天气" in compact or "weather" in compact.casefold():
+        weather_markers = (
+            "天气",
+            "气温",
+            "温度",
+            "下雨",
+            "降雨",
+            "预报",
+            "weather",
+            "forecast",
+            "temperature",
+            "rain",
+        )
+        if any(marker in compact.casefold() for marker in weather_markers):
             return compact
         if self._local_time_context(compact) and len(compact) <= 20:
             return ""

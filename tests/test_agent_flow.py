@@ -3,6 +3,7 @@ import asyncio
 
 from local_qq_agent.agent import LocalAgent, PersonaGuard
 from local_qq_agent.agent.context import ContextBuilder
+from local_qq_agent.agent.dialogue_state import DialogueStateTracker
 from local_qq_agent.config import PersonaConfig
 from local_qq_agent.memory import SQLiteMemoryStore
 from local_qq_agent.tools import MathTool
@@ -41,6 +42,47 @@ class FakeDecisionModelClient:
             content='{"action":"reply","reply":"ok","reason":"short_greeting","memory_to_save":""}',
             usage={"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16},
             tokens_per_second={"completion_tokens": 42.0},
+        )
+
+
+class FakeProviderDecisionClient:
+    provider_name = "grok"
+    supports_decision_call = True
+
+    def __init__(self):
+        self.decision_messages = []
+        self.web_queries = []
+
+    async def chat_decision(self, messages, **kwargs):
+        self.decision_messages.append(messages)
+        return FakeReply(
+            content=(
+                '{"action":"reply","reply":"明天大概二十多度。","reason":"weather_answer",'
+                '"attention":0.9,"used_web":true,"sources":[],'
+                '"memory_update_suggestions":[],'
+                '"affinity_delta_suggestion":{"delta":0,"reason":"","confidence":0,"should_apply":false}}'
+            ),
+            model="grok-test",
+            usage={"prompt_tokens": 20, "completion_tokens": 6, "total_tokens": 26},
+        )
+
+    async def web_search_context(self, query, **kwargs):
+        self.web_queries.append(query)
+        return WebContext(
+            used=True,
+            query=query,
+            context="Provider web search summary:\n江东区明天气温约 24-26°C。",
+            sources=[
+                WebSource(
+                    title="weather.example",
+                    url="https://weather.example/koto",
+                    content="江东区明天气温约 24-26°C。",
+                    source_type="xai_web_search",
+                )
+            ],
+            latency_seconds=0.01,
+            reason="provider_responses_web_search",
+            search_used=True,
         )
 
 
@@ -113,6 +155,12 @@ class SequenceModelClient:
         )
 
 
+class DelayedSequenceModelClient(SequenceModelClient):
+    async def chat(self, messages, **kwargs):
+        await asyncio.sleep(0.01)
+        return await super().chat(messages, **kwargs)
+
+
 def build_agent(tmp_path):
     persona = PersonaConfig(
         name="demo",
@@ -130,6 +178,19 @@ def build_agent(tmp_path):
         context_builder=ContextBuilder(store, guard),
         model_client=FakeModelClient(),
     ), store
+
+
+def test_agent_resolves_fuzzy_command_with_local_utility_model(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    agent.utility_model_client = SequenceModelClient(
+        ['{"replacements":{".debig":".debug",".froce":".enforce"},"confidence":0.91}']
+    )
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="tester", message=".debig .froce"))
+
+    assert result.reason == "debug_requested"
+    assert result.reply.startswith("Command resolved: .debig .froce -> .debug .enforce\n")
+    assert result.metadata["command_resolution"]["source"] == "local_model"
 
 
 def build_agent_with_profile(tmp_path, profile_text: str):
@@ -325,6 +386,36 @@ def test_agent_clears_matching_memory_without_model(tmp_path):
     remaining = store.recent_memories(limit=10)
     assert [memory.summary for memory in remaining] == ["tester likes short replies"]
     assert store.recent_events()[-2].kind == "memory_clear"
+
+
+def test_agent_auto_captures_ordinary_user_memory(tmp_path):
+    agent, store = build_agent(tmp_path)
+
+    asyncio.run(agent.simulate(user_name="tester", message="I love eating pasta"))
+    asyncio.run(agent.simulate(user_name="tester", message="I am going to the doctors today"))
+    asyncio.run(agent.simulate(user_name="tester", message="I had curry for dinner"))
+
+    memories = store.recent_memories(limit=10)
+    summaries = [memory.summary for memory in memories]
+    kinds = {memory.summary: memory.kind for memory in memories}
+
+    assert "tester: likes: eating pasta" in summaries
+    assert "tester: plans or current activity: the doctors today" in summaries
+    assert "tester: recent personal context: curry for dinner" in summaries
+    assert kinds["tester: likes: eating pasta"] == "preference"
+    assert kinds["tester: plans or current activity: the doctors today"] == "plan"
+    assert kinds["tester: recent personal context: curry for dinner"] == "working_context"
+    assert any(event.kind == "memory_auto_capture" for event in store.recent_events())
+
+
+def test_agent_dedupes_auto_captured_memory(tmp_path):
+    agent, store = build_agent(tmp_path)
+
+    asyncio.run(agent.simulate(user_name="tester", message="I love eating pasta"))
+    asyncio.run(agent.simulate(user_name="tester", message="I love eating pasta"))
+
+    memories = [memory for memory in store.recent_memories(limit=10) if memory.summary == "tester: likes: eating pasta"]
+    assert len(memories) == 1
 
 
 def test_agent_status_skips_model_and_reports_runtime_state(tmp_path):
@@ -661,6 +752,99 @@ def test_agent_treats_qq_quote_reply_to_bot_as_direct_without_name(tmp_path):
     assert len(fake_model.messages) == 1
 
 
+def test_quote_followup_adds_repair_obligation_to_final_prompt(tmp_path):
+    agent, store = build_agent(tmp_path)
+    fake_model = SequenceModelClient(["那就是细面，我刚才没说清。"])
+    agent.model_client = fake_model
+    store.append_event(source="agent", kind="assistant_reply", content="嗯……细面那种。", metadata={})
+
+    result = asyncio.run(
+        agent.respond_to_incoming(
+            user_name="tester",
+            message="所以你吃的是什么面？哪种细面？",
+            reply_to_bot=True,
+        )
+    )
+
+    assert result.action == "reply"
+    assert result.metadata["dialogue_state"]["obligation"] == "repair_required"
+    prompt_text = "\n".join(message["content"] for message in fake_model.messages[0])
+    assert "repair_required" in prompt_text
+    assert "recent_agent_replies" in prompt_text
+    assert "细面" in prompt_text
+
+
+def test_auto_captured_meal_memory_has_expiry(tmp_path):
+    agent, store = build_agent(tmp_path)
+    agent.model_client = SequenceModelClient(["ok"])
+
+    asyncio.run(agent.simulate(user_name="tester", message="I had soba for dinner"))
+
+    memories = store.search_memories("soba", limit=5)
+    assert len(memories) == 1
+    assert memories[0].metadata["scope"] == "short_term"
+    assert memories[0].metadata["expires_at"]
+
+
+def test_incoming_no_reply_still_captures_short_term_memory(tmp_path):
+    agent, store = build_agent(tmp_path)
+
+    asyncio.run(agent.respond_to_incoming(user_name="tester", message=".set .activity 0"))
+    result = asyncio.run(agent.respond_to_incoming(user_name="tester", message="I had udon for dinner"))
+
+    assert result.action == "no_reply"
+    memories = store.search_memories("udon", limit=5)
+    assert len(memories) == 1
+    assert memories[0].summary == "tester: recent personal context: udon for dinner"
+    assert memories[0].metadata["scope"] == "short_term"
+    assert memories[0].metadata["expires_at"]
+
+
+def test_provider_weather_query_uses_provider_web_context(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    provider = FakeProviderDecisionClient()
+    agent.gate_model_client = provider
+    agent.final_model_client = provider
+
+    result = asyncio.run(
+        agent.respond_to_incoming(
+            user_name="tester",
+            message="明天江东区气温",
+            reply_to_bot=True,
+        )
+    )
+
+    assert result.action == "reply"
+    assert provider.web_queries == ["明天江东区气温"]
+    assert result.metadata["web_used"] is True
+    assert result.metadata["search_used"] is True
+    assert result.metadata["web_query"] == "明天江东区气温"
+    assert result.metadata["web_sources"][0]["url"] == "https://weather.example/koto"
+    prompt_text = "\n".join(message["content"] for message in provider.decision_messages[0])
+    assert "Provider web search summary" in prompt_text
+
+
+def test_provider_lookup_followup_resolves_previous_weather_query(tmp_path):
+    agent, store = build_agent(tmp_path)
+    provider = FakeProviderDecisionClient()
+    agent.gate_model_client = provider
+    agent.final_model_client = provider
+    store.append_event(source="tester", kind="group_message", content="明天江东区气温", metadata={})
+
+    result = asyncio.run(
+        agent.respond_to_incoming(
+            user_name="tester",
+            message="查一下",
+            reply_to_bot=True,
+        )
+    )
+
+    assert result.action == "reply"
+    assert provider.web_queries == ["明天江东区气温"]
+    assert result.metadata["web_query"] == "明天江东区气温"
+    assert result.metadata["web_used"] is True
+
+
 def test_attention_gate_prompt_allows_followup_without_name(tmp_path):
     agent, store = build_agent(tmp_path)
     fake_model = SequenceModelClient(
@@ -678,9 +862,9 @@ def test_attention_gate_prompt_allows_followup_without_name(tmp_path):
     assert "do not require the character name for every turn" in gate_prompt
 
 
-def test_agent_sends_one_placeholder_before_slow_reply(tmp_path):
+def test_agent_does_not_placeholder_for_ordinary_fast_web_reply(tmp_path):
     agent, store = build_agent(tmp_path)
-    agent.model_client = SequenceModelClient(["I'll check.", "done"])
+    agent.model_client = SequenceModelClient(["done"])
     agent.web_researcher = FakeWebResearcher()
     sent = []
 
@@ -691,19 +875,74 @@ def test_agent_sends_one_placeholder_before_slow_reply(tmp_path):
     result = asyncio.run(
         agent.respond_to_incoming(
             user_name="tester",
-            message="查一下 Qwen 在维基百科上是什么 .enforce .think 2",
+            message="search Qwen on Wikipedia .enforce .think 2",
             placeholder_sender=placeholder_sender,
         )
     )
 
     assert result.action == "reply"
     assert result.reply == "done"
-    assert sent == ["I'll check"]
+    assert sent == []
+    assert result.metadata["placeholder_needed"] is False
+    assert result.metadata["placeholder_sent"] is False
+    assert [event.kind for event in store.recent_events() if event.kind == "assistant_placeholder"] == []
+
+
+def test_agent_sends_delayed_placeholder_only_for_predicted_slow_reply(tmp_path):
+    agent, store = build_agent(tmp_path)
+    agent.model_client = DelayedSequenceModelClient(["done"])
+    agent.web_researcher = FakeWebResearcher()
+    agent.placeholder_delay_seconds = 0.0
+    sent = []
+
+    async def placeholder_sender(text):
+        sent.append(text)
+        return {"sent": True, "reason": "sent"}
+
+    result = asyncio.run(
+        agent.respond_to_incoming(
+            user_name="tester",
+            message="search Qwen on Wikipedia .enforce .think 3",
+            placeholder_sender=placeholder_sender,
+        )
+    )
+
+    assert result.action == "reply"
+    assert result.reply == "done"
+    assert sent == ["Let me think"]
     assert result.metadata["placeholder_sent"]
-    assert result.metadata["placeholder_text"] == "I'll check"
+    assert result.metadata["placeholder_text"] == "Let me think"
     assert [event.kind for event in store.recent_events() if event.kind == "assistant_placeholder"] == [
         "assistant_placeholder"
     ]
+
+
+def test_agent_cancels_delayed_placeholder_when_final_reply_finishes_first(tmp_path):
+    agent, store = build_agent(tmp_path)
+    agent.model_client = SequenceModelClient(["done"])
+    agent.web_researcher = FakeWebResearcher()
+    agent.placeholder_delay_seconds = 25.0
+    sent = []
+
+    async def placeholder_sender(text):
+        sent.append(text)
+        return {"sent": True, "reason": "sent"}
+
+    result = asyncio.run(
+        agent.respond_to_incoming(
+            user_name="tester",
+            message="search Qwen on Wikipedia .enforce .think 3",
+            placeholder_sender=placeholder_sender,
+        )
+    )
+
+    assert result.action == "reply"
+    assert result.reply == "done"
+    assert result.metadata["placeholder_needed"] is True
+    assert result.metadata["placeholder_sent"] is False
+    assert result.metadata["placeholder_cancelled"] is True
+    assert sent == []
+    assert [event.kind for event in store.recent_events() if event.kind == "assistant_placeholder"] == []
 
 
 def test_agent_loop_model_no_reply_records_message_without_reply(tmp_path):
@@ -748,6 +987,22 @@ def test_agent_loop_invalid_decision_fails_closed_after_repair_failure(tmp_path)
     assert result.metadata["gate_decision"]["raw_decision"]["decision_parse_status"] == "repair_failed"
     assert not result.reply
     assert store.recent_events()[-1].kind == "assistant_no_reply"
+
+
+def test_dialogue_state_keeps_recent_agent_reply_through_log_noise(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    store.append_event(source="agent", kind="assistant_reply", content="No fixed job, just odd work.", metadata={})
+    for index in range(35):
+        store.append_event(source="other", kind="group_message", content=f"ambient {index}", metadata={})
+
+    state = DialogueStateTracker(store).for_turn(
+        user_name="tester",
+        message="what did you mean by work?",
+        reply_to_bot=True,
+    )
+
+    assert "No fixed job, just odd work." in state.recent_agent_replies
+    assert any(line.startswith("consistency_rule:") for line in state.lines)
 
 
 def test_agent_gate_extracts_json_from_noisy_output(tmp_path):

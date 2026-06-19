@@ -27,6 +27,20 @@ def decode_metadata(value: str | None) -> dict[str, Any]:
     return decoded
 
 
+def is_expired_metadata(metadata: dict[str, Any], *, now: datetime | None = None) -> bool:
+    expires_at = str(metadata.get("expires_at") or "").strip()
+    if not expires_at:
+        return False
+    now = now or datetime.now(UTC)
+    try:
+        expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=UTC)
+    return expires <= now
+
+
 @dataclass(frozen=True)
 class EventRecord:
     id: int
@@ -284,10 +298,10 @@ class SQLiteMemoryStore:
                 ORDER BY updated_at DESC, id DESC
                 LIMIT ?
                 """,
-                (like_query, like_query, limit),
+                (like_query, like_query, max(limit * 4, limit)),
             ).fetchall()
 
-        return [self._memory_from_row(row) for row in rows]
+        return self._active_memories([self._memory_from_row(row) for row in rows], limit=limit)
 
     def recent_memories(self, limit: int = 8, *, newest_first: bool = False) -> list[MemoryRecord]:
         if limit <= 0:
@@ -301,10 +315,10 @@ class SQLiteMemoryStore:
                 ORDER BY updated_at DESC, id DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (max(limit * 4, limit),),
             ).fetchall()
 
-        memories = [self._memory_from_row(row) for row in rows]
+        memories = self._active_memories([self._memory_from_row(row) for row in rows], limit=limit)
         if not newest_first:
             memories.reverse()
         return memories
@@ -366,3 +380,7 @@ class SQLiteMemoryStore:
             confidence=float(row["confidence"]),
             metadata=decode_metadata(row["metadata_json"]),
         )
+
+    def _active_memories(self, memories: list[MemoryRecord], *, limit: int) -> list[MemoryRecord]:
+        active = [memory for memory in memories if not is_expired_metadata(memory.metadata)]
+        return active[:limit]
