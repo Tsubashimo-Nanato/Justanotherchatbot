@@ -113,6 +113,12 @@ class SequenceModelClient:
         )
 
 
+class DelayedSequenceModelClient(SequenceModelClient):
+    async def chat(self, messages, **kwargs):
+        await asyncio.sleep(0.01)
+        return await super().chat(messages, **kwargs)
+
+
 def build_agent(tmp_path):
     persona = PersonaConfig(
         name="demo",
@@ -708,9 +714,9 @@ def test_attention_gate_prompt_allows_followup_without_name(tmp_path):
     assert "do not require the character name for every turn" in gate_prompt
 
 
-def test_agent_sends_one_placeholder_before_slow_reply(tmp_path):
+def test_agent_does_not_placeholder_for_ordinary_fast_web_reply(tmp_path):
     agent, store = build_agent(tmp_path)
-    agent.model_client = SequenceModelClient(["I'll check.", "done"])
+    agent.model_client = SequenceModelClient(["done"])
     agent.web_researcher = FakeWebResearcher()
     sent = []
 
@@ -721,19 +727,74 @@ def test_agent_sends_one_placeholder_before_slow_reply(tmp_path):
     result = asyncio.run(
         agent.respond_to_incoming(
             user_name="tester",
-            message="查一下 Qwen 在维基百科上是什么 .enforce .think 2",
+            message="search Qwen on Wikipedia .enforce .think 2",
             placeholder_sender=placeholder_sender,
         )
     )
 
     assert result.action == "reply"
     assert result.reply == "done"
-    assert sent == ["I'll check"]
+    assert sent == []
+    assert result.metadata["placeholder_needed"] is False
+    assert result.metadata["placeholder_sent"] is False
+    assert [event.kind for event in store.recent_events() if event.kind == "assistant_placeholder"] == []
+
+
+def test_agent_sends_delayed_placeholder_only_for_predicted_slow_reply(tmp_path):
+    agent, store = build_agent(tmp_path)
+    agent.model_client = DelayedSequenceModelClient(["done"])
+    agent.web_researcher = FakeWebResearcher()
+    agent.placeholder_delay_seconds = 0.0
+    sent = []
+
+    async def placeholder_sender(text):
+        sent.append(text)
+        return {"sent": True, "reason": "sent"}
+
+    result = asyncio.run(
+        agent.respond_to_incoming(
+            user_name="tester",
+            message="search Qwen on Wikipedia .enforce .think 3",
+            placeholder_sender=placeholder_sender,
+        )
+    )
+
+    assert result.action == "reply"
+    assert result.reply == "done"
+    assert sent == ["Let me think"]
     assert result.metadata["placeholder_sent"]
-    assert result.metadata["placeholder_text"] == "I'll check"
+    assert result.metadata["placeholder_text"] == "Let me think"
     assert [event.kind for event in store.recent_events() if event.kind == "assistant_placeholder"] == [
         "assistant_placeholder"
     ]
+
+
+def test_agent_cancels_delayed_placeholder_when_final_reply_finishes_first(tmp_path):
+    agent, store = build_agent(tmp_path)
+    agent.model_client = SequenceModelClient(["done"])
+    agent.web_researcher = FakeWebResearcher()
+    agent.placeholder_delay_seconds = 25.0
+    sent = []
+
+    async def placeholder_sender(text):
+        sent.append(text)
+        return {"sent": True, "reason": "sent"}
+
+    result = asyncio.run(
+        agent.respond_to_incoming(
+            user_name="tester",
+            message="search Qwen on Wikipedia .enforce .think 3",
+            placeholder_sender=placeholder_sender,
+        )
+    )
+
+    assert result.action == "reply"
+    assert result.reply == "done"
+    assert result.metadata["placeholder_needed"] is True
+    assert result.metadata["placeholder_sent"] is False
+    assert result.metadata["placeholder_cancelled"] is True
+    assert sent == []
+    assert [event.kind for event in store.recent_events() if event.kind == "assistant_placeholder"] == []
 
 
 def test_agent_loop_model_no_reply_records_message_without_reply(tmp_path):

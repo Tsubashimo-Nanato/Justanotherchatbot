@@ -177,6 +177,12 @@ The first capture policy handles:
 
 Stable preferences and plans become durable SQLite memories. Recent meals/status updates become `working_context` memories with lower confidence so they can appear in near-term context without being treated as permanent personality facts. Duplicate summaries are suppressed before writing.
 
+## Slow Reply Placeholders
+
+The QQ loop does not send a waiting line just because a web/tool call is possible. A placeholder is only scheduled for replies predicted to exceed the configured delay window, currently 25 seconds, and it is sent only if the final answer has not completed by then. If the search/model reply finishes before the delay, the placeholder task is cancelled and no extra QQ message is sent.
+
+Placeholders are generic deterministic lines such as `我看一下` or `Let me think`; they are not generated from the user's actual query. This prevents the local placeholder path from hallucinating an answer before the web/tool result is available.
+
 Run-stop logs are `RunSessionLog` artifacts, not raw database dumps. They keep only training-useful events such as clean user messages, bot replies, no-reply decisions, placeholders, behavior feedback, and compact web/tool summaries. They deliberately exclude prompts, API keys, raw provider traces, SQLite dumps, model files, and private reference material.
 
 The current style-learning path is an iteration harness:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -139,6 +140,7 @@ class LocalAgent:
         self.model_status_provider = model_status_provider or (lambda: {})
         self.quality_gate = quality_gate or QualityGate()
         self.memory_capture_policy = MemoryCapturePolicy()
+        self.placeholder_delay_seconds = 25.0
 
     @property
     def model_client(self):
@@ -388,12 +390,14 @@ class LocalAgent:
                 },
             )
 
-        placeholder_metadata = await self._maybe_send_placeholder(
+        placeholder_metadata = self._placeholder_metadata(gate)
+        placeholder_task = self._start_placeholder_task(
             user_name=user_name,
             message=message,
             parsed=parsed,
             gate=gate,
             placeholder_sender=placeholder_sender,
+            metadata=placeholder_metadata,
         )
         result = await self._generate_final_reply(
             user_name=user_name,
@@ -407,6 +411,7 @@ class LocalAgent:
             social_snapshot=snapshot.to_dict(),
             turn=turn,
         )
+        result.metadata.update(await self._finish_placeholder_task(placeholder_task, placeholder_metadata))
         result.metadata["stage_timings"] = self._stage_timings(started_at)
         return result
 
@@ -636,21 +641,22 @@ class LocalAgent:
         parsed,
         gate: GateDecision,
         placeholder_sender: PlaceholderSender | None,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        metadata = metadata or self._placeholder_metadata(gate)
         if not gate.placeholder_needed:
-            return {"placeholder_sent": False, "placeholder_needed": False}
-
-        text = await self._placeholder_text(user_name=user_name, message=message)
-        metadata: dict[str, Any] = {
-            "placeholder_needed": True,
-            "placeholder_text": text,
-            "placeholder_sent": False,
-        }
-
-        if placeholder_sender is None:
-            self._record_placeholder_event(text=text, parsed=parsed, gate=gate, metadata=metadata)
             return metadata
 
+        delay = max(0.0, float(self.placeholder_delay_seconds))
+        if delay:
+            await asyncio.sleep(delay)
+
+        text = await self._placeholder_text(user_name=user_name, message=message)
+        if placeholder_sender is None:
+            return metadata
+
+        metadata["placeholder_text"] = text
+        metadata["placeholder_send_started"] = True
         try:
             send_result = await placeholder_sender(text)
         except Exception as error:
@@ -661,6 +667,55 @@ class LocalAgent:
         metadata["placeholder_send_result"] = send_result
         if metadata["placeholder_sent"]:
             self._record_placeholder_event(text=text, parsed=parsed, gate=gate, metadata=metadata)
+        return metadata
+
+    def _placeholder_metadata(self, gate: GateDecision) -> dict[str, Any]:
+        return {
+            "placeholder_needed": bool(gate.placeholder_needed),
+            "placeholder_sent": False,
+            "placeholder_text": "",
+            "placeholder_delay_seconds": self.placeholder_delay_seconds,
+        }
+
+    def _start_placeholder_task(
+        self,
+        *,
+        user_name: str,
+        message: str,
+        parsed,
+        gate: GateDecision,
+        placeholder_sender: PlaceholderSender | None,
+        metadata: dict[str, Any],
+    ) -> asyncio.Task[dict[str, Any]] | None:
+        if not gate.placeholder_needed or placeholder_sender is None:
+            return None
+        return asyncio.create_task(
+            self._maybe_send_placeholder(
+                user_name=user_name,
+                message=message,
+                parsed=parsed,
+                gate=gate,
+                placeholder_sender=placeholder_sender,
+                metadata=metadata,
+            )
+        )
+
+    async def _finish_placeholder_task(
+        self,
+        task: asyncio.Task[dict[str, Any]] | None,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        if task is None:
+            return metadata
+        if task.done():
+            return task.result()
+        if metadata.get("placeholder_send_started"):
+            return await task
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            metadata["placeholder_cancelled"] = True
         return metadata
 
     def _record_placeholder_event(self, *, text: str, parsed, gate: GateDecision, metadata: dict[str, Any]) -> None:
@@ -677,34 +732,7 @@ class LocalAgent:
         )
 
     async def _placeholder_text(self, *, user_name: str, message: str) -> str:
-        recent_placeholders = self._recent_placeholder_texts()
-        prompt = (
-            "Write one short in-character chat line that means you are thinking. "
-            "Do not mention AI, model, tools, search, tokens, debug, or system state. "
-            "Use the language of the latest message when possible. "
-            "Do not repeat any recent placeholder. Do not end with a period or Chinese full stop.\n"
-            f"recent placeholders: {json.dumps(recent_placeholders, ensure_ascii=False)}\n"
-            f"speaker: {user_name}\n"
-            f"message: {message}"
-        )
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    f"{self.persona_guard.build_system_prompt([])}\n"
-                    "Placeholder mode: /no_think. Output only the chat line."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ]
-        try:
-            reply = await self.utility_model_client.chat(messages, max_tokens=32)
-            text = self._clean_placeholder_text(reply.content)
-            if text and text not in recent_placeholders:
-                return text
-        except Exception:
-            pass
-        return self._fallback_placeholder(message, recent_placeholders)
+        return self._fallback_placeholder(message, self._recent_placeholder_texts())
 
     def _recent_placeholder_texts(self) -> list[str]:
         placeholders: list[str] = []
@@ -716,17 +744,11 @@ class LocalAgent:
                 placeholders.append(text)
         return placeholders[-5:]
 
-    def _clean_placeholder_text(self, text: str) -> str:
-        cleaned = self.persona_guard.clean_reply(text)
-        cleaned = cleaned.splitlines()[0].strip() if cleaned.strip() else ""
-        cleaned = cleaned[:80].strip()
-        return cleaned.rstrip("。. ").strip()
-
     def _fallback_placeholder(self, message: str, recent_placeholders: list[str]) -> str:
         if self._mostly_ascii(message):
             candidates = ["Let me think", "One moment", "I'll check"]
         else:
-            candidates = ["我想一下", "等我一下", "我看一眼", "嗯，我理一下"]
+            candidates = ["我看一下", "等我一下", "我确认下", "我查一下"]
         for candidate in candidates:
             if candidate not in recent_placeholders:
                 return candidate
@@ -1660,7 +1682,7 @@ class LocalAgent:
         thinking_level: int,
     ) -> float:
         if web_needed:
-            return 16.0
+            return 18.0 + max(0, thinking_level - 1) * 4.0
         if math_needed:
             return 10.0
         if thinking_level >= 3:
@@ -1672,7 +1694,7 @@ class LocalAgent:
         return 6.0
 
     def _placeholder_needed(self, predicted_latency_seconds: float) -> bool:
-        return predicted_latency_seconds > 15.0
+        return predicted_latency_seconds >= self.placeholder_delay_seconds
 
     def _expected_latency_class(self, web_needed: bool, math_needed: bool, fast_reply: bool, thinking_level: int) -> str:
         if web_needed:
