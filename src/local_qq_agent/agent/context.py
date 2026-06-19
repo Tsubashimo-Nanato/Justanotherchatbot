@@ -40,6 +40,7 @@ class ContextBuilder:
         fast_reply: bool = False,
         thinking_directive: str = "",
         dialogue_state: Any | None = None,
+        interaction_plan: Any | None = None,
     ) -> BuiltContext:
         memory_records = self.store.search_memories(user_message, limit=6)
         recent_memories = self.store.recent_memories(limit=6)
@@ -50,6 +51,7 @@ class ContextBuilder:
         memory_lines.extend(f"social_state: {line}" for line in social_snapshot.prompt_lines())
         memory_lines.extend(self._style_sample_lines(recent_events))
         dialogue_lines = list(getattr(dialogue_state, "lines", ()) or ())
+        interaction_lines = list(getattr(interaction_plan, "prompt_lines", lambda: [])())
         recent_lines = self._recent_conversation_lines(recent_events)
 
         fast_rule = ""
@@ -66,6 +68,7 @@ class ContextBuilder:
             "If it is directed at you or quoting/following you, reply in character. "
             "Match language to the latest message and recent context; do not default to Chinese for English turns. "
             f"{fast_rule}\n"
+            f"{self._interaction_text(interaction_lines)}"
             f"{thinking_directive}"
         )
         user_prompt = self._build_user_prompt(
@@ -74,6 +77,7 @@ class ContextBuilder:
             recent_lines,
             external_context,
             dialogue_lines,
+            interaction_lines,
         )
 
         return BuiltContext(
@@ -151,17 +155,25 @@ class ContextBuilder:
         recent_lines: list[str],
         external_context: str,
         dialogue_lines: list[str],
+        interaction_lines: list[str],
     ) -> str:
         recent_text = "\n".join(recent_lines[-RECENT_CONTEXT_LIMIT:]) if recent_lines else "none"
         external_text = external_context.strip() or "none"
         dialogue_text = "\n".join(dialogue_lines) if dialogue_lines else "none"
+        interaction_text = "\n".join(interaction_lines) if interaction_lines else "none"
         return (
             "Current group context:\n"
             f"recent messages:\n{recent_text}\n\n"
             f"dialogue state:\n{dialogue_text}\n\n"
+            f"interaction policy:\n{interaction_text}\n\n"
             f"external/tool evidence:\n{external_text}\n\n"
             f"latest sender: {user_name}\n"
             f"latest message: {user_message}\n\n"
             "Decide the real intent from context, especially the 真实语气和意图, then output only the text you would send to QQ."
             " 如果这句话是讽刺、反问、抱怨或玩笑，不要只回答字面问题，也不要只回一个疑问词。"
         )
+
+    def _interaction_text(self, interaction_lines: list[str]) -> str:
+        if not interaction_lines:
+            return ""
+        return "Interaction policy:\n" + "\n".join(f"- {line}" for line in interaction_lines) + "\n"

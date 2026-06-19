@@ -902,6 +902,12 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       if (metadata.web_used !== undefined || metadata.search_used !== undefined || metadata.web_query) {
         lines.push(`web: used=${metadata.web_used ?? false} search=${metadata.search_used ?? false} query=${shortLine(metadata.web_query || "")}`);
       }
+      if (metadata.interaction_plan) {
+        lines.push(formatInteractionLine(metadata.interaction_plan));
+      }
+      if (metadata.quality_review) {
+        lines.push(formatQualityLine(metadata));
+      }
       if (metadata.message_identity) {
         lines.push(`turn: ${shortLine(metadata.message_identity)}`);
       }
@@ -927,10 +933,30 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       if (metadata.web_used !== undefined || metadata.search_used !== undefined || metadata.web_query) {
         lines.push(`web: used=${metadata.web_used ?? false} search=${metadata.search_used ?? false} query=${shortLine(metadata.web_query || "")}`);
       }
+      if (metadata.interaction_plan) {
+        lines.push(formatInteractionLine(metadata.interaction_plan));
+      }
+      if (metadata.quality_review) {
+        lines.push(formatQualityLine(metadata));
+      }
       if (metadata.provider_trace_id) {
         lines.push(`trace: ${metadata.provider_trace_id}`);
       }
       return lines;
+    }
+
+    function formatInteractionLine(plan) {
+      if (!plan) {
+        return "";
+      }
+      return `interaction: ${plan.mode || "unknown"} hook=${plan.hook_budget ?? "?"} affinity=${plan.affinity ?? "?"} kind=${plan.message_kind || "?"}`;
+    }
+
+    function formatQualityLine(metadata) {
+      const review = metadata.quality_review || {};
+      const hits = Array.isArray(review.rule_hits) ? review.rule_hits.join(",") : (review.rule_hits || "");
+      const rewrite = metadata.quality_rewrite_used ? ` rewrite=${shortLine(metadata.quality_rewrite_reply || "")}` : "";
+      return `quality: score=${review.score ?? "?"} rewrite=${review.rewrite_needed ?? false} hits=${hits}${rewrite}`;
     }
 
     function summarizeEventsOutput(result) {
@@ -1142,7 +1168,13 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         "provider_decision",
         "provider_trace_id",
         "provider_parse_status",
-        "provider_decision_json"
+        "provider_decision_json",
+        "interaction_plan",
+        "quality_review",
+        "quality_second_review",
+        "quality_rewrite_used",
+        "quality_rewrite_reply",
+        "pre_quality_reply"
       ];
       const result = {};
       for (const key of keys) {
@@ -1864,6 +1896,12 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       if (metadata.latency_seconds || metadata.prompt_tokens || metadata.completion_tokens) {
         lines.push(`model: ${metadata.latency_seconds ?? "?"}s, prompt ${metadata.prompt_tokens ?? "?"}, completion ${metadata.completion_tokens ?? "?"}`);
       }
+      if (metadata.interaction_plan) {
+        lines.push(formatInteractionLine(metadata.interaction_plan));
+      }
+      if (metadata.quality_review) {
+        lines.push(formatQualityLine(metadata));
+      }
       if (latestDecision) {
         lines.push(`latest decision: ${latestDecision.action || ""} ${latestDecision.reason || ""}`.trim());
         lines.push(`latest sent: ${latestDecision.sent ?? false} ${latestDecision.send_reason || ""}`.trim());
@@ -1936,6 +1974,8 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         `tok/s: prompt=${tps.prompt_tokens ?? "?"} completion=${tps.completion_tokens ?? "?"} total=${tps.total_tokens ?? "?"}`,
         `latency: ${modelMetadata.latency_seconds ?? "?"}s`,
         `thinking: requested=${modelMetadata.requested_thinking_level ?? "auto"} effective=${modelMetadata.thinking_level ?? "?"}`,
+        `interaction: ${modelMetadata.interaction_plan ? `${modelMetadata.interaction_plan.mode || "unknown"} hook=${modelMetadata.interaction_plan.hook_budget ?? "?"} affinity=${modelMetadata.interaction_plan.affinity ?? "?"}` : "none"}`,
+        `quality: ${modelMetadata.quality_review ? `score=${modelMetadata.quality_review.score ?? "?"} rewrite=${modelMetadata.quality_rewrite_used ?? false}` : "none"}`,
         `provider: decision=${modelMetadata.provider_decision ?? false} trace=${modelMetadata.provider_trace_id || "none"}`,
         `web: used=${modelMetadata.web_used ?? false} search=${modelMetadata.search_used ?? false} query=${modelMetadata.web_query || ""}`,
         `sources: ${(modelMetadata.web_sources || []).length || 0}`
