@@ -5,7 +5,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .env
+config/*.local.yaml
 *.egg-info/
+.codex-remote-attachments/
 
 data/
 artifacts/
@@ -13,6 +15,7 @@ models/
 workspace/
 personality/*/References/
 personality/*/profile_backup_*/
+personality/*/profile/generated_style_anchor.md
 personality/*/memory/runtime/
 personality/*/memory/*.jsonl
 personality/*/workspace/

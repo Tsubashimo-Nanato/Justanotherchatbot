@@ -26,6 +26,7 @@ def test_memory_capture_detects_short_term_meal_context():
     assert captures[0].kind == "working_context"
     assert captures[0].scope == "short_term"
     assert captures[0].summary == "recent personal context: curry for dinner"
+    assert captures[0].ttl_seconds == 3 * 24 * 60 * 60
 
 
 def test_memory_capture_keeps_explicit_memory_requests():

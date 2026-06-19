@@ -44,6 +44,8 @@ class PersonaGuard:
                 "target_user": self.config.style_learning_target_user,
                 "base_anchor_weight": self.config.base_anchor_weight,
                 "proactive_topic_bias": self.config.proactive_topic_bias,
+                "auto_distill_on_start": self.config.style_learning_auto_distill,
+                "generated_anchor_path": str(self.config.style_learning_generated_anchor_path or ""),
             },
             "reload_policy": "restart_required",
         }

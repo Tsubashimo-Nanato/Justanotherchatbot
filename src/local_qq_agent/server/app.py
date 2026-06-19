@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from local_qq_agent.agent import LocalAgent, PersonaGuard, SocialStateTracker
 from local_qq_agent.agent.context import ContextBuilder
+from local_qq_agent.agent.style_learning import StyleAnchorDistiller
 from local_qq_agent.config import MemoryConfig, ModelConfig, PersonaConfig, QQConfig, WebConfig
 from local_qq_agent.memory import SQLiteMemoryStore
 from local_qq_agent.model import (
@@ -154,6 +155,7 @@ class Runtime:
         self.provider_runtime = ProviderRuntime(store=self.store)
         self.model_clients = self.provider_runtime.build_clients(self.model_config)
         self.model_client = self.model_clients.primary
+        self._refresh_generated_style_anchor()
         self.persona_guard = PersonaGuard(self.persona_config)
         self.social_state = SocialStateTracker(self.store)
         self.context_builder = ContextBuilder(self.store, self.persona_guard, self.social_state)
@@ -188,6 +190,7 @@ class Runtime:
         self.persona_config = PersonaConfig.load()
         self.model_clients = self.provider_runtime.build_clients(self.model_config)
         self.model_client = self.model_clients.primary
+        self._refresh_generated_style_anchor()
         self.persona_guard = PersonaGuard(self.persona_config)
         self.context_builder = ContextBuilder(self.store, self.persona_guard, self.social_state)
         self.agent = LocalAgent(
@@ -210,6 +213,27 @@ class Runtime:
             reboot_scheduler=lambda reason: self.rebooter.schedule(reason=reason),
             is_active_instance=self.instance_guard.is_current,
         )
+
+    def _refresh_generated_style_anchor(self) -> dict[str, Any] | None:
+        config = self.persona_config
+        if not config.style_learning_enabled or not config.style_learning_auto_distill:
+            return None
+        output_path = config.style_learning_generated_anchor_path
+        if output_path is None:
+            return None
+
+        result = StyleAnchorDistiller(self.store).distill(
+            target_user=config.style_learning_target_user,
+            output_path=output_path,
+            run_log_dir=config.style_learning_run_log_dir,
+        )
+        self.store.append_event(
+            source="agent",
+            kind="style_anchor_refresh",
+            content="Generated style anchor refresh completed.",
+            metadata=result.to_dict(),
+        )
+        return result.to_dict()
 
     def model_status(self) -> dict[str, Any]:
         return {

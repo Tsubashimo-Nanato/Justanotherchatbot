@@ -12,12 +12,15 @@ class MemoryCapture:
     confidence: float
     scope: str
     reason: str
+    ttl_seconds: int | None = None
 
     def to_metadata(self) -> dict[str, Any]:
         return asdict(self)
 
 
 class MemoryCapturePolicy:
+    SHORT_TERM_TTL_SECONDS = 3 * 24 * 60 * 60
+
     def capture(self, message: str) -> list[MemoryCapture]:
         text = self._normalize(message)
         if not text:
@@ -143,6 +146,7 @@ class MemoryCapturePolicy:
                     confidence=confidence,
                     scope=scope,
                     reason="schedule_or_current_activity",
+                    ttl_seconds=self.SHORT_TERM_TTL_SECONDS,
                 )
             ]
         return []
@@ -168,6 +172,7 @@ class MemoryCapturePolicy:
                     confidence=0.5,
                     scope="short_term",
                     reason="recent_status_or_meal",
+                    ttl_seconds=self.SHORT_TERM_TTL_SECONDS,
                 )
             ]
         return []

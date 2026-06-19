@@ -1,8 +1,7 @@
 from local_qq_agent.config import QQConfig
 from local_qq_agent.memory import SQLiteMemoryStore
 from local_qq_agent.qq import QQChatMessage, QQReadResult
-from local_qq_agent.server.agent_loop import AgentLoop
-import time
+from local_qq_agent.server.agent_loop import AgentLoop, LoopDecision
 
 
 def test_agent_loop_deduplicates_visible_message_after_coordinate_shift():
@@ -18,9 +17,6 @@ def test_agent_loop_deduplicates_visible_message_after_coordinate_shift():
 def test_agent_loop_keeps_same_visible_message_seen_after_two_minutes():
     loop = build_loop()
     loop._remember_seen_message("target user", "roast chicken good", "fp-old")
-    old_seen_at = time.time() - 121
-    loop._processed_message_times[loop._message_identity("target user", "roast chicken good")] = old_seen_at
-    loop._processed_text_times[loop._text_key("target user", "roast chicken good")] = old_seen_at
 
     assert loop._message_seen("target user", "roast chicken good", "fp-new-coordinate")
 
@@ -43,6 +39,35 @@ def test_agent_loop_hydrates_seen_messages_from_recent_loop_decisions(tmp_path):
     assert loop._message_seen("target user", "roast chicken good", "fp-new-coordinate")
 
 
+def test_agent_loop_persists_decision_index_fields(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    loop = build_loop(store=store)
+    decision = LoopDecision(
+        created_at=1.0,
+        message_text="roast chicken good",
+        sender_name="target user",
+        action="reply",
+        reason="model_reply",
+        sent=True,
+        send_reason="sent",
+        elapsed_seconds=1.2,
+        metadata={
+            "message_identity": "target user|roast chicken good",
+            "provider_trace_id": "trace-1",
+            "prompt_tokens": 12,
+            "completion_tokens": 3,
+        },
+    )
+
+    loop._remember_decision(decision)
+
+    event = store.recent_events()[0]
+    assert event.metadata["message_identity"] == "target user|roast chicken good"
+    assert event.metadata["provider_trace_id"] == "trace-1"
+    assert event.metadata["prompt_tokens"] == 12
+    assert event.metadata["metadata"]["message_identity"] == "target user|roast chicken good"
+
+
 def test_agent_loop_stable_identity_ignores_invisible_text_noise():
     loop = build_loop()
     loop._remember_seen_message("Target User", "roast\u200b  chicken good", "fp-old")
@@ -58,8 +83,7 @@ def test_agent_loop_uses_clean_identity_for_inflight_duplicate_suppression():
     enqueued = loop._enqueue_visible_targets([polluted])
     queued = enqueued[0]
     loop._pending_messages.popleft()
-    loop._queued_message_ids.discard(queued.identity)
-    loop._inflight_message_ids.add(queued.identity)
+    loop._turn_ledger.mark_inflight(queued.identity)
 
     repeated = loop._enqueue_visible_targets([same_turn])
 
@@ -118,14 +142,30 @@ def test_agent_loop_deduplicates_quote_reply_when_raw_block_changes():
     enqueued = loop._enqueue_visible_targets([raw_quote])
     queued = enqueued[0]
     loop._pending_messages.popleft()
-    loop._queued_message_ids.discard(queued.identity)
-    loop._inflight_message_ids.add(queued.identity)
+    loop._turn_ledger.mark_inflight(queued.identity)
 
     repeated = loop._enqueue_visible_targets([refreshed_quote])
 
     assert queued.text == "早上吃什么"
     assert loop._clean_visible_message(refreshed_quote).identity == queued.identity
     assert repeated == []
+
+
+def test_agent_loop_prefers_clean_visible_message_over_quote_wrapper():
+    loop = build_loop()
+    loop.agent = agent_with_aliases("target user")
+    wrapper = message(
+        "old reply\ntarget user\nnanato! what work do you do",
+        "fp-wrapper",
+        top=100,
+        sender_name="other user",
+    )
+    clean = message("nanato! what work do you do", "fp-clean", top=140, sender_name="target user")
+
+    enqueued = loop._enqueue_visible_targets([wrapper, clean])
+
+    assert [item.sender_name for item in enqueued] == ["target user"]
+    assert enqueued[0].fingerprint == "fp-clean"
 
 
 def test_agent_loop_skips_own_outgoing_quote_echo_from_target_queue():
@@ -208,7 +248,7 @@ def test_tick_does_not_read_or_consume_messages_when_not_armed():
 
     assert result["reason"] == "qq_not_armed"
     assert reads == []
-    assert len(loop._processed_fingerprints) == 0
+    assert loop.status()["ledger"]["record_count"] == 0
 
 
 def test_agent_loop_records_other_visible_users_as_context_only():
@@ -386,6 +426,7 @@ def test_processor_handles_queued_messages_in_fifo_order():
 
     loop = build_loop(max_messages_per_tick=1)
     replies = []
+    record_flags = []
     first = message("first", "fp-first", top=100)
     second = message("second", "fp-second", top=150)
 
@@ -402,6 +443,7 @@ def test_processor_handles_queued_messages_in_fifo_order():
 
         async def respond_to_incoming(self, **kwargs):
             replies.append(kwargs["message"])
+            record_flags.append(kwargs.get("record_incoming_event"))
             return AgentResult(f"reply to {kwargs['message']}")
 
     class Store:
@@ -437,6 +479,7 @@ def test_processor_handles_queued_messages_in_fifo_order():
     second_decision = asyncio.run(loop._process_next_pending_message())
 
     assert replies == ["first", "second"]
+    assert record_flags == [False, False]
     assert first_decision.message_text == "first"
     assert second_decision.message_text == "second"
     assert loop.status()["pending_message_count"] == 0
@@ -569,6 +612,62 @@ def test_final_reply_after_placeholder_sends_unquoted_followup():
     assert calls == [{"text": "final answer", "reply_to": None}]
     assert decision.metadata["send_result"]["verification"]["stage"] == "final_followup"
     assert decision.metadata["send_result"]["verification"]["mode"] == "followup_unquoted"
+
+
+def test_final_answer_is_once_per_clean_turn():
+    import asyncio
+
+    loop = build_loop()
+    calls = []
+    target = message("nanato today food", "fp-target", top=140, sender_name="target user")
+
+    class Result:
+        def to_dict(self):
+            return {"sent": True, "reason": "sent", "verification": {}}
+
+    class QQ:
+        def read_visible_context(self, *, passive=False):
+            return QQReadResult(
+                active_group_name="target group",
+                expected_group_name="target group",
+                target_sender_name="target user",
+                bot_sender_name="bot user",
+                group_matched=True,
+                visible_items=[],
+                chat_messages=[target],
+                target_messages=[target],
+            )
+
+        def send_text(self, text, *, reply_to=None):
+            calls.append({"text": text, "reply_to": reply_to})
+            return Result()
+
+    class AgentResult:
+        action = "reply"
+        reply = "one answer"
+        reason = "model_reply"
+        used_model = True
+        metadata = {}
+
+    class Agent:
+        async def respond_to_incoming(self, **kwargs):
+            return AgentResult()
+
+    class Store:
+        def append_event(self, **kwargs):
+            pass
+
+    loop.qq = QQ()
+    loop.agent = Agent()
+    loop.store = Store()
+
+    first = asyncio.run(loop._handle_message(target, 0.0))
+    second = asyncio.run(loop._handle_message(target, 0.0))
+
+    assert first.sent
+    assert not second.sent
+    assert second.send_reason == "answer_already_attempted_for_message"
+    assert calls == [{"text": "one answer", "reply_to": target}]
 
 
 def test_quoted_send_refuses_when_target_is_not_visible():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import re
 from typing import Any
 
 
@@ -10,7 +11,60 @@ COMMAND_ALIASES = {
     ".debug": "debug",
     ".ignore": "ignore",
 }
+COMMAND_TOKEN_ALIASES = {
+    ".force": ".enforce",
+    ".forced": ".enforce",
+    ".log": ".debug",
+    ".logs": ".debug",
+    ".dbg": ".debug",
+    ".details": ".detail",
+}
+KNOWN_COMMAND_TOKENS = {
+    ".activity",
+    ".debug",
+    ".detail",
+    ".enforce",
+    ".help",
+    ".ignore",
+    ".reboot",
+    ".score",
+    ".set",
+    ".status",
+    ".think",
+}
 THINKING_LEVELS = {0, 1, 2, 3}
+
+
+@dataclass(frozen=True)
+class CommandResolution:
+    text: str
+    changed: bool = False
+    source: str = "exact"
+    replacements: tuple[tuple[str, str], ...] = ()
+    unresolved_tokens: tuple[str, ...] = ()
+    confidence: float = 1.0
+    original_text: str = ""
+
+    @property
+    def notice(self) -> str:
+        if not self.changed or not self.replacements:
+            return ""
+        original = _command_token_text(self.original_text or self.text)
+        resolved = _command_token_text(self.text)
+        if not original or not resolved:
+            original = " ".join(original for original, _replacement in self.replacements)
+            resolved = " ".join(replacement for _original, replacement in self.replacements)
+        return f"Command resolved: {original} -> {resolved}"
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "changed": self.changed,
+            "source": self.source,
+            "replacements": [{"from": original, "to": replacement} for original, replacement in self.replacements],
+            "unresolved_tokens": list(self.unresolved_tokens),
+            "confidence": self.confidence,
+            "notice": self.notice,
+        }
 
 
 @dataclass(frozen=True)
@@ -31,16 +85,20 @@ class ParsedMessage:
     setting_updates: dict[str, Any]
     setting_errors: tuple[str, ...]
     command_suffixes: tuple[str, ...]
+    command_resolution_notice: str = ""
+    command_resolution: dict[str, Any] = field(default_factory=dict)
 
     @property
     def command_suffix(self) -> str:
         return " ".join(self.command_suffixes)
 
 
-def parse_message_commands(message: str) -> ParsedMessage:
+def parse_message_commands(message: str, resolution: CommandResolution | None = None) -> ParsedMessage:
+    resolution = resolution or resolve_command_aliases(message)
+    message = resolution.text
     text = message.strip()
     if not text:
-        return _parsed_empty()
+        return _parsed_empty(resolution)
 
     standalone_text = _standalone_command_text(text)
     standalone_commands = {
@@ -68,13 +126,15 @@ def parse_message_commands(message: str) -> ParsedMessage:
             setting_updates={},
             setting_errors=(),
             command_suffixes=(standalone_text,),
+            command_resolution_notice=resolution.notice,
+            command_resolution=resolution.to_metadata(),
         )
 
     if standalone_text.casefold().startswith(".set"):
-        return _parse_set_command(standalone_text)
+        return _parse_set_command(standalone_text, resolution=resolution)
 
     if standalone_text.casefold().startswith(".score"):
-        return _parse_score_command(standalone_text)
+        return _parse_score_command(standalone_text, resolution=resolution)
 
     tokens = text.split()
     suffixes: list[str] = []
@@ -122,10 +182,77 @@ def parse_message_commands(message: str) -> ParsedMessage:
         setting_updates={},
         setting_errors=(),
         command_suffixes=tuple(suffixes),
+        command_resolution_notice=resolution.notice,
+        command_resolution=resolution.to_metadata(),
     )
 
 
-def _parsed_empty() -> ParsedMessage:
+def resolve_command_aliases(message: str) -> CommandResolution:
+    tokens = re.findall(r"\S+", message)
+    if not tokens:
+        return CommandResolution(text=message)
+
+    replacements: list[tuple[str, str]] = []
+    resolved_text = message
+    unresolved: list[str] = []
+    for token in tokens:
+        lowered = token.casefold()
+        replacement = COMMAND_TOKEN_ALIASES.get(lowered)
+        if replacement is not None:
+            replacements.append((token, replacement))
+            resolved_text = re.sub(rf"(?<!\S){re.escape(token)}(?!\S)", replacement, resolved_text)
+            continue
+        if _looks_like_unknown_command_token(token):
+            unresolved.append(token)
+
+    if not replacements and not unresolved:
+        return CommandResolution(text=message)
+
+    return CommandResolution(
+        text=resolved_text,
+        changed=bool(replacements),
+        source="alias" if replacements else "exact",
+        replacements=tuple(replacements),
+        unresolved_tokens=tuple(unresolved),
+        original_text=message,
+    )
+
+
+def resolution_from_model(
+    *,
+    original_text: str,
+    replacements: dict[str, str],
+    confidence: float,
+) -> CommandResolution:
+    tokens = re.findall(r"\S+", original_text)
+    applied: list[tuple[str, str]] = []
+    resolved_text = original_text
+    allowed = KNOWN_COMMAND_TOKENS | set(COMMAND_ALIASES)
+    for token in tokens:
+        replacement = replacements.get(token) or replacements.get(token.casefold())
+        if replacement is None:
+            continue
+        normalized = replacement.strip().casefold()
+        if normalized not in allowed:
+            continue
+        applied.append((token, normalized))
+        resolved_text = re.sub(rf"(?<!\S){re.escape(token)}(?!\S)", normalized, resolved_text)
+
+    if not applied:
+        return resolve_command_aliases(original_text)
+
+    return CommandResolution(
+        text=resolved_text,
+        changed=True,
+        source="local_model",
+        replacements=tuple(applied),
+        confidence=max(0.0, min(1.0, float(confidence))),
+        original_text=original_text,
+    )
+
+
+def _parsed_empty(resolution: CommandResolution | None = None) -> ParsedMessage:
+    resolution = resolution or CommandResolution(text="")
     return ParsedMessage(
         content="",
         enforced=False,
@@ -143,6 +270,8 @@ def _parsed_empty() -> ParsedMessage:
         setting_updates={},
         setting_errors=(),
         command_suffixes=(),
+        command_resolution_notice=resolution.notice,
+        command_resolution=resolution.to_metadata(),
     )
 
 
@@ -159,10 +288,11 @@ def _standalone_command_text(text: str) -> str:
     return text
 
 
-def _parse_set_command(text: str) -> ParsedMessage:
+def _parse_set_command(text: str, *, resolution: CommandResolution | None = None) -> ParsedMessage:
+    resolution = resolution or CommandResolution(text=text)
     tokens = text.split()
     if not tokens or tokens[0].casefold() != ".set":
-        return _parsed_empty()
+        return _parsed_empty(resolution)
 
     updates: dict[str, Any] = {}
     errors: list[str] = []
@@ -221,10 +351,13 @@ def _parse_set_command(text: str) -> ParsedMessage:
         setting_updates=updates,
         setting_errors=tuple(errors),
         command_suffixes=tuple(tokens),
+        command_resolution_notice=resolution.notice,
+        command_resolution=resolution.to_metadata(),
     )
 
 
-def _parse_score_command(text: str) -> ParsedMessage:
+def _parse_score_command(text: str, *, resolution: CommandResolution | None = None) -> ParsedMessage:
+    resolution = resolution or CommandResolution(text=text)
     parts = text.split(maxsplit=2)
     command = parts[0].casefold()
     value_text = ""
@@ -266,6 +399,8 @@ def _parse_score_command(text: str) -> ParsedMessage:
         setting_updates={},
         setting_errors=tuple(errors),
         command_suffixes=tuple(text.split()),
+        command_resolution_notice=resolution.notice,
+        command_resolution=resolution.to_metadata(),
     )
 
 
@@ -275,3 +410,22 @@ def _is_thinking_level_token(token: str) -> bool:
     except ValueError:
         return False
     return level in THINKING_LEVELS
+
+
+def _looks_like_unknown_command_token(token: str) -> bool:
+    lowered = token.casefold()
+    if not lowered.startswith("."):
+        return False
+    if lowered.startswith(".score") and lowered != ".score":
+        return False
+    if lowered in KNOWN_COMMAND_TOKENS or lowered in COMMAND_TOKEN_ALIASES:
+        return False
+    return lowered[1:].isalpha()
+
+
+def _command_token_text(text: str) -> str:
+    tokens = []
+    for token in re.findall(r"\S+", text):
+        if token.startswith("."):
+            tokens.append(token)
+    return " ".join(tokens)

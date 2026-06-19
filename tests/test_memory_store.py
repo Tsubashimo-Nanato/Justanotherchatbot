@@ -78,3 +78,19 @@ def test_recent_events_can_return_newest_first(tmp_path):
 
     assert [event.id for event in store.recent_events(limit=2)] == [first.id, second.id]
     assert [event.id for event in store.recent_events(limit=2, newest_first=True)] == [second.id, first.id]
+
+
+def test_memory_store_filters_expired_memories_from_context_queries(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    expired = store.add_memory(
+        kind="working_context",
+        summary="tester had soba for dinner",
+        metadata={"expires_at": "2000-01-01T00:00:00+00:00"},
+    )
+    active = store.add_memory(kind="preference", summary="tester likes quiet replies")
+
+    assert [memory.id for memory in store.search_memories("tester", limit=10)] == [active.id]
+    assert [memory.id for memory in store.recent_memories(limit=10, newest_first=True)] == [active.id]
+
+    deleted = store.delete_memories_matching("soba")
+    assert [memory.id for memory in deleted] == [expired.id]

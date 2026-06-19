@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 import re
@@ -11,8 +11,14 @@ import time
 from typing import Any
 import unicodedata
 
-from local_qq_agent.agent.commands import parse_message_commands
+from local_qq_agent.agent.commands import (
+    CommandResolution,
+    parse_message_commands,
+    resolution_from_model,
+    resolve_command_aliases,
+)
 from local_qq_agent.agent.context import ContextBuilder
+from local_qq_agent.agent.dialogue_state import DialogueState, DialogueStateTracker
 from local_qq_agent.agent.memory_capture import MemoryCapturePolicy
 from local_qq_agent.agent.persona import PersonaGuard
 from local_qq_agent.agent.quality import QualityGate
@@ -140,6 +146,7 @@ class LocalAgent:
         self.model_status_provider = model_status_provider or (lambda: {})
         self.quality_gate = quality_gate or QualityGate()
         self.memory_capture_policy = MemoryCapturePolicy()
+        self.dialogue_state = DialogueStateTracker(store)
         self.placeholder_delay_seconds = 25.0
 
     @property
@@ -166,6 +173,58 @@ class LocalAgent:
             or (parsed.ignored and not parsed.content)
         )
 
+    async def _parse_message_commands(self, message: str):
+        resolution = resolve_command_aliases(message)
+        if resolution.unresolved_tokens:
+            resolution = await self._resolve_unknown_commands_with_local_model(resolution)
+        return parse_message_commands(resolution.text, resolution=resolution)
+
+    async def _resolve_unknown_commands_with_local_model(self, resolution: CommandResolution) -> CommandResolution:
+        client = self.utility_model_client
+        provider_name = str(getattr(client, "provider_name", "local")).casefold()
+        if provider_name in {"grok", "unloaded"}:
+            return resolution
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Resolve fuzzy dot commands for a local QQ chat agent. "
+                    "Use only this command vocabulary: .help, .status, .reboot, .debug, .detail, "
+                    ".enforce, .ignore, .think, .set, .score, .activity. "
+                    "Return JSON only."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Schema: {\"replacements\":{\"original_token\":\"canonical_token\"},\"confidence\":0.0}\n"
+                    f"message: {resolution.text}\n"
+                    f"unknown_tokens: {list(resolution.unresolved_tokens)}"
+                ),
+            },
+        ]
+        try:
+            reply = await client.chat(messages, max_tokens=96)
+            decision = self._parse_model_decision(reply.content)
+        except Exception:
+            return resolution
+
+        replacements = decision.get("replacements", {})
+        if not isinstance(replacements, dict):
+            return resolution
+        try:
+            confidence = float(decision.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            return resolution
+        if confidence < 0.72:
+            return resolution
+        return resolution_from_model(
+            original_text=resolution.text,
+            replacements={str(key): str(value) for key, value in replacements.items()},
+            confidence=confidence,
+        )
+
     async def simulate(
         self,
         *,
@@ -176,7 +235,7 @@ class LocalAgent:
         user_name = user_name.strip() or "group member"
         turn = clean_turn_text(message)
         message = turn.text.strip()
-        parsed = parse_message_commands(message)
+        parsed = await self._parse_message_commands(message)
         if self._is_standalone_command(parsed):
             return await self.respond_to_incoming(
                 user_name=user_name,
@@ -204,6 +263,11 @@ class LocalAgent:
             snapshot = self.social_state.record_boundary_hit(user_name=user_name, reason="simulate_persona_boundary")
         else:
             snapshot = self.social_state.snapshot(user_name)
+        dialogue_state = self.dialogue_state.for_turn(
+            user_name=user_name,
+            message=message,
+            reply_to_bot=turn.references_bot,
+        )
 
         return await self._generate_final_reply(
             user_name=user_name,
@@ -216,6 +280,7 @@ class LocalAgent:
             persona_boundary_hit=persona_boundary_hit,
             social_snapshot=snapshot.to_dict(),
             turn=turn,
+            dialogue_state=dialogue_state,
         )
 
     async def respond_to_incoming(
@@ -227,12 +292,13 @@ class LocalAgent:
         placeholder_sender: PlaceholderSender | None = None,
         recent_bot_texts: tuple[str, ...] = (),
         reply_to_bot: bool = False,
+        record_incoming_event: bool = True,
     ) -> AgentResult:
         started_at = time.perf_counter()
         user_name = user_name.strip() or "group member"
         turn = clean_turn_text(message, recent_bot_texts=recent_bot_texts)
         message = turn.text
-        parsed = parse_message_commands(message)
+        parsed = await self._parse_message_commands(message)
         message = parsed.content
 
         if parsed.help_requested:
@@ -311,21 +377,29 @@ class LocalAgent:
         if memory_clear_query:
             return self._clear_memory(memory_clear_query, user_name=user_name, command_source="chat")
 
+        self._maybe_store_user_memory(user_name, message)
+
         persona_boundary_hit = self._persona_boundary(message)
         if persona_boundary_hit:
             snapshot = self.social_state.record_boundary_hit(user_name=user_name, reason="persona_boundary_hit")
         else:
             snapshot = self.social_state.snapshot(user_name)
+        dialogue_state = self.dialogue_state.for_turn(
+            user_name=user_name,
+            message=message,
+            reply_to_bot=reply_to_bot or turn.references_bot,
+        )
 
         if self.settings.activity <= 0 and not parsed.enforced:
-            self._record_incoming_event(
-                user_name=user_name,
-                message=message,
-                parsed=parsed,
-                external_context=external_context,
-                agent_action="no_reply",
-                agent_reason="activity_disabled",
-            )
+            if record_incoming_event:
+                self._record_incoming_event(
+                    user_name=user_name,
+                    message=message,
+                    parsed=parsed,
+                    external_context=external_context,
+                    agent_action="no_reply",
+                    agent_reason="activity_disabled",
+                )
             return self._record_reply(
                 reply="",
                 action="no_reply",
@@ -350,6 +424,9 @@ class LocalAgent:
                 persona_boundary_hit=persona_boundary_hit,
                 social_snapshot=snapshot.to_dict(),
                 turn=turn,
+                reply_to_bot=reply_to_bot,
+                dialogue_state=dialogue_state,
+                record_incoming_event=record_incoming_event,
             )
             result.metadata["stage_timings"] = self._stage_timings(started_at)
             return result
@@ -362,16 +439,18 @@ class LocalAgent:
                 message=message,
                 parsed=parsed,
                 reply_to_bot=reply_to_bot,
+                dialogue_state=dialogue_state,
             )
         if gate.action == "no_reply":
-            self._record_incoming_event(
-                user_name=user_name,
-                message=message,
-                parsed=parsed,
-                external_context=external_context,
-                agent_action="no_reply",
-                agent_reason=gate.reason,
-            )
+            if record_incoming_event:
+                self._record_incoming_event(
+                    user_name=user_name,
+                    message=message,
+                    parsed=parsed,
+                    external_context=external_context,
+                    agent_action="no_reply",
+                    agent_reason=gate.reason,
+                )
             return self._record_reply(
                 reply="",
                 action="no_reply",
@@ -410,6 +489,8 @@ class LocalAgent:
             persona_boundary_hit=persona_boundary_hit,
             social_snapshot=snapshot.to_dict(),
             turn=turn,
+            dialogue_state=dialogue_state,
+            record_incoming_event=record_incoming_event,
         )
         result.metadata.update(await self._finish_placeholder_task(placeholder_task, placeholder_metadata))
         result.metadata["stage_timings"] = self._stage_timings(started_at)
@@ -450,8 +531,22 @@ class LocalAgent:
             },
         )
 
-    async def _attention_gate(self, *, user_name: str, message: str, parsed, reply_to_bot: bool = False) -> GateDecision:
-        web_needed = self._web_needed_for(message)
+    async def _attention_gate(
+        self,
+        *,
+        user_name: str,
+        message: str,
+        parsed,
+        reply_to_bot: bool = False,
+        dialogue_state: DialogueState | None = None,
+    ) -> GateDecision:
+        dialogue_state = dialogue_state or self.dialogue_state.for_turn(
+            user_name=user_name,
+            message=message,
+            reply_to_bot=reply_to_bot,
+        )
+        web_query = self._web_query_for_turn(user_name, message, reply_to_bot=reply_to_bot)
+        web_needed = bool(web_query)
         math_needed = self._math_needed_for(message)
         slow_context_needed = web_needed or math_needed
         fast_reply = self._is_fast_message(message) and not slow_context_needed
@@ -534,8 +629,10 @@ class LocalAgent:
                     "attention": "direct",
                     "attention_score": 0.88,
                     "decision_parse_status": "local_quote_reply",
+                    "web_query": web_query,
                     "thinking_plan": thinking_plan,
                     "predicted_latency_seconds": predicted_latency,
+                    "dialogue_state": dialogue_state.to_metadata(),
                     "model_used": False,
                 },
             )
@@ -565,6 +662,7 @@ class LocalAgent:
                     "address_kind": address.kind,
                     "content_after_alias": address.content_after_alias,
                     "decision_parse_status": "local_name_address",
+                    "web_query": web_query,
                     "thinking_plan": thinking_plan,
                     "predicted_latency_seconds": predicted_latency,
                     "model_used": False,
@@ -575,6 +673,7 @@ class LocalAgent:
             user_name=user_name,
             message=message,
             web_needed=web_needed,
+            dialogue_state=dialogue_state,
         )
         try:
             model_reply = await self.gate_model_client.chat(messages, max_tokens=96)
@@ -627,6 +726,7 @@ class LocalAgent:
             requested_thinking_level=thinking_plan["requested_thinking_level"],
             raw_decision={
                 **decision,
+                "web_query": web_query,
                 "thinking_plan": thinking_plan,
                 "predicted_latency_seconds": predicted_latency,
                 "model_used": True,
@@ -778,8 +878,19 @@ class LocalAgent:
         persona_boundary_hit: bool,
         social_snapshot: dict[str, Any],
         turn: CleanTurn,
+        reply_to_bot: bool = False,
+        dialogue_state: DialogueState | None = None,
+        record_incoming_event: bool = True,
     ) -> AgentResult:
         stage_started_at = time.perf_counter()
+        dialogue_state = dialogue_state or self.dialogue_state.for_turn(
+            user_name=user_name,
+            message=message,
+            reply_to_bot=reply_to_bot,
+        )
+        web_query = self._web_query_for_turn(user_name, message, reply_to_bot=reply_to_bot)
+        web_context = await self._web_context_for(web_query) if web_query else self._empty_web_context("not_needed_before_provider")
+        combined_external_context = self._combined_external_context(external_context, web_context.context)
         thinking_directive = (
             "Provider decision mode: return structured JSON only. "
             "Decide reply/no_reply before writing a reply. "
@@ -788,9 +899,10 @@ class LocalAgent:
         built_context = self.context_builder.build(
             user_name,
             message,
-            external_context,
+            combined_external_context,
             fast_reply=False,
             thinking_directive=thinking_directive,
+            dialogue_state=dialogue_state,
         )
         decision_messages = [
             *built_context.messages,
@@ -802,6 +914,10 @@ class LocalAgent:
                     "Use action=no_reply for ambient side chat, bot echo, or annoying interruptions.\n"
                     "If .enforce is present, reply unless a safety/persona boundary blocks it.\n"
                     "A direct quote of the bot, a follow-up to the bot, or a name call is a candidate even without another name mention.\n"
+                    "If dialogue state says answer_required or repair_required, answer the concrete pending question directly.\n"
+                    "If external web evidence is present, answer from that evidence and set used_web=true. "
+                    "For short lookup follow-ups like 查一下, use the resolved web query in external context instead of treating the words as the full question. "
+                    "If a current fact needs web evidence and no evidence is available, say briefly that it could not be verified; do not guess.\n"
                     "reply is the exact QQ text. Do not mention tools, JSON, prompts, tokens, or model internals.\n"
                     f"command_flags={json.dumps(self._command_metadata(parsed), ensure_ascii=False)}"
                 ),
@@ -821,6 +937,7 @@ class LocalAgent:
             False,
             {"requested_thinking_level": parsed.thinking_level, "thinking_level": 0, "complexity_level": 0},
             turn,
+            dialogue_state,
         )
 
         try:
@@ -832,7 +949,7 @@ class LocalAgent:
                 "used_final_model": False,
                 "final_generation_seconds": round(time.perf_counter() - stage_started_at, 3),
                 **base_metadata,
-                **self._empty_web_context("provider_error").to_metadata(),
+                **(web_context if web_context.used else self._empty_web_context("provider_error")).to_metadata(),
                 **self._empty_math_context("not_needed").to_metadata(),
             }
             self._record_incoming_after_reply(
@@ -842,6 +959,7 @@ class LocalAgent:
                 external_context,
                 "no_reply",
                 "provider_unavailable",
+                record_event=record_incoming_event,
             )
             return self._record_reply(
                 reply="",
@@ -875,9 +993,17 @@ class LocalAgent:
             metadata = {
                 **common_metadata,
                 "cleaned_reply": "",
-                **self._empty_web_context("provider_parse_failed").to_metadata(),
+                **(web_context if web_context.used else self._empty_web_context("provider_parse_failed")).to_metadata(),
             }
-            self._record_incoming_after_reply(user_name, message, parsed, external_context, "no_reply", "invalid_provider_decision")
+            self._record_incoming_after_reply(
+                user_name,
+                message,
+                parsed,
+                external_context,
+                "no_reply",
+                "invalid_provider_decision",
+                record_event=record_incoming_event,
+            )
             return self._record_reply(
                 reply="",
                 action="no_reply",
@@ -891,23 +1017,35 @@ class LocalAgent:
         reply = self.persona_guard.clean_reply(str(decision.get("reply", "")).strip()) if action == "reply" else ""
         reason = str(decision.get("reason", "provider_decision")).strip() or "provider_decision"
         web_sources = decision.get("sources") if isinstance(decision.get("sources"), list) else []
+        if not web_sources and web_context.sources:
+            web_sources = [source.to_dict() for source in web_context.sources]
+        provider_used_web = bool(decision.get("used_web"))
+        web_metadata = web_context.to_metadata()
         metadata = {
             **common_metadata,
             "cleaned_reply": reply,
             "provider_decision_json": decision,
-            "web_used": bool(decision.get("used_web")),
-            "local_time_used": False,
-            "search_used": bool(decision.get("used_web")),
-            "browser_used": bool(decision.get("used_web")),
-            "web_query": "",
+            **web_metadata,
+            "web_used": bool(web_metadata.get("web_used")) or provider_used_web,
+            "local_time_used": bool(web_metadata.get("local_time_used")),
+            "search_used": bool(web_metadata.get("search_used")) or provider_used_web,
+            "browser_used": bool(web_metadata.get("browser_used")),
+            "web_query": web_metadata.get("web_query") or web_query,
             "web_sources": web_sources,
-            "tool_latency_seconds": 0,
-            "web_reason": "provider_native_web" if decision.get("used_web") else "not_needed_by_provider",
-            "web_error": "",
+            "tool_latency_seconds": web_metadata.get("tool_latency_seconds", 0),
+            "web_reason": web_metadata.get("web_reason") or ("provider_native_web" if provider_used_web else "not_needed_by_provider"),
+            "web_error": web_metadata.get("web_error", ""),
+            "provider_native_web_used": provider_used_web,
         }
-        self._record_incoming_after_reply(user_name, message, parsed, external_context, action, reason)
-        if action == "reply":
-            self._maybe_store_user_memory(user_name, message)
+        self._record_incoming_after_reply(
+            user_name,
+            message,
+            parsed,
+            external_context,
+            action,
+            reason,
+            record_event=record_incoming_event,
+        )
         return self._record_reply(
             reply=reply,
             action=action,
@@ -930,9 +1068,17 @@ class LocalAgent:
         persona_boundary_hit: bool = False,
         social_snapshot: dict[str, Any] | None = None,
         turn: CleanTurn | None = None,
+        dialogue_state: DialogueState | None = None,
+        record_incoming_event: bool = True,
     ) -> AgentResult:
         stage_started_at = time.perf_counter()
-        web_context = await self._web_context_for(message) if web_needed else self._empty_web_context("not_needed_after_gate")
+        dialogue_state = dialogue_state or self.dialogue_state.for_turn(
+            user_name=user_name,
+            message=message,
+            reply_to_bot=bool(gate and gate.raw_decision.get("decision_parse_status") == "local_quote_reply"),
+        )
+        web_query = self._web_query_from_gate(gate, message)
+        web_context = await self._web_context_for(web_query) if web_needed else self._empty_web_context("not_needed_after_gate")
         math_context = await self._math_context_for(message) if self._math_needed_for(message) else self._empty_math_context("not_needed")
         if math_context.used:
             self.store.append_event(
@@ -977,6 +1123,7 @@ class LocalAgent:
             combined_external_context,
             fast_reply=fast_reply,
             thinking_directive=thinking_directive,
+            dialogue_state=dialogue_state,
         )
         final_messages = self._final_messages(
             built_context.messages,
@@ -984,6 +1131,7 @@ class LocalAgent:
             web_context=web_context,
             math_context=math_context,
             thinking_directive=thinking_directive,
+            dialogue_state=dialogue_state,
         )
 
         try:
@@ -1007,12 +1155,21 @@ class LocalAgent:
                     pragmatic_context_needed,
                     thinking_plan,
                     turn,
+                    dialogue_state,
                 ),
                 **web_context.to_metadata(),
                 **math_context.to_metadata(),
                 **placeholder_metadata,
             }
-            self._record_incoming_after_reply(user_name, message, parsed, external_context, "reply", "model_unavailable")
+            self._record_incoming_after_reply(
+                user_name,
+                message,
+                parsed,
+                external_context,
+                "reply",
+                "model_unavailable",
+                record_event=record_incoming_event,
+            )
             return self._record_reply(
                 reply=reply,
                 action="reply",
@@ -1051,15 +1208,22 @@ class LocalAgent:
                 pragmatic_context_needed,
                 thinking_plan,
                 turn,
+                dialogue_state,
             ),
             **web_context.to_metadata(),
             **math_context.to_metadata(),
             **placeholder_metadata,
         }
 
-        self._record_incoming_after_reply(user_name, message, parsed, external_context, action, reason)
-        if action == "reply":
-            self._maybe_store_user_memory(user_name, message)
+        self._record_incoming_after_reply(
+            user_name,
+            message,
+            parsed,
+            external_context,
+            action,
+            reason,
+            record_event=record_incoming_event,
+        )
 
         return self._record_reply(
             reply=reply,
@@ -1084,6 +1248,7 @@ class LocalAgent:
         pragmatic_context_needed: bool = False,
         thinking_plan: dict[str, Any] | None = None,
         turn: CleanTurn | None = None,
+        dialogue_state: DialogueState | None = None,
     ) -> dict[str, Any]:
         command_metadata = self._command_metadata(parsed) if parsed is not None else {}
         plan = thinking_plan or {
@@ -1098,6 +1263,7 @@ class LocalAgent:
                 "lines": memory_lines,
                 "count": len(memory_lines),
             },
+            "dialogue_state": dialogue_state.to_metadata() if dialogue_state else None,
             "turn_cleaning": turn.to_metadata() if turn else None,
             "gate_decision": gate.to_metadata() if gate else None,
             "persona_boundary_hit": persona_boundary_hit,
@@ -1122,8 +1288,10 @@ class LocalAgent:
         external_context: str,
         action: str,
         reason: str,
+        *,
+        record_event: bool = True,
     ) -> None:
-        if parsed is None:
+        if parsed is None or not record_event:
             return
         self._record_incoming_event(
             user_name=user_name,
@@ -1144,6 +1312,11 @@ class LocalAgent:
         blocked: bool,
         metadata: dict[str, Any] | None = None,
     ) -> AgentResult:
+        output_metadata = dict(metadata or {})
+        notice = str(output_metadata.get("command_resolution_notice", "")).strip()
+        if notice and reply.strip():
+            reply = f"{notice}\n{reply}"
+
         if action == "no_reply":
             kind = "assistant_no_reply"
             event_content = reply or f"no_reply: {reason}"
@@ -1151,7 +1324,6 @@ class LocalAgent:
             kind = "assistant_blocked" if blocked else "assistant_reply"
             event_content = reply
 
-        output_metadata = dict(metadata or {})
         event = self.store.append_event(
             source="agent",
             kind=kind,
@@ -1199,6 +1371,8 @@ class LocalAgent:
                 "setting_updates": dict(parsed.setting_updates),
                 "setting_errors": list(parsed.setting_errors),
                 "command_suffixes": list(parsed.command_suffixes),
+                "command_resolution_notice": parsed.command_resolution_notice,
+                "command_resolution": dict(parsed.command_resolution),
                 "origin": "qq_loop",
                 "agent_action": agent_action,
                 "agent_reason": agent_reason,
@@ -1215,6 +1389,7 @@ class LocalAgent:
             summary = f"{user_name}: {capture.summary}"
             if self._memory_summary_exists(summary):
                 continue
+            expires_at = self._memory_expires_at(capture.ttl_seconds)
             memory = self.store.add_memory(
                 kind=capture.kind,
                 summary=summary,
@@ -1224,9 +1399,17 @@ class LocalAgent:
                     "source": "auto_memory_capture",
                     "user_name": user_name,
                     "original_message": message[:500],
+                    "expires_at": expires_at,
                 },
             )
-            saved.append({"id": memory.id, "kind": memory.kind, "summary": memory.summary})
+            saved.append(
+                {
+                    "id": memory.id,
+                    "kind": memory.kind,
+                    "summary": memory.summary,
+                    "expires_at": expires_at,
+                }
+            )
 
         if saved:
             self.store.append_event(
@@ -1235,6 +1418,12 @@ class LocalAgent:
                 content=f"Captured {len(saved)} memory item(s) from {user_name}",
                 metadata={"user_name": user_name, "memory_ids": [item["id"] for item in saved], "items": saved},
             )
+
+    def _memory_expires_at(self, ttl_seconds: int | None) -> str:
+        if ttl_seconds is None:
+            return ""
+        expires_at = datetime.now(UTC) + timedelta(seconds=max(1, int(ttl_seconds)))
+        return expires_at.isoformat(timespec="seconds")
 
     def _memory_summary_exists(self, summary: str) -> bool:
         return any(memory.summary == summary for memory in self.store.search_memories(summary, limit=1))
@@ -1308,9 +1497,18 @@ class LocalAgent:
             "setting_updates": dict(parsed.setting_updates),
             "setting_errors": list(parsed.setting_errors),
             "command_suffixes": list(parsed.command_suffixes),
+            "command_resolution_notice": parsed.command_resolution_notice,
+            "command_resolution": dict(parsed.command_resolution),
         }
 
-    def _gate_messages(self, *, user_name: str, message: str, web_needed: bool) -> list[dict[str, str]]:
+    def _gate_messages(
+        self,
+        *,
+        user_name: str,
+        message: str,
+        web_needed: bool,
+        dialogue_state: DialogueState | None = None,
+    ) -> list[dict[str, str]]:
         recent_events = self.store.recent_events(limit=8)
         recent_lines = []
         for event in recent_events:
@@ -1318,6 +1516,7 @@ class LocalAgent:
                 continue
             recent_lines.append(f"{event.source}/{event.kind}: {event.content}")
         recent_text = "\n".join(recent_lines[-4:]) or "none"
+        dialogue_text = "\n".join(dialogue_state.lines) if dialogue_state and dialogue_state.lines else "none"
         aliases = ", ".join(self.persona_guard.reply_aliases) or self.persona_guard.config.name
         prompt = (
             "Decide whether the local chat character should reply to the latest QQ group message.\n"
@@ -1331,6 +1530,8 @@ class LocalAgent:
             "- A status description, fragment, complaint, or casual remark is not automatically no_reply. It can be reply if it invites a natural reaction, continues a shared thread, or silence would feel awkward.\n"
             "- If the latest message directly names the character or one of the listed aliases, treat it as direct unless context clearly says it is about someone else.\n"
             "- If recent_context shows the character just spoke or asked something, the latest message can be a followup answer even without naming the character.\n"
+            "- If dialogue_state says answer_required or repair_required, reply unless a safety boundary blocks it.\n"
+            "- If the user is asking what/which/kind about the character's previous words, classify as reply and require a concrete answer.\n"
             "- Treat followup as reply when continuing would be natural; do not require the character name for every turn.\n"
             "- Choose no_reply when the message is clearly aimed at someone else, replying would cut into another conversation, the addressee is unclear, or the character has no good reason to enter.\n"
             "- Higher activity means more willingness to join; lower activity requires clearer relevance and lower interruption risk.\n"
@@ -1340,6 +1541,7 @@ class LocalAgent:
             f"web_needed_if_reply: {str(web_needed).lower()}\n"
             f"latest_sender: {user_name}\n"
             f"latest_message: {message}\n\n"
+            f"dialogue_state:\n{dialogue_text}\n\n"
             f"recent_context:\n{recent_text}"
         )
         return [
@@ -1480,15 +1682,18 @@ class LocalAgent:
         web_context: WebContext,
         math_context: MathContext,
         thinking_directive: str,
+        dialogue_state: DialogueState | None = None,
     ) -> list[dict[str, str]]:
         messages = [dict(message) for message in base_messages]
         if len(messages) < 2:
             return messages
 
         gate_text = gate.to_metadata() if gate else {"action": "reply", "reason": "simulate"}
+        dialogue_text = dialogue_state.to_metadata() if dialogue_state else {"obligation": "none"}
         final_instruction = (
             "\n\nAttention gate selected reply. Now write only the final QQ message text.\n"
             f"gate: {json.dumps(gate_text, ensure_ascii=False)}\n"
+            f"dialogue_state: {json.dumps(dialogue_text, ensure_ascii=False)}\n"
             f"thinking_directive: {thinking_directive}\n"
             f"web_used: {str(web_context.used).lower()}\n"
             f"web_query: {web_context.query}\n"
@@ -1497,6 +1702,9 @@ class LocalAgent:
             "If the gate reason is direct_name_address, treat the character name as addressing, not as the message content. "
             "For name_prefix, answer the content after the name. For name_only, write a short natural acknowledgement in character, "
             "using recent context if it helps; do not just echo the name, do not use a fixed template, and avoid repeatedly replying with the same wording. "
+            "If dialogue_state says answer_required or repair_required, answer the concrete pending question directly. "
+            "If the user asks what/which/kind about what the character said, use recent_agent_replies and recent messages to resolve it. "
+            "If the previous answer was unclear or contradictory, repair it naturally; do not dodge, deny the topic, or reinterpret an ordinary object question as abstract without clear evidence. "
             "先读语气和上下文：判断最新消息是认真请求、讽刺、反问、抱怨、玩笑还是试探。"
             "如果一句话表面像技术问题，但上下文已经说明它是在讽刺或表达不满，不要写教程式回答。"
             "讽刺已经清楚时，不能只回一个“诶？”或类似困惑标记；要短短接住真正的矛盾。"
@@ -1536,6 +1744,12 @@ class LocalAgent:
         return any(marker in text for marker in markers)
 
     async def _web_context_for(self, message: str) -> WebContext:
+        provider_web_context = getattr(self.final_model_client, "web_search_context", None)
+        if callable(provider_web_context):
+            context = await provider_web_context(message)
+            if context.used or context.error:
+                return context
+
         if self.web_researcher is None:
             return self._empty_web_context("web_researcher_not_configured")
         return await self.web_researcher.answer_context(message)
@@ -1550,7 +1764,8 @@ class LocalAgent:
         return MathContext(used=False, query="", context="", reason=reason)
 
     def _web_needed_for(self, message: str) -> bool:
-        if self.web_researcher is None:
+        provider_web_context = getattr(self.final_model_client, "web_search_context", None)
+        if self.web_researcher is None and not callable(provider_web_context):
             return False
         should_search = getattr(self.web_researcher, "should_search", None)
         if callable(should_search):
@@ -1565,8 +1780,14 @@ class LocalAgent:
             "新闻",
             "最新",
             "今天",
+            "明天",
             "现在",
             "天气",
+            "气温",
+            "温度",
+            "下雨",
+            "降雨",
+            "预报",
             "日期",
             "几号",
             "几点",
@@ -1574,10 +1795,73 @@ class LocalAgent:
             "latest",
             "news",
             "weather",
+            "forecast",
+            "temperature",
+            "rain",
             "today",
+            "tomorrow",
             "now",
         )
         return any(trigger in text for trigger in triggers)
+
+    def _web_query_from_gate(self, gate: GateDecision | None, message: str) -> str:
+        if gate is None:
+            return message
+        raw_query = gate.raw_decision.get("web_query") if isinstance(gate.raw_decision, dict) else ""
+        query = str(raw_query or "").strip()
+        return query or message
+
+    def _web_query_for_turn(self, user_name: str, message: str, *, reply_to_bot: bool = False) -> str:
+        message = message.strip()
+        if not message:
+            return ""
+        if self._web_needed_for(message) and not self._is_bare_lookup_request(message):
+            return message
+        if reply_to_bot or self._is_bare_lookup_request(message):
+            recent_query = self._recent_searchable_user_message(user_name, exclude=message)
+            if recent_query:
+                return recent_query
+        if self._web_needed_for(message) and not self._is_bare_lookup_request(message):
+            return message
+        return ""
+
+    def _is_bare_lookup_request(self, message: str) -> bool:
+        compact = re.sub(r"[。！？!?,.，\s]+", "", message.casefold())
+        bare_requests = {
+            "查",
+            "查下",
+            "查一下",
+            "搜",
+            "搜下",
+            "搜一下",
+            "搜索",
+            "帮我查",
+            "帮我查下",
+            "帮我查一下",
+            "帮我搜",
+            "帮我搜一下",
+            "lookup",
+            "lookitup",
+            "searchit",
+            "checkit",
+        }
+        return compact in bare_requests
+
+    def _recent_searchable_user_message(self, user_name: str, *, exclude: str) -> str:
+        excluded = exclude.strip()
+        for event in self.store.recent_events(limit=60, newest_first=True):
+            if event.kind != "group_message":
+                continue
+            if event.source != user_name:
+                continue
+            content = event.content.strip()
+            if not content or content == excluded:
+                continue
+            if self._is_bare_lookup_request(content):
+                continue
+            if self._web_needed_for(content):
+                return content
+        return ""
 
     def _math_needed_for(self, message: str) -> bool:
         return self.math_tool.should_calculate(message)
@@ -1723,6 +2007,7 @@ class LocalAgent:
             ".set .think 0|1|2|3 changes the default thinking level; 0 is automatic. "
             ".set .activity 0..1 changes reply willingness. "
             ".score 0..1 [reason] records behavior feedback without changing personality. "
+            "Aliases: .force means .enforce; .log/.logs/.dbg mean .debug; .details means .detail. "
             "Say '清除关于 X 的记忆' or 'forget memory about X' to delete matching memories. "
             "Old #e/#d/#i commands are retired. Put suffix commands at the end."
         )
