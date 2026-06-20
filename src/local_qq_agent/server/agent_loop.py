@@ -326,7 +326,7 @@ class AgentLoop:
                 return self.status()
 
         self._task = asyncio.create_task(self._run(), name="qq-agent-loop")
-        self._processor_task = asyncio.create_task(self._process_pending_messages(), name="qq-agent-processor")
+        self._ensure_processor_running("start")
         self._set_activity(stage="running_idle", detail="Loop started. Waiting for new target messages.")
         start_event = self.store.append_event(
             source="loop",
@@ -516,6 +516,7 @@ class AgentLoop:
 
     async def _tick_unlocked(self) -> dict[str, Any]:
         started_at = time.perf_counter()
+        self._ensure_processor_running("tick")
         send_preflight = self._send_preflight()
         if not send_preflight["ok"]:
             self._set_activity(
@@ -803,6 +804,56 @@ class AgentLoop:
             processed = await self._process_next_pending_message()
             if not processed:
                 await asyncio.sleep(max(self.config.poll_interval_seconds, 0.2))
+
+    def _ensure_processor_running(self, reason: str) -> None:
+        if self._stop_requested:
+            return
+        if not self._is_active_instance():
+            self._stop_for_inactive_instance(f"processor_restart_{reason}")
+            return
+        if self._processor_task is not None and not self._processor_task.done():
+            return
+
+        self._processor_task = asyncio.create_task(self._process_pending_messages(), name="qq-agent-processor")
+        self._processor_task.add_done_callback(self._record_processor_exit)
+        if self.store is not None:
+            self.store.append_event(
+                source="loop",
+                kind="loop_processor_started",
+                content="QQ pending-message processor started",
+                metadata={"reason": reason, "pending_message_count": len(self._pending_messages)},
+            )
+
+    def _record_processor_exit(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled() or self._stop_requested:
+            return
+
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+
+        if error is None:
+            if self.store is not None:
+                self.store.append_event(
+                    source="loop",
+                    kind="loop_processor_stopped",
+                    content="QQ pending-message processor stopped unexpectedly",
+                    metadata={"pending_message_count": len(self._pending_messages)},
+                )
+            return
+
+        if self.store is not None:
+            self.store.append_event(
+                source="loop",
+                kind="loop_processor_error",
+                content="QQ pending-message processor failed",
+                metadata={
+                    "error": repr(error),
+                    "pending_message_count": len(self._pending_messages),
+                    "active_message": self._active_message,
+                },
+            )
 
     async def _process_next_pending_message(self) -> LoopDecision | None:
         if not self._is_active_instance():

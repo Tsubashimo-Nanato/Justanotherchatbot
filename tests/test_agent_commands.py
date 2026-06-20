@@ -206,6 +206,15 @@ def test_spontaneous_commands_are_standalone():
         assert parsed.command_suffixes == (command,)
 
 
+def test_spaced_spontaneous_command_is_normalized():
+    parsed = parse_message_commands(". spontaneous")
+
+    assert parsed.spontaneous_requested
+    assert parsed.content == ""
+    assert parsed.command_suffixes == (".spontaneous",)
+    assert parsed.command_resolution["changed"]
+
+
 def test_status_suffix_is_plain_text():
     parsed = parse_message_commands("show this .status")
 
