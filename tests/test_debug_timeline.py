@@ -59,3 +59,33 @@ def test_debug_timeline_keeps_human_readable_decision_fields(tmp_path):
     assert timeline[1]["tokens"]["prompt"] == 1200
     assert timeline[1]["tokens"]["local"]["total"] == 34
     assert timeline[1]["tokens"]["api"]["cached"] == 900
+
+
+def test_debug_timeline_collapses_linked_assistant_reply(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    assistant_event = store.append_event(
+        source="agent",
+        kind="assistant_reply",
+        content="still thinking, you?",
+        metadata={"reason": "direct_quote_reply"},
+    )
+    store.append_event(
+        source="loop",
+        kind="loop_decision",
+        content="reply decision",
+        metadata={
+            "assistant_event_id": assistant_event.id,
+            "sender_name": "Tsubashimo Nanato",
+            "message_text": "going to the store later",
+            "action": "reply",
+            "reason": "direct_quote_reply",
+            "sent": True,
+            "metadata": {"cleaned_reply": "still thinking, you?"},
+        },
+    )
+
+    timeline = build_debug_timeline(store.recent_events(limit=20), limit=10)
+
+    assert len(timeline) == 1
+    assert timeline[0]["kind"] == "loop_decision"
+    assert timeline[0]["reply"] == "still thinking, you?"

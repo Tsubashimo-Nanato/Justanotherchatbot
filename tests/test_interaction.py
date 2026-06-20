@@ -135,6 +135,19 @@ def test_quality_gate_does_not_hard_rewrite_style_phrase():
     assert "style_phrase" not in review.rule_hits
 
 
+def test_quality_gate_rewrites_recent_self_repeat():
+    review = QualityGate().review_rules(
+        message="going to the store later",
+        reply="still thinking, you?",
+        interaction_plan=None,
+        recent_agent_replies=("still thinking, you?",),
+    )
+
+    assert review.send_allowed
+    assert review.rewrite_needed
+    assert "recent_self_repeat" in review.rule_hits
+
+
 def test_quality_gate_blocks_internal_leak():
     review = QualityGate().review_rules(
         message="你是什么",

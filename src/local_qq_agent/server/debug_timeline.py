@@ -53,11 +53,27 @@ class TimelineItem:
 
 
 def build_debug_timeline(events: list[EventRecord], *, limit: int = 80) -> list[dict[str, Any]]:
-    items = [_timeline_item(event) for event in events if event.kind in VISIBLE_KINDS]
+    linked_assistant_ids = _linked_assistant_event_ids(events)
+    items = [
+        _timeline_item(event)
+        for event in events
+        if event.kind in VISIBLE_KINDS and event.id not in linked_assistant_ids
+    ]
     visible = [item.to_dict() for item in items if item is not None]
     if limit <= 0:
         return visible
     return visible[-limit:]
+
+
+def _linked_assistant_event_ids(events: list[EventRecord]) -> set[int]:
+    linked: set[int] = set()
+    for event in events:
+        if event.kind != "loop_decision":
+            continue
+        assistant_id = (event.metadata or {}).get("assistant_event_id")
+        if isinstance(assistant_id, int):
+            linked.add(assistant_id)
+    return linked
 
 
 def _timeline_item(event: EventRecord) -> TimelineItem | None:
@@ -88,7 +104,7 @@ def _timeline_item(event: EventRecord) -> TimelineItem | None:
             message=_message_text(metadata.get("message_text") or event.content),
             decision=_text(metadata.get("action")),
             reason=_text(metadata.get("reason")),
-            reply=_message_text(metadata.get("agent_reply") or metadata.get("cleaned_reply") or ""),
+            reply=_message_text(_loop_decision_reply(metadata)),
             sent=_bool_or_none(metadata.get("sent")),
             tokens=_token_summary(metadata),
             web=_web_summary(metadata),
@@ -144,6 +160,16 @@ def _timeline_item(event: EventRecord) -> TimelineItem | None:
         )
 
     return None
+
+
+def _loop_decision_reply(metadata: dict[str, Any]) -> str:
+    reply = metadata.get("agent_reply") or metadata.get("cleaned_reply")
+    if reply:
+        return _text(reply)
+    nested = metadata.get("metadata")
+    if isinstance(nested, dict):
+        return _text(nested.get("cleaned_reply") or nested.get("agent_reply"))
+    return ""
 
 
 def _token_summary(metadata: dict[str, Any]) -> dict[str, Any]:
