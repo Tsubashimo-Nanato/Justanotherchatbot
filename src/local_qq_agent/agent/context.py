@@ -58,18 +58,13 @@ class ContextBuilder:
         if fast_reply:
             fast_rule = "\nFast path: this is a simple chat turn. Reply directly, short, and do not overthink."
 
-        system_prompt = (
-            f"{self.persona_guard.build_system_prompt(memory_lines)}\n\n"
-            "语用判断: 先判断最新消息是认真提问、讽刺、反问、抱怨、玩笑、命令还是延续上一轮。"
-            " 如果已经能看出真实矛盾，不要只回答字面问题。"
-            "Generation rules: output only the QQ message text. Do not output reasoning. "
-            "First read the latest turn pragmatically: literal question, joke, sarcasm, complaint, command, or follow-up. "
-            "Do not force a reply if the turn is only ambient side-chat. "
-            "If it is directed at you or quoting/following you, reply in character. "
-            "Match language to the latest message and recent context; do not default to Chinese for English turns. "
-            f"{fast_rule}\n"
-            f"{self._interaction_text(interaction_lines)}"
-            f"{thinking_directive}"
+        system_prompt = self.persona_guard.build_system_prompt([])
+        runtime_prompt = self._runtime_prompt(
+            memory_lines=memory_lines,
+            dialogue_lines=dialogue_lines,
+            interaction_lines=interaction_lines,
+            thinking_directive=thinking_directive,
+            fast_rule=fast_rule,
         )
         user_prompt = self._build_user_prompt(
             user_name,
@@ -83,6 +78,7 @@ class ContextBuilder:
         return BuiltContext(
             messages=[
                 {"role": "system", "content": system_prompt},
+                {"role": "system", "content": runtime_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             memory_lines=memory_lines,
@@ -107,7 +103,9 @@ class ContextBuilder:
                 continue
             sender = event.metadata.get("sender_name") or event.source
             text = event.metadata.get("clean_text") or event.content
-            lines.append(f"{sender}: {str(text).strip()}")
+            clean = str(text).strip()
+            if clean:
+                lines.append(f"{sender}: {clean}")
         return lines[-RECENT_CONTEXT_LIMIT:]
 
     def _style_sample_lines(self, events: list[EventRecord]) -> list[str]:
@@ -124,9 +122,8 @@ class ContextBuilder:
             if not self._same_person_hint(sender, target):
                 continue
             text = str(event.metadata.get("clean_text") or event.content).strip()
-            if not text:
-                continue
-            samples.append(text)
+            if text:
+                samples.append(text)
 
         return [f"style_sample_from_{target}: {sample}" for sample in samples[-STYLE_SAMPLE_LIMIT:]]
 
@@ -169,11 +166,36 @@ class ContextBuilder:
             f"external/tool evidence:\n{external_text}\n\n"
             f"latest sender: {user_name}\n"
             f"latest message: {user_message}\n\n"
-            "Decide the real intent from context, especially the 真实语气和意图, then output only the text you would send to QQ."
-            " 如果这句话是讽刺、反问、抱怨或玩笑，不要只回答字面问题，也不要只回一个疑问词。"
+            "Decide the real intent from context, especially the tone and pragmatic intent. "
+            "语用判断：看真实语气和意图。If this is sarcasm, a rhetorical jab, complaint, or joke, "
+            "不要只回答字面问题; do not answer only the literal words. "
+            "If this is a concrete follow-up, answer the concrete object from recent context. "
+            "Output only the text to send to QQ."
         )
 
-    def _interaction_text(self, interaction_lines: list[str]) -> str:
-        if not interaction_lines:
-            return ""
-        return "Interaction policy:\n" + "\n".join(f"- {line}" for line in interaction_lines) + "\n"
+    def _runtime_prompt(
+        self,
+        *,
+        memory_lines: list[str],
+        dialogue_lines: list[str],
+        interaction_lines: list[str],
+        thinking_directive: str,
+        fast_rule: str,
+    ) -> str:
+        memories = "\n".join(f"- {line}" for line in memory_lines) if memory_lines else "- no relevant memory"
+        dialogue = "\n".join(f"- {line}" for line in dialogue_lines) if dialogue_lines else "- none"
+        interaction = "\n".join(f"- {line}" for line in interaction_lines) if interaction_lines else "- none"
+        return (
+            "Runtime context for this turn. This block may change every message; do not treat it as persona text.\n\n"
+            f"Relevant memory, social state, and style samples:\n{memories}\n\n"
+            f"Dialogue obligations:\n{dialogue}\n\n"
+            f"Interaction policy:\n{interaction}\n\n"
+            "Generation rules: output only the QQ message text. Do not output reasoning. "
+            "First read the latest turn pragmatically: literal question, joke, sarcasm, complaint, command, or follow-up. "
+            "语用判断：先看真实语气和意图，尤其是讽刺、抱怨、玩笑和追问；不要只回答字面问题，不要只回一个疑问词。 "
+            "Do not force a reply if the turn is only ambient side-chat. "
+            "If it is directed at you or quoting/following you, reply in character. "
+            "Match language to the latest message and recent context; do not default to Chinese for English turns. "
+            f"{fast_rule}\n"
+            f"{thinking_directive}"
+        )

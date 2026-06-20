@@ -25,7 +25,7 @@ style_learning:
   target_user: "Tsubashimo Nanato"
   base_anchor_weight: "low"
   proactive_topic_bias: 0.68
-  auto_distill_on_start: true
+  auto_distill_on_start: false
   generated_anchor_path: "personality/nanato/profile/generated_style_anchor.md"
   run_log_dir: "personality/nanato/memory/runtime/run_logs"
 

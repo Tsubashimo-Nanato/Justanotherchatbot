@@ -117,14 +117,18 @@ The QQ loop is careful by default. A message from `target_sender_name` is not en
 Commands are dot suffixes appended to the end of an incoming QQ message. They are stripped before the text is sent to the model. Old `#e`, `#d`, and `#i` suffixes are deprecated and are now treated as normal text.
 
 - `.enforce`: forced reply. The agent must call the language model and reply even if the message would normally be skipped.
+- `.force`, `.f`, `.e`, and common typo `.enforece`: aliases for `.enforce`.
 - `.detail`: debug reply. The QQ reply includes elapsed time, model latency, completion token/sec, prompt tokens, completion tokens, total tokens, thinking level, and web usage.
 - `.debug`: diagnostic reply. The QQ reply includes a compact diagnostic summary with event id, clean-turn reason, removed-line count, requested/effective thinking, web query, and source count. Full raw metadata stays in the debug UI/event log.
+- `.log`, `.logs`, `.dbg`, `.d`, and `.l`: aliases for `.debug`.
 - `.ignore`: ignore completely. The agent skips memory write, model inference, and QQ send.
 - `.think`: current message uses thinking level `1`, the lowest explicit thinking budget.
 - `.think 0|1|2|3`: current message thinking level. `0` means automatic selection from message complexity; `1`, `2`, and `3` force that level for the current message.
 - `.help`: standalone help command. It does not call the model and must be the whole message.
 - `.status`: standalone status command. It does not call the model and reports runtime settings, social state, and persona reload policy.
 - `.reboot`: standalone agent-only reboot command. It restarts the FastAPI agent service so changed personality files are loaded, while keeping the local model server running.
+- `.loop start` / `.loop stop`: standalone QQ commands that start or stop listening and send a short confirmation to QQ.
+- `.spon`, `.spontaneous`, `.s`: standalone QQ commands that force one spontaneous topic with thinking level 3.
 - `.score 0..1 [reason]`: standalone feedback command for the previous reply. It records behavior feedback in memory without changing personality files and sends no QQ reply. Compact form such as `.score0.3 打断` is also accepted.
 
 Runtime setting commands are standalone messages:
@@ -145,6 +149,8 @@ hello .detail .debug .think 2 .enforce
 ```
 
 Commands in the middle of a sentence are plain text. Without `.detail` or `.debug`, the QQ reply only contains the model reply text. Full metadata is still stored in the debug UI and event log.
+
+When `/api/qq/arm` is called from the debug UI, the adapter arms real sending, sends `QQ armed` to the currently matched group, then brings the QQ window to the foreground and maximizes it. The debug UI also exposes both an agent-service restart button and a full-service restart button; the browser page can stay open and reconnect as the service comes back.
 
 `.score` is for behavior correction, not personality editing. A low score with a reason such as `打断` tells the agent that the previous reply was poorly timed or inappropriate; the feedback becomes `behavior_feedback` memory for future attention/reply decisions. Low scores below `0.35` with a reason are also appended to the active profile's `memory/behavior_feedback.jsonl` for later review by a separate personality agent. They do not rewrite personality anchors.
 # Nanato Persona Runtime Learning

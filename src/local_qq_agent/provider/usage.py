@@ -13,6 +13,11 @@ class UsageSnapshot:
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    cached_tokens: int
+    reasoning_tokens: int
+    cost_in_usd_ticks: int
+    source_count: int
+    tool_count: int
     budget: int
     degrade_at_ratio: float
 
@@ -36,6 +41,12 @@ class UsageSnapshot:
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
+            "cached_tokens": self.cached_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "cost_in_usd_ticks": self.cost_in_usd_ticks,
+            "cost_usd": round(self.cost_in_usd_ticks / 10_000_000_000, 8),
+            "source_count": self.source_count,
+            "tool_count": self.tool_count,
             "budget": self.budget,
             "used_ratio": round(self.used_ratio, 4),
             "degrade_at_ratio": self.degrade_at_ratio,
@@ -60,10 +71,21 @@ class ProviderUsageLedger:
         operation: str = "chat",
     ) -> None:
         prompt_tokens = _token_count(usage.get("prompt_tokens"))
+        if prompt_tokens <= 0:
+            prompt_tokens = _token_count(usage.get("input_tokens"))
         completion_tokens = _token_count(usage.get("completion_tokens"))
+        if completion_tokens <= 0:
+            completion_tokens = _token_count(usage.get("output_tokens"))
         total_tokens = _token_count(usage.get("total_tokens")) or prompt_tokens + completion_tokens
         if total_tokens <= 0:
             return
+        prompt_details = _details(usage, "prompt_tokens_details", "input_tokens_details")
+        completion_details = _details(usage, "completion_tokens_details", "output_tokens_details")
+        cached_tokens = _token_count(prompt_details.get("cached_tokens"))
+        reasoning_tokens = _token_count(completion_details.get("reasoning_tokens"))
+        cost_ticks = _token_count(usage.get("cost_in_usd_ticks"))
+        source_count = _token_count(usage.get("num_sources_used"))
+        tool_count = _token_count(usage.get("num_server_side_tools_used"))
 
         self.store.append_event(
             source="provider",
@@ -77,6 +99,12 @@ class ProviderUsageLedger:
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": total_tokens,
+                "cached_tokens": cached_tokens,
+                "reasoning_tokens": reasoning_tokens,
+                "cost_in_usd_ticks": cost_ticks,
+                "source_count": source_count,
+                "tool_count": tool_count,
+                "raw_usage": usage,
             },
         )
 
@@ -85,6 +113,11 @@ class ProviderUsageLedger:
         prompt_tokens = 0
         completion_tokens = 0
         total_tokens = 0
+        cached_tokens = 0
+        reasoning_tokens = 0
+        cost_ticks = 0
+        source_count = 0
+        tool_count = 0
         try:
             events = self.store.recent_events(limit=2000, newest_first=True)
         except Exception:
@@ -98,11 +131,21 @@ class ProviderUsageLedger:
             prompt_tokens += _token_count(metadata.get("prompt_tokens"))
             completion_tokens += _token_count(metadata.get("completion_tokens"))
             total_tokens += _token_count(metadata.get("total_tokens"))
+            cached_tokens += _token_count(metadata.get("cached_tokens"))
+            reasoning_tokens += _token_count(metadata.get("reasoning_tokens"))
+            cost_ticks += _token_count(metadata.get("cost_in_usd_ticks"))
+            source_count += _token_count(metadata.get("source_count"))
+            tool_count += _token_count(metadata.get("tool_count"))
         return UsageSnapshot(
             date=today,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
+            cached_tokens=cached_tokens,
+            reasoning_tokens=reasoning_tokens,
+            cost_in_usd_ticks=cost_ticks,
+            source_count=source_count,
+            tool_count=tool_count,
             budget=self.budget,
             degrade_at_ratio=self.degrade_at_ratio,
         )
@@ -114,3 +157,11 @@ def _token_count(value: Any) -> int:
     if isinstance(value, int | float) and value > 0:
         return int(value)
     return 0
+
+
+def _details(usage: dict[str, Any], *keys: str) -> dict[str, Any]:
+    for key in keys:
+        value = usage.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}

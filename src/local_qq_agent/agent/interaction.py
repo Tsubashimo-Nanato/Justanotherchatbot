@@ -8,6 +8,7 @@ from typing import Any
 @dataclass(frozen=True)
 class InteractionPlan:
     mode: str
+    reply_shape: str
     hook_budget: int
     affinity: float
     directness: str
@@ -20,18 +21,25 @@ class InteractionPlan:
     def prompt_lines(self) -> list[str]:
         lines = [
             f"interaction_mode: {self.mode}",
+            f"reply_shape: {self.reply_shape}",
             f"hook_budget: {self.hook_budget}",
             f"interaction_reason: {self.reason}",
-            "interaction_rule: Short does not mean dead-end. Add a small information gain when hook_budget is above 0.",
-            "interaction_rule: Information gain can be emotion, concrete answer, tiny tease, context connection, or one light follow-up.",
-            "interaction_rule: Do not force a new topic. Do not ask a question when hook_budget is 0.",
+            "interaction_rule: Follow reply_shape before deciding length. Short is fine; dead-end is not.",
+            "interaction_rule: Information gain can be a direct answer, emotion, concrete detail, tiny tease, or context connection.",
+            "interaction_rule: Do not force a new topic. Avoid follow-up questions unless reply_shape explicitly allows a hook.",
         ]
-        if self.hook_budget >= 2:
+        if self.reply_shape == "answer_with_context_hook":
+            lines.append("interaction_rule: Answer first, then add one light context hook or low-pressure follow-up if natural.")
+        elif self.reply_shape == "answer_with_reaction":
+            lines.append("interaction_rule: Answer first, then add a small reaction; do not turn it into an interview.")
+        elif self.reply_shape == "answer_only":
+            lines.append("interaction_rule: Answer the concrete question cleanly; no extra topic needed.")
+        elif self.reply_shape == "ack_with_light_hook":
             lines.append(
-                "interaction_rule: A light follow-up or tease is allowed if it fits the current relationship and message."
+                "interaction_rule: Acknowledge the message and add one small context connection, tease, or gentle hook."
             )
-        elif self.hook_budget == 1:
-            lines.append("interaction_rule: Prefer a small reaction or context connection over a full follow-up question.")
+        else:
+            lines.append("interaction_rule: Minimal acknowledgement is enough; do not stretch the conversation.")
         return lines
 
 
@@ -45,6 +53,7 @@ class InteractionPolicy:
         dialogue_state: Any | None,
         direct_address: bool,
         reply_to_bot: bool,
+        continuation_budget: int | None = None,
     ) -> InteractionPlan:
         affinity = self._affinity(social_snapshot)
         message_kind = self._message_kind(message)
@@ -58,14 +67,17 @@ class InteractionPolicy:
             affinity=affinity,
             directness=directness,
             message_kind=message_kind,
+            continuation_budget=continuation_budget,
         )
         mode = self._mode(message_kind=message_kind, hook_budget=hook_budget, directness=directness)
+        reply_shape = self._reply_shape(message_kind=message_kind, hook_budget=hook_budget)
         reason = (
             f"{directness}; {message_kind}; affinity={affinity:.2f}; "
-            f"hook_budget={hook_budget}"
+            f"hook_budget={hook_budget}; reply_shape={reply_shape}"
         )
         return InteractionPlan(
             mode=mode,
+            reply_shape=reply_shape,
             hook_budget=hook_budget,
             affinity=affinity,
             directness=directness,
@@ -116,11 +128,22 @@ class InteractionPolicy:
             return "short_ping"
         return "statement"
 
-    def _hook_budget(self, *, affinity: float, directness: str, message_kind: str) -> int:
+    def _hook_budget(
+        self,
+        *,
+        affinity: float,
+        directness: str,
+        message_kind: str,
+        continuation_budget: int | None = None,
+    ) -> int:
+        if continuation_budget is not None:
+            return max(0, min(3, int(continuation_budget)))
         if message_kind in {"empty"}:
             return 0
         if message_kind == "question":
-            return 0
+            if directness in {"reply_to_bot", "direct_address", "answer_required", "repair_required", "direct", "followup"}:
+                return 2 if affinity >= 0.75 else 1
+            return 1 if affinity >= 0.75 else 0
         if directness in {"reply_to_bot", "direct_address", "answer_required", "repair_required", "direct", "followup"}:
             if message_kind in {"life_status", "complaint"}:
                 return 2 if affinity >= 0.75 else 1
@@ -139,6 +162,17 @@ class InteractionPolicy:
         if directness in {"reply_to_bot", "direct_address", "answer_required", "repair_required"}:
             return "bare_ack"
         return "minimal_or_no_extra"
+
+    def _reply_shape(self, *, message_kind: str, hook_budget: int) -> str:
+        if message_kind == "question":
+            if hook_budget >= 2:
+                return "answer_with_context_hook"
+            if hook_budget == 1:
+                return "answer_with_reaction"
+            return "answer_only"
+        if hook_budget > 0:
+            return "ack_with_light_hook"
+        return "minimal_ack"
 
     def _is_question(self, text: str) -> bool:
         if "?" in text or "？" in text:

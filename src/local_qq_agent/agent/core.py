@@ -19,11 +19,20 @@ from local_qq_agent.agent.commands import (
 )
 from local_qq_agent.agent.context import ContextBuilder
 from local_qq_agent.agent.dialogue_state import DialogueState, DialogueStateTracker
+from local_qq_agent.agent.engagement import EngagementPolicy, EngagementSignals
 from local_qq_agent.agent.interaction import InteractionPlan, InteractionPolicy
 from local_qq_agent.agent.memory_capture import MemoryCapturePolicy
 from local_qq_agent.agent.persona import PersonaGuard
 from local_qq_agent.agent.quality import QualityGate, QualityReview
 from local_qq_agent.agent.social_state import SocialStateTracker
+from local_qq_agent.agent.token_usage import (
+    add_usage,
+    api_usage,
+    empty_token_usage,
+    merge_token_usage,
+    scope_for_client,
+    usage_from_reply,
+)
 from local_qq_agent.agent.turns import CleanTurn, clean_turn_text
 from local_qq_agent.memory.store import SQLiteMemoryStore
 from local_qq_agent.model.openai_client import ModelReply, OpenAICompatibleClient
@@ -149,6 +158,7 @@ class LocalAgent:
         self.memory_capture_policy = MemoryCapturePolicy()
         self.dialogue_state = DialogueStateTracker(store)
         self.interaction_policy = InteractionPolicy()
+        self.engagement_policy = EngagementPolicy()
         self.placeholder_delay_seconds = 25.0
 
     @property
@@ -171,6 +181,8 @@ class LocalAgent:
             or parsed.reboot_requested
             or parsed.set_requested
             or parsed.score_requested
+            or bool(parsed.loop_command)
+            or parsed.spontaneous_requested
             or (parsed.diagnostic_requested and not parsed.content)
             or (parsed.ignored and not parsed.content)
         )
@@ -295,6 +307,7 @@ class LocalAgent:
         recent_bot_texts: tuple[str, ...] = (),
         reply_to_bot: bool = False,
         record_incoming_event: bool = True,
+        turn_identity: str = "",
     ) -> AgentResult:
         started_at = time.perf_counter()
         user_name = user_name.strip() or "group member"
@@ -302,6 +315,36 @@ class LocalAgent:
         message = turn.text
         parsed = await self._parse_message_commands(message)
         message = parsed.content
+
+        if parsed.loop_command:
+            reply = "监听开始。" if parsed.loop_command == "start" else "监听结束。"
+            return self._record_reply(
+                reply=reply,
+                action="reply",
+                reason=f"loop_{parsed.loop_command}_requested",
+                used_model=False,
+                blocked=False,
+                metadata={
+                    **self._command_metadata(parsed),
+                    "turn_cleaning": turn.to_metadata(),
+                    "loop_command_requested": parsed.loop_command,
+                },
+            )
+
+        if parsed.spontaneous_requested:
+            return self._record_reply(
+                reply="",
+                action="command",
+                reason="spontaneous_requested",
+                used_model=False,
+                blocked=False,
+                metadata={
+                    **self._command_metadata(parsed),
+                    "turn_cleaning": turn.to_metadata(),
+                    "spontaneous_requested": True,
+                    "thinking_level": 3,
+                },
+            )
 
         if parsed.help_requested:
             return self._record_reply(
@@ -391,8 +434,16 @@ class LocalAgent:
             message=message,
             reply_to_bot=reply_to_bot or turn.references_bot,
         )
+        direct_address = self._direct_character_address(message) is not None
+        directly_engaged = (
+            parsed.enforced
+            or reply_to_bot
+            or turn.references_bot
+            or direct_address
+            or dialogue_state.obligation in {"answer_required", "repair_required"}
+        )
 
-        if self.settings.activity <= 0 and not parsed.enforced:
+        if self.settings.activity <= 0 and not directly_engaged:
             if record_incoming_event:
                 self._record_incoming_event(
                     user_name=user_name,
@@ -414,6 +465,13 @@ class LocalAgent:
                     "settings": self.settings.to_dict(),
                     "persona_boundary_hit": False,
                     "social_state": self.social_state.snapshot(user_name).to_dict(),
+                    "engagement_decision": {
+                        "action": "no_reply",
+                        "reason": "activity_disabled",
+                        "directness": "ambient",
+                        "reply_probability": 0.0,
+                    },
+                    "token_usage": empty_token_usage(),
                 },
             )
 
@@ -442,6 +500,8 @@ class LocalAgent:
                 parsed=parsed,
                 reply_to_bot=reply_to_bot,
                 dialogue_state=dialogue_state,
+                turn_identity=turn_identity,
+                social_snapshot=snapshot.to_dict(),
             )
         if gate.action == "no_reply":
             if record_incoming_event:
@@ -463,9 +523,12 @@ class LocalAgent:
                     **self._command_metadata(parsed),
                     "turn_cleaning": turn.to_metadata(),
                     "gate_decision": gate.to_metadata(),
+                    "engagement_decision": gate.raw_decision.get("engagement_decision"),
+                    "engagement_signals": gate.raw_decision.get("engagement_signals"),
                     "placeholder_sent": False,
                     "persona_boundary_hit": persona_boundary_hit,
                     "social_state": self.social_state.snapshot(user_name).to_dict(),
+                    "token_usage": merge_token_usage(gate.raw_decision.get("token_usage")),
                     **self._empty_web_context("not_needed_after_gate").to_metadata(),
                     "stage_timings": self._stage_timings(started_at),
                 },
@@ -541,6 +604,8 @@ class LocalAgent:
         parsed,
         reply_to_bot: bool = False,
         dialogue_state: DialogueState | None = None,
+        turn_identity: str = "",
+        social_snapshot: dict[str, Any] | None = None,
     ) -> GateDecision:
         dialogue_state = dialogue_state or self.dialogue_state.for_turn(
             user_name=user_name,
@@ -581,6 +646,12 @@ class LocalAgent:
                 raw_decision={
                     "action": "reply",
                     "reason": "enforced",
+                    "engagement_decision": {
+                        "action": "reply",
+                        "reason": "enforced",
+                        "directness": "direct",
+                        "reply_probability": 1.0,
+                    },
                     "thinking_plan": thinking_plan,
                     "predicted_latency_seconds": predicted_latency,
                     "model_used": False,
@@ -606,6 +677,12 @@ class LocalAgent:
                     "action": "no_reply",
                     "reason": "empty_or_punctuation_only",
                     "decision_parse_status": "local_no_semantic_content",
+                    "engagement_decision": {
+                        "action": "no_reply",
+                        "reason": "empty_or_punctuation_only",
+                        "directness": "ambient",
+                        "reply_probability": 0.0,
+                    },
                     "model_used": False,
                 },
             )
@@ -631,6 +708,12 @@ class LocalAgent:
                     "attention": "direct",
                     "attention_score": 0.88,
                     "decision_parse_status": "local_quote_reply",
+                    "engagement_decision": {
+                        "action": "reply",
+                        "reason": "direct_quote_reply",
+                        "directness": "reply_to_bot",
+                        "reply_probability": 1.0,
+                    },
                     "web_query": web_query,
                     "thinking_plan": thinking_plan,
                     "predicted_latency_seconds": predicted_latency,
@@ -664,6 +747,12 @@ class LocalAgent:
                     "address_kind": address.kind,
                     "content_after_alias": address.content_after_alias,
                     "decision_parse_status": "local_name_address",
+                    "engagement_decision": {
+                        "action": "reply",
+                        "reason": "direct_name_address",
+                        "directness": "direct_address",
+                        "reply_probability": 1.0,
+                    },
                     "web_query": web_query,
                     "thinking_plan": thinking_plan,
                     "predicted_latency_seconds": predicted_latency,
@@ -694,7 +783,11 @@ class LocalAgent:
                 thinking_level=0,
                 max_thinking_level=0,
                 requested_thinking_level=parsed.thinking_level,
-            raw_decision={"error": str(error)},
+                raw_decision={
+                    "error": str(error),
+                    "token_usage": empty_token_usage(),
+                    "model_used": False,
+                },
             )
 
         decision = self._parse_model_decision(model_reply.content)
@@ -712,6 +805,29 @@ class LocalAgent:
         attention = str(decision.get("attention", "unclear")).strip() or "unclear"
         score = self._attention_score(decision.get("attention_score"), action)
         reason = str(decision.get("reason", "attention_gate")).strip() or "attention_gate"
+        directness = self._engagement_directness(
+            attention=attention,
+            reply_to_bot=reply_to_bot,
+            dialogue_state=dialogue_state,
+        )
+        signals = EngagementSignals.from_gate_decision(
+            decision,
+            direct_followup=directness in {"followup", "answer_required", "repair_required"},
+        )
+        engagement = self.engagement_policy.decide(
+            activity=self.settings.activity,
+            user_affinity=self._snapshot_float(social_snapshot, "affinity", 0.5),
+            global_affinity=self._snapshot_float(social_snapshot, "global_affinity", 0.5),
+            mood_label=str((social_snapshot or {}).get("global_mood", "neutral")),
+            mood_intensity=self._snapshot_float(social_snapshot, "mood_intensity", 0.0),
+            directness=directness,
+            signals=signals,
+            turn_key=turn_identity or f"{user_name}|{message}",
+            model_action=action,
+            model_reason=reason,
+        )
+        action = "reply" if engagement.action == "reply" else "no_reply"
+        reason = engagement.reason
         return GateDecision(
             action=action,
             reason=reason,
@@ -731,6 +847,13 @@ class LocalAgent:
                 "web_query": web_query,
                 "thinking_plan": thinking_plan,
                 "predicted_latency_seconds": predicted_latency,
+                "engagement_signals": signals.to_metadata(),
+                "engagement_decision": engagement.to_metadata(),
+                "token_usage": self._token_usage_for_reply(
+                    self.gate_model_client,
+                    model_reply,
+                    operation="gate",
+                ),
                 "model_used": True,
             },
         )
@@ -1001,6 +1124,17 @@ class LocalAgent:
             **base_metadata,
             **self._empty_math_context("not_needed").to_metadata(),
         }
+        common_metadata["token_usage"] = merge_token_usage(
+            common_metadata.get("token_usage"),
+            self._token_usage_for_reply(self.final_model_client, model_reply, operation="decision"),
+        )
+        if web_context.usage:
+            common_metadata["token_usage"] = add_usage(
+                common_metadata.get("token_usage"),
+                scope="api",
+                operation="web",
+                usage=api_usage(web_context.usage, latency_seconds=web_context.latency_seconds),
+            )
         if decision.get("reason") == "invalid_model_decision":
             metadata = {
                 **common_metadata,
@@ -1060,6 +1194,10 @@ class LocalAgent:
             "web_error": web_metadata.get("web_error", ""),
             "provider_native_web_used": provider_used_web,
         }
+        metadata["token_usage"] = merge_token_usage(
+            metadata.get("token_usage"),
+            quality_metadata.get("token_usage"),
+        )
         self._record_incoming_after_reply(
             user_name,
             message,
@@ -1166,9 +1304,20 @@ class LocalAgent:
             dialogue_state=dialogue_state,
             interaction_plan=interaction_plan,
         )
+        provider_operation = self._provider_operation_for(
+            fast_reply=fast_reply,
+            web_context=web_context,
+            math_context=math_context,
+            thinking_level=thinking_level,
+            pragmatic_context_needed=pragmatic_context_needed,
+        )
 
         try:
-            model_reply = await self.final_model_client.chat(final_messages, max_tokens=model_max_tokens)
+            model_reply = await self.final_model_client.chat(
+                final_messages,
+                max_tokens=model_max_tokens,
+                operation=provider_operation,
+            )
         except Exception as error:
             reply = self._fallback_reply(message)
             metadata = {
@@ -1237,6 +1386,9 @@ class LocalAgent:
             "prompt_tokens": model_reply.usage.get("prompt_tokens"),
             "completion_tokens": model_reply.usage.get("completion_tokens"),
             "total_tokens": model_reply.usage.get("total_tokens"),
+            "provider_operation": provider_operation,
+            "provider_endpoint": getattr(model_reply, "metadata", {}).get("endpoint"),
+            "reasoning_effort": getattr(model_reply, "metadata", {}).get("reasoning_effort"),
             "used_final_model": True,
             "final_generation_seconds": round(time.perf_counter() - stage_started_at, 3),
             **self._base_metadata(
@@ -1260,6 +1412,18 @@ class LocalAgent:
             **math_context.to_metadata(),
             **placeholder_metadata,
         }
+        metadata["token_usage"] = merge_token_usage(
+            metadata.get("token_usage"),
+            self._token_usage_for_reply(self.final_model_client, model_reply, operation="final"),
+            quality_metadata.get("token_usage"),
+        )
+        if web_context.usage:
+            metadata["token_usage"] = add_usage(
+                metadata.get("token_usage"),
+                scope="api",
+                operation="web",
+                usage=api_usage(web_context.usage, latency_seconds=web_context.latency_seconds),
+            )
 
         self._record_incoming_after_reply(
             user_name,
@@ -1291,6 +1455,7 @@ class LocalAgent:
         reply_to_bot: bool,
     ) -> InteractionPlan:
         gate_metadata = gate.to_metadata() if gate else None
+        continuation_budget = self._continuation_budget_from_gate(gate_metadata)
         return self.interaction_policy.plan(
             message=message,
             social_snapshot=social_snapshot,
@@ -1298,6 +1463,7 @@ class LocalAgent:
             dialogue_state=dialogue_state,
             direct_address=self._direct_character_address(message) is not None,
             reply_to_bot=reply_to_bot or bool(turn and turn.references_bot),
+            continuation_budget=continuation_budget,
         )
 
     async def _quality_checked_reply(
@@ -1331,6 +1497,7 @@ class LocalAgent:
                     interaction_plan=interaction_plan,
                 ),
                 max_tokens=96,
+                operation="rewrite",
             )
         except Exception as error:
             metadata["quality_rewrite_error"] = str(error)
@@ -1348,6 +1515,11 @@ class LocalAgent:
                 "quality_rewrite_raw": rewrite_reply.content,
                 "quality_rewrite_reply": rewritten,
                 "quality_second_review": second_review.to_metadata(),
+                "token_usage": self._token_usage_for_reply(
+                    self.final_model_client,
+                    rewrite_reply,
+                    operation="rewrite",
+                ),
             }
         )
         if rewritten and second_review.send_allowed and not second_review.rewrite_needed:
@@ -1375,6 +1547,13 @@ class LocalAgent:
         interaction_plan: InteractionPlan | None = None,
     ) -> dict[str, Any]:
         command_metadata = self._command_metadata(parsed) if parsed is not None else {}
+        gate_token_usage = {}
+        engagement_decision = None
+        engagement_signals = None
+        if gate is not None:
+            gate_token_usage = gate.raw_decision.get("token_usage") if isinstance(gate.raw_decision, dict) else {}
+            engagement_decision = gate.raw_decision.get("engagement_decision")
+            engagement_signals = gate.raw_decision.get("engagement_signals")
         plan = thinking_plan or {
             "requested_thinking_level": command_metadata.get("thinking_level"),
             "max_thinking_level": self.settings.default_thinking_level,
@@ -1391,6 +1570,8 @@ class LocalAgent:
             "interaction_plan": interaction_plan.to_metadata() if interaction_plan else None,
             "turn_cleaning": turn.to_metadata() if turn else None,
             "gate_decision": gate.to_metadata() if gate else None,
+            "engagement_decision": engagement_decision,
+            "engagement_signals": engagement_signals,
             "persona_boundary_hit": persona_boundary_hit,
             "pragmatic_context_needed": pragmatic_context_needed,
             "fast_reply": thinking_level <= 1,
@@ -1403,6 +1584,7 @@ class LocalAgent:
             "activity": self.settings.activity,
             "settings": self.settings.to_dict(),
             "social_state": social_snapshot or self.social_state.snapshot(user_name).to_dict(),
+            "token_usage": merge_token_usage(gate_token_usage),
         }
 
     def _record_incoming_after_reply(
@@ -1425,6 +1607,73 @@ class LocalAgent:
             external_context=external_context,
             agent_action=action,
             agent_reason=reason,
+        )
+
+    def _engagement_directness(
+        self,
+        *,
+        attention: str,
+        reply_to_bot: bool,
+        dialogue_state: DialogueState | None,
+    ) -> str:
+        if reply_to_bot:
+            return "reply_to_bot"
+        obligation = str(getattr(dialogue_state, "obligation", "") or "")
+        if obligation in {"answer_required", "repair_required"}:
+            return obligation
+        normalized = attention.strip().casefold()
+        if normalized == "direct":
+            return "direct"
+        if normalized == "followup":
+            return "followup"
+        if normalized == "other_person":
+            return "likely_other_conversation"
+        return "ambient"
+
+    def _continuation_budget_from_gate(self, gate_metadata: dict[str, Any] | None) -> int | None:
+        if not gate_metadata:
+            return None
+        raw = gate_metadata.get("raw_decision")
+        if not isinstance(raw, dict):
+            return None
+        engagement = raw.get("engagement_decision")
+        if not isinstance(engagement, dict):
+            return None
+        try:
+            return int(engagement.get("continuation_budget"))
+        except (TypeError, ValueError):
+            return None
+
+    def _snapshot_float(self, snapshot: dict[str, Any] | None, key: str, default: float) -> float:
+        try:
+            value = float((snapshot or {}).get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(0.0, min(1.0, value))
+
+    def _token_usage_for_reply(self, client: Any, reply: Any, *, operation: str) -> dict[str, Any]:
+        scope = scope_for_client(client)
+        return add_usage(
+            empty_token_usage(),
+            scope=scope,
+            operation=operation,
+            usage=usage_from_reply(reply, scope=scope),
+        )
+
+    def _add_reply_token_usage(
+        self,
+        token_usage: dict[str, Any] | None,
+        client: Any,
+        reply: Any,
+        *,
+        operation: str,
+    ) -> dict[str, Any]:
+        scope = scope_for_client(client)
+        return add_usage(
+            token_usage,
+            scope=scope,
+            operation=operation,
+            usage=usage_from_reply(reply, scope=scope),
         )
 
     def _record_reply(
@@ -1490,6 +1739,8 @@ class LocalAgent:
                 "reboot_requested": parsed.reboot_requested,
                 "set_requested": parsed.set_requested,
                 "score_requested": parsed.score_requested,
+                "loop_command": parsed.loop_command,
+                "spontaneous_requested": parsed.spontaneous_requested,
                 "score_value": parsed.score_value,
                 "score_note": parsed.score_note,
                 "thinking_level": parsed.thinking_level,
@@ -1616,6 +1867,8 @@ class LocalAgent:
             "reboot_requested": parsed.reboot_requested,
             "set_requested": parsed.set_requested,
             "score_requested": parsed.score_requested,
+            "loop_command": parsed.loop_command,
+            "spontaneous_requested": parsed.spontaneous_requested,
             "score_value": parsed.score_value,
             "score_note": parsed.score_note,
             "thinking_level": parsed.thinking_level,
@@ -1648,7 +1901,12 @@ class LocalAgent:
             "Output one JSON object only. Do not write markdown.\n"
             "Schema: {\"action\":\"reply|no_reply\",\"reason\":\"string\","
             "\"attention\":\"direct|followup|ambient|other_person|unclear\","
-            "\"attention_score\":0.0}\n\n"
+            "\"attention_score\":0.0,"
+            "\"topic_interest\":0.0,"
+            "\"interruption_risk\":0.0,"
+            "\"is_shared_context\":true,"
+            "\"is_direct_followup\":false,"
+            "\"memory_salience\":\"short|long|none\"}\n\n"
             "Rules:\n"
             "- This is a group chat. Be careful about interrupting, but do not use rigid keyword rules.\n"
             "- Decide whether this character would naturally answer now under the current context, recent short-term memory, and any durable memory.\n"
@@ -1660,6 +1918,9 @@ class LocalAgent:
             "- Treat followup as reply when continuing would be natural; do not require the character name for every turn.\n"
             "- Choose no_reply when the message is clearly aimed at someone else, replying would cut into another conversation, the addressee is unclear, or the character has no good reason to enter.\n"
             "- Higher activity means more willingness to join; lower activity requires clearer relevance and lower interruption risk.\n"
+            "- topic_interest is semantic interest for this character in this context, not keyword matching.\n"
+            "- interruption_risk is how likely a reply would cut into another person's conversation.\n"
+            "- memory_salience=short for fresh daily facts, plans, meals, or follow-up context; long for durable preferences or stable facts.\n"
             "- Use /no_think. Keep the decision small and explain the practical reason in reason.\n\n"
             f"activity: {self.settings.activity:.2f}\n"
             f"character_aliases: {aliases}\n"
@@ -1833,9 +2094,13 @@ class LocalAgent:
             "If dialogue_state says answer_required or repair_required, answer the concrete pending question directly. "
             "If the user asks what/which/kind about what the character said, use recent_agent_replies and recent messages to resolve it. "
             "If the previous answer was unclear or contradictory, repair it naturally; do not dodge, deny the topic, or reinterpret an ordinary object question as abstract without clear evidence. "
-            "Short does not mean dead-end. When interaction_plan hook_budget is above 0, add one small information gain instead of merely repeating the user's words. "
-            "Information gain can be a tiny reaction, concrete detail, light tease, context connection, or one low-pressure follow-up. "
-            "When hook_budget is 0, stay minimal and do not force a new topic. "
+            "Follow interaction_plan.reply_shape: answer_only means answer the concrete question without extra topic; "
+            "answer_with_reaction means answer first, then add one small natural reaction; "
+            "answer_with_context_hook means answer first, then add one light context hook or low-pressure follow-up if it fits; "
+            "ack_with_light_hook means acknowledge and add one small information gain instead of only repeating the user's words; "
+            "minimal_ack means stay minimal and do not stretch the conversation. "
+            "Do not end a direct high-affinity turn with only a repeated status plus a particle. "
+            "Do not ask a question every time; a reaction, concrete detail, tiny tease, or context connection is often better. "
             "先读语气和上下文：判断最新消息是认真请求、讽刺、反问、抱怨、玩笑还是试探。"
             "如果一句话表面像技术问题，但上下文已经说明它是在讽刺或表达不满，不要写教程式回答。"
             "讽刺已经清楚时，不能只回一个“诶？”或类似困惑标记；要短短接住真正的矛盾。"
@@ -2085,6 +2350,23 @@ class LocalAgent:
         }
         return directives.get(level, directives[1])
 
+    def _provider_operation_for(
+        self,
+        *,
+        fast_reply: bool,
+        web_context: WebContext,
+        math_context: MathContext,
+        thinking_level: int,
+        pragmatic_context_needed: bool,
+    ) -> str:
+        if web_context.search_used or web_context.sources:
+            return "web_fact"
+        if math_context.used or thinking_level >= 3:
+            return "complex_reasoning"
+        if fast_reply and not pragmatic_context_needed:
+            return "simple_chat"
+        return "final_reply"
+
     def _max_tokens_for_thinking(self, level: int) -> int:
         limits = {0: 96, 1: 96, 2: 220, 3: 640}
         return limits.get(level, 96)
@@ -2137,8 +2419,10 @@ class LocalAgent:
             ".think sets explicit level 1; .think 0 means automatic, .think 1|2|3 forces this message's thinking level. "
             ".set .think 0|1|2|3 changes the default thinking level; 0 is automatic. "
             ".set .activity 0..1 changes reply willingness. "
+            ".loop start/.loop stop start or stop QQ listening and confirm in QQ. "
+            ".spon/.spontaneous/.s forces one spontaneous topic. "
             ".score 0..1 [reason] records behavior feedback without changing personality. "
-            "Aliases: .force means .enforce; .log/.logs/.dbg mean .debug; .details means .detail. "
+            "Aliases: .force/.f/.e mean .enforce; .log/.logs/.dbg/.d/.l mean .debug; .details means .detail. "
             "Say '清除关于 X 的记忆' or 'forget memory about X' to delete matching memories. "
             "Old #e/#d/#i commands are retired. Put suffix commands at the end."
         )

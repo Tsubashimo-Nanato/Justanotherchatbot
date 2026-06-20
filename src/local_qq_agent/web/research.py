@@ -34,6 +34,8 @@ class WebContext:
     local_time_used: bool = False
     search_used: bool = False
     browser_used: bool = False
+    usage: dict[str, Any] = field(default_factory=dict)
+    trace_id: str = ""
 
     def to_metadata(self) -> dict[str, Any]:
         return {
@@ -47,6 +49,8 @@ class WebContext:
             "local_time_used": self.local_time_used,
             "search_used": self.search_used,
             "browser_used": self.browser_used,
+            "web_usage": self.usage,
+            "web_trace_id": self.trace_id,
         }
 
 

@@ -137,6 +137,42 @@ def test_force_alias_resolves_to_enforce_suffix():
     assert parsed.command_resolution_notice == "Command resolved: .force -> .enforce"
 
 
+def test_short_force_aliases_resolve_to_enforce_suffix():
+    parsed = parse_message_commands("answer this .f")
+
+    assert parsed.content == "answer this"
+    assert parsed.enforced
+    assert parsed.command_suffixes == (".enforce",)
+
+
+def test_common_enforce_typo_resolves_to_enforce_suffix():
+    parsed = parse_message_commands("answer this .enforece")
+
+    assert parsed.content == "answer this"
+    assert parsed.enforced
+    assert parsed.command_suffixes == (".enforce",)
+
+    parsed = parse_message_commands("answer this .e")
+
+    assert parsed.content == "answer this"
+    assert parsed.enforced
+    assert parsed.command_suffixes == (".enforce",)
+
+
+def test_short_debug_aliases_resolve_to_debug_suffix():
+    parsed = parse_message_commands("status please .d")
+
+    assert parsed.content == "status please"
+    assert parsed.diagnostic_requested
+    assert parsed.command_suffixes == (".debug",)
+
+    parsed = parse_message_commands("status please .l")
+
+    assert parsed.content == "status please"
+    assert parsed.diagnostic_requested
+    assert parsed.command_suffixes == (".debug",)
+
+
 def test_combined_debug_force_alias_command_line():
     parsed = parse_message_commands(".debug .force")
 
@@ -145,6 +181,29 @@ def test_combined_debug_force_alias_command_line():
     assert parsed.enforced
     assert parsed.command_suffixes == (".debug", ".enforce")
     assert parsed.command_resolution_notice == "Command resolved: .debug .force -> .debug .enforce"
+
+
+def test_loop_commands_are_standalone():
+    parsed = parse_message_commands(".loop start")
+
+    assert parsed.loop_command == "start"
+    assert parsed.content == ""
+    assert parsed.command_suffixes == (".loop", "start")
+
+    parsed = parse_message_commands("old quote\n.loop stop")
+
+    assert parsed.loop_command == "stop"
+    assert parsed.content == ""
+    assert parsed.command_suffixes == (".loop", "stop")
+
+
+def test_spontaneous_commands_are_standalone():
+    for command in (".s", ".spon", ".spontaneous"):
+        parsed = parse_message_commands(command)
+
+        assert parsed.spontaneous_requested
+        assert parsed.content == ""
+        assert parsed.command_suffixes == (command,)
 
 
 def test_status_suffix_is_plain_text():

@@ -87,7 +87,7 @@ class ProviderRuntime:
                 utility=local_client,
                 mode="local",
             )
-        if self.config.active_provider == "grok":
+        if self.config.active_provider in {"grok", "grok_responses"}:
             return ProviderClientBundle(
                 primary=grok_client,
                 gate=grok_client,
@@ -95,7 +95,7 @@ class ProviderRuntime:
                 utility=grok_client,
                 mode="grok",
             )
-        if self.config.active_provider == "hybrid":
+        if self.config.active_provider in {"hybrid", "hybrid_responses"}:
             return ProviderClientBundle(
                 primary=grok_client,
                 gate=local_client,
@@ -132,7 +132,7 @@ class ProviderRuntime:
 
     def switch_provider(self, provider: str) -> dict[str, Any]:
         provider = provider.strip().casefold()
-        if provider not in {"unloaded", "local", "grok", "hybrid"}:
+        if provider not in {"unloaded", "local", "grok", "hybrid", "grok_responses", "hybrid_responses"}:
             raise ValueError(f"unsupported provider: {provider}")
         data = _read_provider_yaml()
         data["active_provider"] = provider
@@ -223,7 +223,7 @@ class ProviderRuntime:
         return result
 
     def cloud_loop_allowed(self) -> bool:
-        if self.config.active_provider not in {"grok", "hybrid"}:
+        if self.config.active_provider not in {"grok", "hybrid", "grok_responses", "hybrid_responses"}:
             return True
         if self.config.require_duplicate_soak_for_cloud_loop and not self.config.duplicate_soak_passed:
             return False
@@ -234,7 +234,7 @@ class ProviderRuntime:
         usage = self.usage.snapshot()
         return {
             "active_provider": self.config.active_provider,
-            "providers": ["unloaded", "local", "grok", "hybrid"],
+            "providers": ["unloaded", "local", "grok", "hybrid", "grok_responses", "hybrid_responses"],
             "routing": self._routing_status(),
             "grok": {
                 "model": self.config.grok_model,
@@ -242,6 +242,18 @@ class ProviderRuntime:
                 "api_key_configured": bool(key),
                 "api_key_masked": masked_secret(key),
                 "web_search_enabled": self.config.grok_enable_web_search,
+                "endpoint": self.config.grok_endpoint,
+                "reasoning": {
+                    "simple_chat": self.config.grok_reasoning_simple_chat,
+                    "final_reply": self.config.grok_reasoning_final_reply,
+                    "rewrite": self.config.grok_reasoning_rewrite,
+                    "web_fact": self.config.grok_reasoning_web_fact,
+                    "complex_reasoning": self.config.grok_reasoning_complex_reasoning,
+                },
+                "cache": {
+                    "enabled": self.config.grok_cache_enabled,
+                    "scope": self.config.grok_cache_scope,
+                },
             },
             "budget": usage.to_dict(),
             "runtime": {
@@ -259,9 +271,9 @@ class ProviderRuntime:
         }
 
     def _routing_status(self) -> dict[str, str]:
-        if self.config.active_provider == "hybrid":
+        if self.config.active_provider in {"hybrid", "hybrid_responses"}:
             return {"gate": "local", "final": "grok", "utility": "local"}
-        if self.config.active_provider == "grok":
+        if self.config.active_provider in {"grok", "grok_responses"}:
             return {"gate": "grok", "final": "grok", "utility": "grok"}
         if self.config.active_provider == "local":
             return {"gate": "local", "final": "local", "utility": "local"}

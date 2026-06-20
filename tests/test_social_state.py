@@ -74,6 +74,22 @@ def test_context_builder_includes_social_state_lines(tmp_path):
     assert any("user affinity for tester: 0.25" in line for line in built.memory_lines)
 
 
+def test_context_builder_keeps_stable_prefix_when_runtime_context_changes(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    tracker = SocialStateTracker(store)
+    builder = ContextBuilder(store, build_guard(), tracker)
+
+    first = builder.build("tester", "hello")
+    store.add_memory(kind="fact", summary="tester likes udon", confidence=0.8)
+    tracker.override(user_name="tester", global_mood="neutral", mood_intensity=0.0, affinity=0.9)
+    second = builder.build("tester", "udon?")
+
+    assert first.messages[0] == second.messages[0]
+    assert "tester likes udon" not in first.messages[0]["content"]
+    assert "tester likes udon" in second.messages[1]["content"]
+    assert "user affinity for tester: 0.90" in second.messages[1]["content"]
+
+
 def test_user_profiles_include_seen_messages_and_manual_profile(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
     tracker = SocialStateTracker(store)

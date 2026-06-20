@@ -86,6 +86,24 @@ class FakeProviderDecisionClient:
         )
 
 
+class FakeGrokChatClient:
+    provider_name = "grok"
+
+    async def chat(self, messages, **kwargs):
+        return FakeReply(
+            content="api answer",
+            model="grok-test",
+            usage={
+                "prompt_tokens": 100,
+                "completion_tokens": 12,
+                "total_tokens": 112,
+                "prompt_tokens_details": {"cached_tokens": 70},
+                "completion_tokens_details": {"reasoning_tokens": 4},
+                "cost_in_usd_ticks": 250,
+            },
+        )
+
+
 class FakeNoReplyModelClient:
     async def chat(self, messages, **kwargs):
         return FakeReply(
@@ -207,7 +225,7 @@ def build_agent_with_profile(tmp_path, profile_text: str):
     )
     store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
     guard = PersonaGuard(persona)
-    model = SequenceModelClient(["嗯？"])
+    model = SequenceModelClient(["在，怎么了"])
     return (
         LocalAgent(
             store=store,
@@ -295,6 +313,24 @@ def test_agent_replies_to_persona_alias_prefix_as_direct_address(tmp_path):
     assert gate["address_kind"] == "name_prefix"
     assert gate["content_after_alias"] == "今天吃什么"
     assert len(model.messages) == 1
+
+
+def test_agent_projects_reply_shape_for_direct_question(tmp_path):
+    agent, _store, model = build_agent_with_profile(
+        tmp_path,
+        "- 濮撳悕锛氭闇滄鐏€俓n- 甯哥敤绉板懠锛氭銆佹妤犮€佹鐏€乶anato銆佹bot銆俓n",
+    )
+    model.replies = ["火锅吧，热一点比较像还活着"]
+
+    agent.persona_guard.reply_aliases = ("nanato",)
+    agent.social_state.override_profile(user_name="tester", affinity=1.0, note="test")
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="tester", message="nanato what should I eat today?"))
+
+    assert result.action == "reply"
+    assert result.metadata["interaction_plan"]["message_kind"] == "question"
+    assert result.metadata["interaction_plan"]["reply_shape"] == "answer_with_context_hook"
+    assert "answer_with_context_hook" in model.messages[-1][-1]["content"]
 
 
 def test_agent_rewrites_dead_end_status_echo(tmp_path):
@@ -619,6 +655,62 @@ def test_agent_set_activity_zero_silences_non_enforced_message(tmp_path):
     assert result.action == "no_reply"
     assert result.reason == "activity_disabled"
     assert not result.used_model
+
+
+def test_agent_activity_zero_still_allows_direct_reply_to_bot(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    agent.model_client = SequenceModelClient(["direct answer"])
+
+    asyncio.run(agent.respond_to_incoming(user_name="tester", message=".set .activity 0"))
+    result = asyncio.run(
+        agent.respond_to_incoming(
+            user_name="tester",
+            message="follow-up question",
+            reply_to_bot=True,
+        )
+    )
+
+    assert result.action == "reply"
+    assert result.reason == "direct_quote_reply"
+    assert result.reply == "direct answer"
+
+
+def test_agent_records_local_gate_and_final_token_usage(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    agent.model_client = SequenceModelClient(
+        [
+            '{"action":"reply","reason":"ambient_candidate","attention":"ambient","attention_score":1.0,"topic_interest":1.0,"interruption_risk":0.0,"is_shared_context":true}',
+            "ambient reply",
+        ]
+    )
+    agent.update_settings(activity=1.0, source="test")
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="tester", message="hello there"))
+    usage = result.metadata["token_usage"]
+
+    assert result.action == "reply"
+    assert usage["local"]["gate"]["total"] == 13
+    assert usage["local"]["final"]["total"] == 13
+    assert usage["local"]["total"]["total"] == 26
+
+
+def test_agent_records_api_final_token_usage(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    agent.final_model_client = FakeGrokChatClient()
+
+    result = asyncio.run(
+        agent.respond_to_incoming(
+            user_name="tester",
+            message="follow-up question",
+            reply_to_bot=True,
+        )
+    )
+    usage = result.metadata["token_usage"]
+
+    assert result.action == "reply"
+    assert usage["api"]["final"]["total"] == 112
+    assert usage["api"]["final"]["cached"] == 70
+    assert usage["api"]["final"]["reasoning"] == 4
 
 
 def test_agent_update_settings_records_source(tmp_path):

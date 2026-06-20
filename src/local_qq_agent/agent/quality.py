@@ -31,13 +31,7 @@ class QualityGate:
     ) -> QualityReview:
         reply = reply.strip()
         if not reply:
-            return QualityReview(
-                send_allowed=False,
-                rewrite_needed=False,
-                score=0.0,
-                reasons=("empty_reply",),
-                rule_hits=("empty_reply",),
-            )
+            return QualityReview(False, False, 0.0, ("empty_reply",), ("empty_reply",))
 
         severe_hits = self._severe_hits(reply)
         if severe_hits:
@@ -59,13 +53,7 @@ class QualityGate:
                 rule_hits=tuple(rewrite_hits),
             )
 
-        return QualityReview(
-            send_allowed=True,
-            rewrite_needed=False,
-            score=0.95,
-            reasons=("rule_check_passed",),
-            rule_hits=(),
-        )
+        return QualityReview(True, False, 0.95, ("rule_check_passed",), ())
 
     def merge_judge(self, review: QualityReview, raw_content: str) -> QualityReview:
         parsed = self._parse_json(raw_content)
@@ -105,7 +93,7 @@ class QualityGate:
     def should_use_judge(self, review: QualityReview, *, reply: str) -> bool:
         if review.rule_hits:
             return True
-        return len(reply) > 90
+        return len(reply) > 140
 
     def rewrite_messages(
         self,
@@ -120,10 +108,12 @@ class QualityGate:
             {
                 "role": "system",
                 "content": (
-                    "Rewrite the assistant reply into a natural QQ group-chat line. "
+                    "Rewrite the assistant reply into one natural QQ group-chat message. "
                     "Do not mention AI, models, prompts, tools, tokens, or system state. "
-                    "Remove customer-service wording, role-card decoration, and unrelated poetic flavor. "
-                    "Do not merely repeat the user's words. Add a small information gain if the interaction policy allows it. "
+                    "Do not merely repeat the user's words. Follow reply_shape from the interaction policy: "
+                    "answer_with_reaction answers first and adds a small reaction; "
+                    "answer_with_context_hook answers first and adds one light hook; "
+                    "ack_with_light_hook acknowledges and adds a small context connection. "
                     "Output only the rewritten chat message."
                 ),
             },
@@ -143,10 +133,10 @@ class QualityGate:
             {
                 "role": "system",
                 "content": (
-                    "You are a strict reply quality judge for a local QQ character chatbot. "
+                    "You are a strict reply quality judge for a QQ character chatbot. "
                     "Return JSON only: {\"send_allowed\": true|false, \"rewrite_needed\": true|false, "
                     "\"score\": 0.0, \"reason\": \"short reason\"}. "
-                    "Penalize AI-like, customer-service, role-card, unrelated poetic, over-eager, or off-topic replies."
+                    "Penalize leaks, repeated echoes, empty dead-end replies, and answers that ignore a concrete follow-up."
                 ),
             },
             {"role": "user", "content": f"user message:\n{message}\n\ncandidate reply:\n{reply}"},
@@ -155,41 +145,29 @@ class QualityGate:
     def _severe_hits(self, reply: str) -> list[str]:
         lowered = reply.casefold()
         terms = (
-            "作为一个ai",
-            "作为 ai",
-            "语言模型",
+            "as an ai",
+            "as a language model",
+            "language model",
+            "system prompt",
+            "developer message",
+            "internal config",
+            "api provider",
+            "xai_api_key",
+            "人格文件",
             "系统提示",
             "开发者消息",
+            "内部配置",
             "token",
             "prompt",
-            "内部配置",
         )
         return [term for term in terms if term in lowered]
 
     def _rewrite_hits(self, *, message: str, reply: str, interaction_plan: Any | None = None) -> list[str]:
         hits: list[str] = []
-        lowered = reply.casefold()
-        phrases = (
-            "色泽和摆盘",
-            "食欲大开",
-            "很吸引人呢",
-            "确实，那道菜",
-            "氛围感",
-            "令人",
-            "我可以帮你",
-            "以下是",
-            "伞骨数",
-            "雨声",
-        )
-        hits.extend(phrase for phrase in phrases if phrase in lowered)
-        if re.search(r"^确实[，,].*呢[。.!]?$", reply):
-            hits.append("generic_affirmation")
-        if re.search(r"[（(].*(伞|雨|雾|花).*[）)]", reply):
-            hits.append("unrelated_role_card_flavor")
         if self._is_dead_end_echo(message=message, reply=reply):
             hits.append("dead_end_echo")
-        if self._needs_information_gain(reply=reply, interaction_plan=interaction_plan) and self._is_empty_ack(reply):
-            hits.append("empty_ack_without_hook")
+        if self._needs_information_gain(reply=reply, interaction_plan=interaction_plan) and self._is_low_value_reply(reply):
+            hits.append("dead_end_without_hook")
         return hits
 
     def _is_dead_end_echo(self, *, message: str, reply: str) -> bool:
@@ -213,20 +191,48 @@ class QualityGate:
         text = text.casefold()
         text = re.sub(r"\s+", "", text)
         text = "".join(char for char in text if char.isalnum() or "\u4e00" <= char <= "\u9fff")
-        text = re.sub(r"^(我|俺|咱|咱们|i|we)", "", text)
-        text = re.sub(r"(啊|呀|呢|哦|喔|吧|啦|了)+$", "", text)
+        text = re.sub(r"^(我|俺|咱|i|we)", "", text)
+        text = re.sub(r"(啊|呀|呢|吧|哦|喔|啦|了)+$", "", text)
         return text
 
     def _contains_cjk(self, text: str) -> bool:
         return any("\u4e00" <= char <= "\u9fff" for char in text)
 
     def _needs_information_gain(self, *, reply: str, interaction_plan: Any | None) -> bool:
+        message_kind = str(getattr(interaction_plan, "message_kind", ""))
+        if message_kind == "short_ping":
+            return False
+        reply_shape = str(getattr(interaction_plan, "reply_shape", "") or "")
+        if reply_shape in {"answer_with_reaction", "answer_with_context_hook", "ack_with_light_hook"}:
+            return True
         try:
             hook_budget = int(getattr(interaction_plan, "hook_budget", 0))
         except (TypeError, ValueError):
             hook_budget = 0
-        message_kind = str(getattr(interaction_plan, "message_kind", ""))
-        return hook_budget > 0 and message_kind in {"life_status", "complaint", "statement"} and len(reply.strip()) <= 4
+        return hook_budget > 0 and message_kind in {"life_status", "complaint", "statement"}
+
+    def _is_low_value_reply(self, reply: str) -> bool:
+        if self._is_empty_ack(reply):
+            return True
+        normalized = self._semantic_key(reply)
+        generic = {
+            "嗯",
+            "嗯嗯",
+            "哦",
+            "噢",
+            "啊",
+            "好",
+            "行",
+            "是",
+            "确实",
+            "可以",
+            "还行",
+            "不知道",
+            "没想好",
+        }
+        if normalized in generic:
+            return True
+        return bool(re.fullmatch(r"(嗯+|哦+|噢+|啊+|好+|行+|是+)[？?。!！]*", reply.strip()))
 
     def _is_empty_ack(self, reply: str) -> bool:
         normalized = self._semantic_key(reply)
@@ -238,17 +244,13 @@ class QualityGate:
         metadata = interaction_plan.to_metadata() if hasattr(interaction_plan, "to_metadata") else {}
         return json.dumps(metadata, ensure_ascii=False, sort_keys=True)
 
-    def _parse_json(self, content: str) -> dict[str, Any] | None:
-        text = content.strip()
+    def _parse_json(self, raw_content: str) -> dict[str, Any] | None:
+        text = raw_content.strip()
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?", "", text).strip()
             text = re.sub(r"```$", "", text).strip()
-        start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end <= start:
-            return None
         try:
-            parsed = json.loads(text[start : end + 1])
+            parsed = json.loads(text)
         except json.JSONDecodeError:
             return None
         return parsed if isinstance(parsed, dict) else None
@@ -257,5 +259,5 @@ class QualityGate:
         try:
             number = float(value)
         except (TypeError, ValueError):
-            number = 0.0
-        return max(0.0, min(1.0, number))
+            return 0.0
+        return max(0.0, min(number, 1.0))
