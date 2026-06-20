@@ -20,6 +20,8 @@ class ModelReply:
 
 
 class OpenAICompatibleClient:
+    provider_name = "local"
+
     def __init__(self, config: ModelConfig) -> None:
         self.config = config
 
@@ -47,7 +49,13 @@ class OpenAICompatibleClient:
                 "model": self.config.model,
             }
 
-    async def chat(self, messages: list[dict[str, str]], *, max_tokens: int | None = None) -> ModelReply:
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None = None,
+        operation: str | None = None,
+    ) -> ModelReply:
         if not messages:
             raise ValueError("messages must not be empty")
 

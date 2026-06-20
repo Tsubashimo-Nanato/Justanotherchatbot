@@ -77,6 +77,10 @@ DEBUG_HTML = """<!doctype html>
       background: #ffffff;
       color: var(--text);
     }
+    input[type="checkbox"] {
+      width: auto;
+      margin-right: 6px;
+    }
     textarea {
       min-height: 86px;
       resize: vertical;
@@ -301,6 +305,52 @@ DEBUG_HTML = """<!doctype html>
       font-size: 12px;
       overflow-wrap: anywhere;
     }
+    .chat-window {
+      display: grid;
+      gap: 10px;
+      max-height: 520px;
+      overflow: auto;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #eef1f4;
+    }
+    .chat-bubble {
+      width: min(82%, 680px);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #ffffff;
+      color: var(--text);
+      text-align: left;
+      cursor: pointer;
+    }
+    .chat-bubble.agent {
+      justify-self: end;
+      background: #dff6dd;
+    }
+    .chat-bubble.decision {
+      justify-self: center;
+      width: min(92%, 760px);
+      background: #f6f8fa;
+      color: var(--muted);
+      cursor: default;
+    }
+    .chat-bubble.selected {
+      outline: 2px solid var(--blue);
+    }
+    .chat-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 4px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .chat-text {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
     .mono-small {
       font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
       font-size: 12px;
@@ -408,6 +458,39 @@ DEBUG_HTML = """<!doctype html>
         </div>
 
         <div id="panel-chat" class="tab-panel" role="tabpanel" aria-labelledby="tab-chat">
+          <section>
+            <h2>Current Chat</h2>
+            <p>Recent QQ-visible messages and agent decisions. Click a user message to force a reply or preview one.</p>
+            <div id="chatTimeline" class="chat-window">Timeline not loaded.</div>
+          </section>
+
+          <section>
+            <h2>Manual Force Reply</h2>
+            <div class="form-grid">
+              <div>
+                <label for="manualReplySender">Sender</label>
+                <input id="manualReplySender" placeholder="Select a chat bubble or type a sender">
+              </div>
+              <div>
+                <label for="manualReplyEvent">Event ID</label>
+                <input id="manualReplyEvent" placeholder="optional" readonly>
+              </div>
+              <div class="wide">
+                <label for="manualReplyMessage">Message to answer</label>
+                <textarea id="manualReplyMessage" placeholder="Select a chat bubble or paste the message."></textarea>
+              </div>
+              <div class="wide">
+                <label for="manualReplyInstruction">Extra instruction</label>
+                <textarea id="manualReplyInstruction" placeholder="Optional debug-only instruction, e.g. answer with current context."></textarea>
+              </div>
+            </div>
+            <label><input id="manualReplySendToQQ" type="checkbox" checked> Send to QQ if generated</label>
+            <div class="actions">
+              <button id="manualForceReplyButton" class="danger" onclick="manualForceReply()">Force reply selected message</button>
+              <button class="secondary" onclick="clearManualReplySelection()">Clear selection</button>
+            </div>
+          </section>
+
           <section>
             <h2>Simulate Chat</h2>
             <label for="userName">User</label>
@@ -551,6 +634,7 @@ qwen3-30b-iq2m-cpu-ram</textarea>
             <div class="actions">
               <button id="settingsApplyButton" onclick="applyAgentSettings()">Apply settings</button>
               <button id="settingsLoadButton" class="secondary" onclick="loadAgentSettings()">Load settings</button>
+              <button id="settingsSpontaneousButton" class="secondary" onclick="triggerSpontaneousFromSettings()">Manual spontaneous topic</button>
             </div>
           </section>
 
@@ -712,6 +796,7 @@ qwen3-30b-iq2m-cpu-ram</textarea>
             <h2>Raw Logs</h2>
             <p>The pinned console stays visible on desktop. This tab gives the same raw areas more room when you need to inspect an event id.</p>
             <div class="actions">
+              <button id="timelineButton" class="secondary" onclick="loadTimeline()">Timeline</button>
               <button class="secondary" onclick="loadEvents()">Recent events</button>
               <button class="secondary" onclick="loadStatus()">Status</button>
               <button class="secondary" onclick="loopStatus()">Loop status</button>
@@ -722,7 +807,10 @@ qwen3-30b-iq2m-cpu-ram</textarea>
           <section class="danger-zone">
             <h2>Service Control</h2>
             <p>Reboot is an agent service action. It should be used when persona files or runtime wiring need to be reloaded.</p>
-            <button id="agentRebootButton" class="danger" onclick="agentReboot()">Schedule agent reboot</button>
+            <button id="styleBundleExportButton" class="secondary" onclick="exportStyleBundle()">Export style bundle</button>
+            <button id="styleAnchorRefreshButton" class="secondary" onclick="refreshStyleAnchor()">Refresh style anchor</button>
+            <button id="agentRebootButton" class="danger" onclick="agentReboot()">Restart agent service</button>
+            <button id="fullRestartButton" class="danger" onclick="fullRestart()">Full service restart</button>
           </section>
         </div>
       </div>
@@ -770,6 +858,8 @@ qwen3-30b-iq2m-cpu-ram</textarea>
     let cachedStatus = null;
     let cachedLoopStatus = null;
     let latestLoopStatus = null;
+    let latestTimelineItems = [];
+    let selectedTimelineItem = null;
     const maxOutputEntries = 60;
 
     function activateTab(name) {
@@ -845,6 +935,9 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       if (operation === "events" || Array.isArray(result?.events) || Array.isArray(result)) {
         return summarizeEventsOutput(result);
       }
+      if (operation === "debug_timeline" || Array.isArray(result?.items)) {
+        return summarizeTimelineOutput(result);
+      }
       if (result?.action !== undefined && (result?.reply !== undefined || result?.reason !== undefined)) {
         return summarizeAgentResult(result);
       }
@@ -866,7 +959,7 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       const latest = recent.length ? recent[recent.length - 1] : null;
       const lines = [
         `loop: running=${result?.running ?? "?"} stage=${activity.stage || "unknown"}`,
-        `queue: pending=${result?.pending_message_count ?? 0} queued=${result?.queued_message_count ?? 0} inflight=${result?.inflight_message_count ?? 0}`,
+        `queue: aggregating=${result?.aggregating_message_count ?? 0} pending=${result?.pending_message_count ?? 0} queued=${result?.queued_message_count ?? 0} inflight=${result?.inflight_message_count ?? 0}`,
       ];
       if (activity.sender_name || activity.message_text) {
         lines.push(`active: ${activity.sender_name || "unknown"}: ${shortLine(activity.message_text || "")}`);
@@ -923,8 +1016,9 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         `decision: ${result.action || "?"} reason=${shortLine(result.reason || "")}`,
         `sent: ${result.sent ?? "n/a"}`,
       ];
-      if (result.reply) {
-        lines.push(`reply: ${shortLine(result.reply)}`);
+      const reply = result.reply || metadata.agent_reply || metadata.cleaned_reply || "";
+      if (reply) {
+        lines.push(`reply: ${shortLine(reply)}`);
       }
       const tokenLine = formatTokenLine(metadata);
       if (tokenLine) {
@@ -971,6 +1065,119 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         const content = event.content || event.message || "";
         return `${time} ${source} ${kind}: ${shortLine(content)}`.trim();
       });
+    }
+
+    function summarizeTimelineOutput(result) {
+      const items = Array.isArray(result?.items) ? result.items : [];
+      if (!items.length) {
+        return ["timeline: no visible debug events"];
+      }
+      return items.slice(-30).map((item) => formatTimelineItem(item));
+    }
+
+    function renderChatTimeline(items) {
+      latestTimelineItems = Array.isArray(items) ? items : [];
+      const element = document.getElementById("chatTimeline");
+      if (!element) {
+        return;
+      }
+      if (!latestTimelineItems.length) {
+        element.textContent = "No chat events yet.";
+        return;
+      }
+      const visible = latestTimelineItems.slice(-80);
+      const offset = latestTimelineItems.length - visible.length;
+      const blocks = visible.map((item, index) => chatBubbleHtml(item, offset + index));
+      element.innerHTML = blocks.join("");
+      scrollToBottom(element);
+    }
+
+    function chatBubbleHtml(item, index) {
+      const kind = item.kind || "";
+      const selectable = kind === "group_message" && item.message;
+      const isAgent = kind === "assistant_reply" || kind === "assistant_placeholder";
+      const isDecision = kind === "loop_decision" || kind === "assistant_blocked";
+      const selected = selectedTimelineItem && selectedTimelineItem.event_id === item.event_id;
+      const classes = ["chat-bubble"];
+      if (isAgent) classes.push("agent");
+      if (isDecision) classes.push("decision");
+      if (selected) classes.push("selected");
+      const onclick = selectable ? ` onclick="selectTimelineItem(${index})"` : "";
+      const label = isAgent ? "bot" : (item.who || "unknown");
+      const text = item.reply || item.message || item.reason || "";
+      const decision = item.decision && kind !== "group_message" ? ` · ${escapeHtml(item.decision)}` : "";
+      return `
+        <button class="${classes.join(" ")}" type="button"${onclick}>
+          <div class="chat-meta"><span>${escapeHtml(shortTime(item.time))} · #${item.event_id} · ${escapeHtml(label)}${decision}</span><span>${item.sent === true ? "sent" : ""}</span></div>
+          <div class="chat-text">${escapeHtml(text || "(empty)")}</div>
+        </button>
+      `;
+    }
+
+    function selectTimelineItem(index) {
+      const item = latestTimelineItems[index];
+      if (!item || !item.message) {
+        return;
+      }
+      selectedTimelineItem = item;
+      document.getElementById("manualReplySender").value = item.who || "";
+      document.getElementById("manualReplyMessage").value = item.message || "";
+      document.getElementById("manualReplyEvent").value = item.event_id || "";
+      renderChatTimeline(latestTimelineItems);
+    }
+
+    function clearManualReplySelection() {
+      selectedTimelineItem = null;
+      document.getElementById("manualReplySender").value = "";
+      document.getElementById("manualReplyMessage").value = "";
+      document.getElementById("manualReplyEvent").value = "";
+      document.getElementById("manualReplyInstruction").value = "";
+      renderChatTimeline(latestTimelineItems);
+    }
+
+    function formatTimelineItem(item) {
+      const time = shortTime(item.time);
+      const who = item.who || "unknown";
+      const message = item.message ? ` said "${shortLine(item.message, 120)}"` : "";
+      const decision = item.decision ? ` -> ${item.decision}` : "";
+      const reason = item.reason ? ` (${shortLine(item.reason, 120)})` : "";
+      const sent = item.sent === null || item.sent === undefined ? "" : ` sent=${item.sent}`;
+      const reply = item.reply ? ` reply="${shortLine(item.reply, 140)}"` : "";
+      const tokenLine = formatTimelineTokens(item.tokens || {});
+      const web = item.web && item.web.used ? ` web="${shortLine(item.web.query || "", 100)}" sources=${item.web.source_count ?? 0}` : "";
+      return `${time} #${item.event_id} ${who}${message}${decision}${reason}${sent}${reply}${tokenLine}${web}`.trim();
+    }
+
+    function formatTimelineTokens(tokens) {
+      if (!tokens || (tokens.prompt === undefined && tokens.completion === undefined && tokens.total === undefined && !tokens.local && !tokens.api)) {
+        return "";
+      }
+      const local = tokens.local || {};
+      const api = tokens.api || {};
+      const parts = [];
+      if (local.total !== undefined) {
+        parts.push(`local=${local.prompt ?? "?"}/${local.completion ?? "?"}/${local.total ?? "?"}`);
+      }
+      if (api.total !== undefined) {
+        parts.push(`api=${api.input ?? "?"}/${api.output ?? "?"}/${api.total ?? "?"}`);
+        if (api.cached !== undefined) {
+          parts.push(`cached=${api.cached}`);
+        }
+        if (api.reasoning !== undefined) {
+          parts.push(`reasoning=${api.reasoning}`);
+        }
+      }
+      if (!parts.length) {
+        parts.push(`${tokens.prompt ?? "?"}/${tokens.completion ?? "?"}/${tokens.total ?? "?"}`);
+      }
+      parts.push(`latency=${tokens.latency_seconds ?? local.latency_seconds ?? api.latency_seconds ?? "?"}s`);
+      return ` tokens ${parts.join(" ")}`;
+    }
+
+    function shortTime(value) {
+      const text = String(value || "");
+      const match = text.match(/T?(\\d{2}:\\d{2}:\\d{2})/);
+      return match ? match[1] : text.slice(0, 19);
     }
 
     function summarizeQqRead(result) {
@@ -1142,6 +1349,9 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         "total_tokens",
         "usage",
         "tokens_per_second",
+        "token_usage",
+        "engagement_decision",
+        "engagement_signals",
         "thinking_level",
         "max_thinking_level",
         "requested_thinking_level",
@@ -1577,8 +1787,11 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         `provider: ${provider.active_provider || "unloaded"}`,
         `routing: gate=${routing.gate || "?"} final=${routing.final || "?"} utility=${routing.utility || "?"}`,
         `grok model: ${grok.model || "unknown"}`,
+        `grok endpoint: ${grok.endpoint || "chat_completions"}`,
+        `reasoning: simple=${grok.reasoning?.simple_chat || "?"} final=${grok.reasoning?.final_reply || "?"} web=${grok.reasoning?.web_fact || "?"}`,
+        `cache: enabled=${grok.cache?.enabled ?? false} scope=${grok.cache?.scope || "default"}`,
         `api key: ${grok.api_key_configured ? grok.api_key_masked || "configured" : "missing"}`,
-        `usage telemetry: total=${formatInteger(budget.total_tokens)}, prompt=${formatInteger(budget.prompt_tokens)}, completion=${formatInteger(budget.completion_tokens)}`,
+        `usage telemetry: total=${formatInteger(budget.total_tokens)}, input=${formatInteger(budget.prompt_tokens)}, output=${formatInteger(budget.completion_tokens)}, cached=${formatInteger(budget.cached_tokens)}, reasoning=${formatInteger(budget.reasoning_tokens)}`,
         `smoke budget reference: ${formatInteger(budget.budget)} (${formatPercentRatio(budget.used_ratio)} used)`,
         `runtime input cap: ${formatInteger(runtime.per_message_input_token_budget)} est. tokens/message, enforced=${runtime.enforce_input_budget ?? false}`,
         `daily usage gates runtime: ${!(runtime.daily_usage_is_telemetry_only ?? false)}`,
@@ -1599,6 +1812,7 @@ qwen3-30b-iq2m-cpu-ram</textarea>
     function formatApiUsage(provider) {
       const budget = provider?.budget || {};
       const runtime = provider?.runtime || {};
+      const grok = provider?.grok || {};
       const latestTrace = provider?.latest_trace || {};
       const latestUsage = latestTraceUsage(latestTrace);
       const lines = [
@@ -1606,9 +1820,16 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         `input cap enforced: ${runtime.enforce_input_budget ?? false}`,
         `daily usage gates runtime: ${!(runtime.daily_usage_is_telemetry_only ?? false)}`,
         `usage telemetry total: ${formatInteger(budget.total_tokens)} tokens`,
-        `usage telemetry prompt: ${formatInteger(budget.prompt_tokens)}`,
-        `usage telemetry completion: ${formatInteger(budget.completion_tokens)}`,
+        `usage telemetry input: ${formatInteger(budget.prompt_tokens)}`,
+        `usage telemetry output: ${formatInteger(budget.completion_tokens)}`,
+        `usage telemetry cached: ${formatInteger(budget.cached_tokens)}`,
+        `usage telemetry reasoning: ${formatInteger(budget.reasoning_tokens)}`,
+        `usage telemetry sources/tools: ${formatInteger(budget.source_count)} / ${formatInteger(budget.tool_count)}`,
+        `usage telemetry cost ticks: ${formatInteger(budget.cost_in_usd_ticks)} (${formatCostUsd(budget.cost_usd)})`,
         `smoke budget reference: ${formatInteger(budget.budget)} (${formatPercentRatio(budget.used_ratio)} used)`,
+        `grok endpoint: ${grok.endpoint || "chat_completions"}`,
+        `reasoning options: simple=${grok.reasoning?.simple_chat || "?"}, final=${grok.reasoning?.final_reply || "?"}, rewrite=${grok.reasoning?.rewrite || "?"}, web=${grok.reasoning?.web_fact || "?"}, complex=${grok.reasoning?.complex_reasoning || "?"}`,
+        `cache: enabled=${grok.cache?.enabled ?? false}, scope=${grok.cache?.scope || "default"}`,
         `latest trace: ${latestTrace.trace_id || "none"}`,
       ];
       if (latestTrace.trace_id) {
@@ -1616,8 +1837,8 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       }
       if (latestUsage) {
         lines.push(`latest usage: ${formatUsageLine(latestUsage)}`);
-        const promptDetails = latestUsage.prompt_tokens_details || {};
-        const completionDetails = latestUsage.completion_tokens_details || {};
+        const promptDetails = latestUsage.prompt_tokens_details || latestUsage.input_tokens_details || {};
+        const completionDetails = latestUsage.completion_tokens_details || latestUsage.output_tokens_details || {};
         if (Object.keys(promptDetails).length) {
           lines.push(`latest prompt details: text=${formatInteger(promptDetails.text_tokens)}, cached=${formatInteger(promptDetails.cached_tokens)}`);
         }
@@ -1628,7 +1849,7 @@ qwen3-30b-iq2m-cpu-ram</textarea>
           lines.push(`latest sources used: ${formatInteger(latestUsage.num_sources_used)}`);
         }
         if (latestUsage.cost_in_usd_ticks !== undefined) {
-          lines.push(`latest cost ticks: ${formatInteger(latestUsage.cost_in_usd_ticks)}`);
+          lines.push(`latest cost ticks: ${formatInteger(latestUsage.cost_in_usd_ticks)} (${formatCostUsd(ticksToUsd(latestUsage.cost_in_usd_ticks))})`);
         }
       }
       return lines.join("\\n");
@@ -1657,12 +1878,34 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       if (!usage || typeof usage !== "object") {
         return "none";
       }
-      const prompt = formatInteger(usage.prompt_tokens);
-      const completion = formatInteger(usage.completion_tokens);
+      const prompt = formatInteger(usage.prompt_tokens ?? usage.input_tokens);
+      const completion = formatInteger(usage.completion_tokens ?? usage.output_tokens);
       const total = formatInteger(usage.total_tokens);
-      const reasoning = usage.completion_tokens_details?.reasoning_tokens;
+      const promptDetails = usage.prompt_tokens_details || usage.input_tokens_details || {};
+      const completionDetails = usage.completion_tokens_details || usage.output_tokens_details || {};
+      const cached = promptDetails.cached_tokens;
+      const reasoning = completionDetails.reasoning_tokens;
+      const costTicks = usage.cost_in_usd_ticks;
+      const cachedText = cached !== undefined ? `, cached=${formatInteger(cached)}` : "";
       const reasoningText = reasoning !== undefined ? `, reasoning=${formatInteger(reasoning)}` : "";
-      return `prompt=${prompt}, completion=${completion}, total=${total}${reasoningText}`;
+      const costText = costTicks !== undefined ? `, cost_ticks=${formatInteger(costTicks)}` : "";
+      return `input=${prompt}, output=${completion}, total=${total}${cachedText}${reasoningText}${costText}`;
+    }
+
+    function formatCostUsd(value) {
+      const number = Number(value || 0);
+      if (!Number.isFinite(number) || number <= 0) {
+        return "$0";
+      }
+      return `$${number.toFixed(6)}`;
+    }
+
+    function ticksToUsd(value) {
+      const number = Number(value || 0);
+      if (!Number.isFinite(number)) {
+        return 0;
+      }
+      return number / 100000000;
     }
 
     function formatPercentRatio(value) {
@@ -1817,8 +2060,9 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       const pendingCount = loop.pending_message_count ?? 0;
       const queuedCount = loop.queued_message_count ?? 0;
       const inflightCount = loop.inflight_message_count ?? 0;
+      const aggregatingCount = loop.aggregating_message_count ?? 0;
       const busyText = loop.active_message ? "model" : (loop.tick_busy ? "read" : "idle");
-      const queueText = `pending=${pendingCount} queued=${queuedCount} inflight=${inflightCount} busy=${busyText}`;
+      const queueText = `agg=${aggregatingCount} pending=${pendingCount} queued=${queuedCount} inflight=${inflightCount} busy=${busyText}`;
       const activeText = activity.message_text || activity.detail || "none";
       const latestText = latest ? `${latest.action || "?"} ${latest.reason || ""}`.trim() : (metadata.action || "none");
 
@@ -1867,7 +2111,7 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         `detail: ${activity.detail || ""}`,
         `sender: ${activity.sender_name || ""}`,
         `message: ${activity.message_text || ""}`,
-        `pending: ${result?.pending_message_count ?? 0}, queued: ${result?.queued_message_count ?? 0}, inflight: ${result?.inflight_message_count ?? 0}`,
+        `aggregating: ${result?.aggregating_message_count ?? 0}, pending: ${result?.pending_message_count ?? 0}, queued: ${result?.queued_message_count ?? 0}, inflight: ${result?.inflight_message_count ?? 0}`,
       ];
       if (active) {
         lines.push(`busy message: ${active.message_text || ""}`);
@@ -1883,6 +2127,9 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         lines.push(`attention: ${gate.attention || "unknown"} score ${gate.attention_score ?? "?"}`);
         lines.push(`expected latency: ${gate.expected_latency_class || "unknown"} ${gate.predicted_latency_seconds ?? "?"}s`);
       }
+      if (metadata.engagement_decision) {
+        lines.push(formatEngagementLine(metadata.engagement_decision));
+      }
       if (metadata.placeholder_sent !== undefined || metadata.placeholder_text) {
         lines.push(`placeholder: ${metadata.placeholder_sent ?? false} ${metadata.placeholder_text || ""}`.trim());
       }
@@ -1895,6 +2142,9 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       }
       if (metadata.latency_seconds || metadata.prompt_tokens || metadata.completion_tokens) {
         lines.push(`model: ${metadata.latency_seconds ?? "?"}s, prompt ${metadata.prompt_tokens ?? "?"}, completion ${metadata.completion_tokens ?? "?"}`);
+      }
+      if (metadata.token_usage) {
+        lines.push(formatTokenUsageLine(metadata.token_usage));
       }
       if (metadata.interaction_plan) {
         lines.push(formatInteractionLine(metadata.interaction_plan));
@@ -1917,10 +2167,12 @@ qwen3-30b-iq2m-cpu-ram</textarea>
 
     function renderQueueInspector(result) {
       const active = result?.active_message || null;
+      const aggregating = result?.aggregating_messages || [];
       const pending = result?.pending_messages || [];
       const ledger = result?.ledger || {};
       const ledgerCounts = ledger.counts || {};
       const lines = [
+        `aggregating_count: ${result?.aggregating_message_count ?? 0}`,
         `pending_count: ${result?.pending_message_count ?? 0}`,
         `queued_count: ${result?.queued_message_count ?? 0}`,
         `inflight_count: ${result?.inflight_message_count ?? 0}`,
@@ -1930,6 +2182,9 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       if (active) {
         items.push(messageButton("active", -1, active));
       }
+      aggregating.forEach((message, index) => {
+        items.push(messageButton("aggregating", index, message));
+      });
       pending.forEach((message, index) => {
         items.push(messageButton("pending", index, message));
       });
@@ -1971,9 +2226,11 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         `reply: ${modelMetadata.cleaned_reply || modelMetadata.agent_reply || ""}`,
         `raw model: ${modelMetadata.raw_model_content || ""}`,
         `tokens: prompt=${modelMetadata.prompt_tokens ?? "?"} completion=${modelMetadata.completion_tokens ?? "?"} total=${modelMetadata.total_tokens ?? "?"}`,
+        formatTokenUsageLine(modelMetadata.token_usage),
         `tok/s: prompt=${tps.prompt_tokens ?? "?"} completion=${tps.completion_tokens ?? "?"} total=${tps.total_tokens ?? "?"}`,
         `latency: ${modelMetadata.latency_seconds ?? "?"}s`,
         `thinking: requested=${modelMetadata.requested_thinking_level ?? "auto"} effective=${modelMetadata.thinking_level ?? "?"}`,
+        modelMetadata.engagement_decision ? formatEngagementLine(modelMetadata.engagement_decision) : "engagement: none",
         `interaction: ${modelMetadata.interaction_plan ? `${modelMetadata.interaction_plan.mode || "unknown"} hook=${modelMetadata.interaction_plan.hook_budget ?? "?"} affinity=${modelMetadata.interaction_plan.affinity ?? "?"}` : "none"}`,
         `quality: ${modelMetadata.quality_review ? `score=${modelMetadata.quality_review.score ?? "?"} rewrite=${modelMetadata.quality_rewrite_used ?? false}` : "none"}`,
         `provider: decision=${modelMetadata.provider_decision ?? false} trace=${modelMetadata.provider_trace_id || "none"}`,
@@ -1988,6 +2245,29 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       }
     }
 
+    function formatEngagementLine(decision) {
+      if (!decision || typeof decision !== "object") {
+        return "engagement: none";
+      }
+      return `engagement: ${decision.action || "?"} p=${decision.reply_probability ?? "?"} roll=${decision.roll ?? "direct"} direct=${decision.directness || "?"} hook=${decision.continuation_budget ?? "?"}`;
+    }
+
+    function formatTokenUsageLine(tokenUsage) {
+      if (!tokenUsage || typeof tokenUsage !== "object") {
+        return "tokens: local=? api=?";
+      }
+      const local = (tokenUsage.local || {}).total || {};
+      const api = (tokenUsage.api || {}).total || {};
+      return [
+        `tokens: local=${local.prompt ?? "?"}/${local.completion ?? "?"}/${local.total ?? "?"}`,
+        `api=${api.input ?? "?"}/${api.output ?? "?"}/${api.total ?? "?"}`,
+        `cached=${api.cached ?? "?"}`,
+        `reasoning=${api.reasoning ?? "?"}`,
+        `local_latency=${local.latency_seconds ?? "?"}s`,
+        `api_latency=${api.latency_seconds ?? "?"}s`
+      ].join(" ");
+    }
+
     function inspectLoopMessage(kind, index) {
       if (!latestLoopStatus) {
         return;
@@ -1995,6 +2275,8 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       let message = null;
       if (kind === "active") {
         message = latestLoopStatus.active_message;
+      } else if (kind === "aggregating") {
+        message = (latestLoopStatus.aggregating_messages || [])[index] || null;
       } else {
         message = (latestLoopStatus.pending_messages || [])[index] || null;
       }
@@ -2068,14 +2350,24 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         ].join("|");
         if (key && key !== lastLoopActivityKey) {
           lastLoopActivityKey = key;
-          showOutput({
-            state: "snapshot",
-            operation: "loop_activity",
-            result: loopSnapshot(result)
-          });
+          refreshDebugTimeline();
         }
       } catch (error) {
         document.getElementById("loopActivity").textContent = `loop status failed: ${String(error.message || error)}`;
+      }
+    }
+
+    async function refreshDebugTimeline() {
+      try {
+        const result = await requestJson("/api/debug/timeline?limit=80");
+        renderChatTimeline(result.items || []);
+        showOutput({
+          state: "snapshot",
+          operation: "debug_timeline",
+          result
+        }, "debug_timeline");
+      } catch (_) {
+        // Keep the existing output if the backend is restarting.
       }
     }
 
@@ -2341,6 +2633,10 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       await runTimed("events", "eventsButton", async () => requestJson("/api/events/recent?limit=20"));
     }
 
+    async function loadTimeline() {
+      await runTimed("debug_timeline", "timelineButton", async () => requestJson("/api/debug/timeline?limit=100"));
+    }
+
     async function loadMemory() {
       await runTimed("memory", "memoryButton", async () => requestJson("/api/memory/recent?limit=30"));
     }
@@ -2494,6 +2790,32 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       }));
     }
 
+    async function triggerSpontaneousFromSettings() {
+      await runTimed("spontaneous", "settingsSpontaneousButton", async () => requestJson("/api/agent/spontaneous", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({context: "Manual trigger from runtime settings panel."})
+      }));
+    }
+
+    async function manualForceReply() {
+      const eventText = document.getElementById("manualReplyEvent").value.trim();
+      const eventId = eventText ? Number(eventText) : null;
+      const payload = {
+        sender_name: document.getElementById("manualReplySender").value.trim(),
+        message_text: document.getElementById("manualReplyMessage").value.trim(),
+        event_id: Number.isFinite(eventId) ? eventId : null,
+        extra_instruction: document.getElementById("manualReplyInstruction").value,
+        send_to_qq: document.getElementById("manualReplySendToQQ").checked
+      };
+      await runTimed("manual_force_reply", "manualForceReplyButton", async () => requestJson("/api/agent-loop/manual-reply", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload)
+      }));
+      await refreshDebugTimeline();
+    }
+
     async function webSearch() {
       await runTimed("web_search", "searchButton", async () => requestJson("/api/web/search", {
         method: "POST",
@@ -2514,6 +2836,18 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       await runTimed("agent_reboot", "agentRebootButton", async () => requestJson("/api/agent/reboot", {method: "POST"}));
     }
 
+    async function fullRestart() {
+      await runTimed("full_restart", "fullRestartButton", async () => requestJson("/api/system/restart", {method: "POST"}));
+    }
+
+    async function refreshStyleAnchor() {
+      await runTimed("style_anchor_refresh", "styleAnchorRefreshButton", async () => requestJson("/api/persona/style-anchor/refresh", {method: "POST"}));
+    }
+
+    async function exportStyleBundle() {
+      await runTimed("style_bundle_export", "styleBundleExportButton", async () => requestJson("/api/persona/style-distillation/export", {method: "POST"}));
+    }
+
     function bootDebugPage() {
       const savedTab = window.localStorage.getItem("debug-active-tab") || "overview";
       activateTab(savedTab);
@@ -2524,8 +2858,9 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       loadGlobalSocialState();
       loadSocialUsers();
       refreshLoopActivity();
-      window.setInterval(refreshLoopActivity, 2000);
-      window.setInterval(refreshTopStatus, 5000);
+      refreshDebugTimeline();
+      window.setInterval(refreshLoopActivity, 1000);
+      window.setInterval(refreshTopStatus, 3000);
     }
 
     bootDebugPage();

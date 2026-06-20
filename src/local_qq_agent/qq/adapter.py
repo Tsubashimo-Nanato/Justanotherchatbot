@@ -126,6 +126,39 @@ class QQWindowAdapter:
         self.armed = False
         return self.status()
 
+    def focus_window(self, *, maximize: bool = False) -> dict[str, Any]:
+        started_at = time.perf_counter()
+        try:
+            window = self._find_window()
+            was_minimized = self._prepare_window_for_interaction(window)
+            maximized = False
+            if maximize:
+                try:
+                    window.maximize()
+                    maximized = True
+                    time.sleep(0.1)
+                except Exception:
+                    maximized = False
+            try:
+                window.set_focus()
+            except Exception:
+                pass
+            return {
+                "ok": True,
+                "reason": "focused",
+                "window_title": str(window.window_text()),
+                "was_minimized": was_minimized,
+                "maximized": maximized,
+                "duration_seconds": round(time.perf_counter() - started_at, 3),
+            }
+        except Exception as error:
+            return {
+                "ok": False,
+                "reason": "focus_failed",
+                "error": str(error),
+                "duration_seconds": round(time.perf_counter() - started_at, 3),
+            }
+
     def probe(self) -> dict[str, Any]:
         window = self._find_window()
         entries: list[dict[str, Any]] = []

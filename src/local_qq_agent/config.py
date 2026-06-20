@@ -77,6 +77,13 @@ def optional_string_tuple(data: dict[str, Any], key: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in value if item.strip())
 
 
+def optional_choice(data: dict[str, Any], key: str, default: str, choices: set[str]) -> str:
+    value = str(data.get(key, default)).strip().casefold()
+    if value not in choices:
+        raise ConfigError(f"{key} must be one of: {', '.join(sorted(choices))}")
+    return value
+
+
 def optional_path(data: dict[str, Any], key: str) -> Path | None:
     value = data.get(key)
     if value is None or value == "":
@@ -279,6 +286,9 @@ class QQConfig:
     idle_poll_after_ticks: int = 3
     read_timeout_seconds: float = 8.0
     duplicate_suppression_seconds: float = 3600.0
+    turn_quiet_period_seconds: float = 6.0
+    scrollback_on_new_messages: bool = True
+    scrollback_pages_on_new_messages: int = 2
     bot_sender_aliases: tuple[str, ...] = ()
 
     @classmethod
@@ -304,7 +314,40 @@ class QQConfig:
             ignore_existing_on_start=optional_bool(raw, "ignore_existing_on_start", True),
             read_timeout_seconds=optional_float(raw, "read_timeout_seconds", 8.0),
             duplicate_suppression_seconds=optional_float(raw, "duplicate_suppression_seconds", 3600.0),
+            turn_quiet_period_seconds=optional_float(raw, "turn_quiet_period_seconds", 6.0),
+            scrollback_on_new_messages=optional_bool(raw, "scrollback_on_new_messages", True),
+            scrollback_pages_on_new_messages=optional_int(raw, "scrollback_pages_on_new_messages", 2),
             bot_sender_aliases=optional_string_tuple(raw, "bot_sender_aliases"),
+        )
+
+
+@dataclass(frozen=True)
+class AutonomyConfig:
+    mode: str
+    min_seconds_between_messages: float
+    max_messages_per_hour: int
+    allow_spontaneous_topics: bool
+    require_human_trigger_for_demo: bool
+    spontaneous_min_idle_seconds: float = 900.0
+    spontaneous_bot_cooldown_seconds: float = 1200.0
+    spontaneous_backoff_seconds: float = 420.0
+    spontaneous_token_capacity: float = 2.0
+    spontaneous_token_refill_per_hour: float = 2.0
+
+    @classmethod
+    def load(cls, path: str | Path = "config/autonomy.yaml") -> "AutonomyConfig":
+        raw = read_yaml(path)
+        return cls(
+            mode=str(raw.get("mode", "manual-demo")),
+            min_seconds_between_messages=optional_float(raw, "min_seconds_between_messages", 90.0),
+            max_messages_per_hour=optional_int(raw, "max_messages_per_hour", 12),
+            allow_spontaneous_topics=optional_bool(raw, "allow_spontaneous_topics", False),
+            require_human_trigger_for_demo=optional_bool(raw, "require_human_trigger_for_demo", True),
+            spontaneous_min_idle_seconds=optional_float(raw, "spontaneous_min_idle_seconds", 900.0),
+            spontaneous_bot_cooldown_seconds=optional_float(raw, "spontaneous_bot_cooldown_seconds", 1200.0),
+            spontaneous_backoff_seconds=optional_float(raw, "spontaneous_backoff_seconds", 420.0),
+            spontaneous_token_capacity=optional_float(raw, "spontaneous_token_capacity", 2.0),
+            spontaneous_token_refill_per_hour=optional_float(raw, "spontaneous_token_refill_per_hour", 2.0),
         )
 
 
@@ -353,6 +396,14 @@ class ProviderConfig:
     grok_timeout_seconds: int
     grok_max_tokens: int
     grok_enable_web_search: bool
+    grok_endpoint: str
+    grok_reasoning_simple_chat: str
+    grok_reasoning_final_reply: str
+    grok_reasoning_rewrite: str
+    grok_reasoning_web_fact: str
+    grok_reasoning_complex_reasoning: str
+    grok_cache_enabled: bool
+    grok_cache_scope: str
     daily_token_budget: int
     degrade_at_ratio: float
     per_message_input_token_budget: int
@@ -366,6 +417,16 @@ class ProviderConfig:
         grok = raw.get("grok", {})
         if not isinstance(grok, dict):
             raise ConfigError("grok must be a mapping")
+        reasoning = grok.get("reasoning", {})
+        if reasoning is None:
+            reasoning = {}
+        if not isinstance(reasoning, dict):
+            raise ConfigError("grok.reasoning must be a mapping")
+        cache = grok.get("cache", {})
+        if cache is None:
+            cache = {}
+        if not isinstance(cache, dict):
+            raise ConfigError("grok.cache must be a mapping")
         budget = raw.get("budget", {})
         if not isinstance(budget, dict):
             raise ConfigError("budget must be a mapping")
@@ -379,8 +440,9 @@ class ProviderConfig:
             raise ConfigError("safety must be a mapping")
 
         provider = str(raw.get("active_provider", "unloaded")).strip().casefold()
-        if provider not in {"unloaded", "local", "grok", "hybrid"}:
+        if provider not in {"unloaded", "local", "grok", "hybrid", "grok_responses", "hybrid_responses"}:
             raise ConfigError(f"unsupported provider: {provider}")
+        reasoning_choices = {"none", "low", "medium", "high"}
 
         return cls(
             active_provider=provider,
@@ -389,6 +451,19 @@ class ProviderConfig:
             grok_timeout_seconds=optional_int(grok, "timeout_seconds", 180),
             grok_max_tokens=optional_int(grok, "max_tokens", 512),
             grok_enable_web_search=optional_bool(grok, "enable_web_search", True),
+            grok_endpoint=optional_choice(grok, "endpoint", "chat_completions", {"chat_completions", "responses"}),
+            grok_reasoning_simple_chat=optional_choice(reasoning, "simple_chat", "none", reasoning_choices),
+            grok_reasoning_final_reply=optional_choice(reasoning, "final_reply", "low", reasoning_choices),
+            grok_reasoning_rewrite=optional_choice(reasoning, "rewrite", "none", reasoning_choices),
+            grok_reasoning_web_fact=optional_choice(reasoning, "web_fact", "medium", reasoning_choices),
+            grok_reasoning_complex_reasoning=optional_choice(
+                reasoning,
+                "complex_reasoning",
+                "high",
+                reasoning_choices,
+            ),
+            grok_cache_enabled=optional_bool(cache, "enabled", True),
+            grok_cache_scope=str(cache.get("scope", "qq_group_session")).strip() or "qq_group_session",
             daily_token_budget=optional_int(
                 budget,
                 "smoke_daily_token_budget",

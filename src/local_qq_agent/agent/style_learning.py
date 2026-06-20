@@ -96,6 +96,57 @@ class StyleAnchorResult:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class StyleDistillationBundleResult:
+    ok: bool
+    path: str
+    target_user: str
+    event_count: int
+    instruction_path: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def export_style_distillation_bundle(
+    store: SQLiteMemoryStore,
+    *,
+    target_user: str,
+    output_path: Path,
+    instruction_path: Path,
+    run_log_dir: Path | None = None,
+    event_limit: int = 0,
+) -> StyleDistillationBundleResult:
+    target = target_user.strip()
+    events = _clean_style_events(
+        store,
+        target_user=target,
+        run_log_dir=run_log_dir,
+        event_limit=event_limit,
+    )
+    ensure_parent(output_path)
+    output_path.write_text(
+        json.dumps(
+            {
+                "target_user": target,
+                "instruction_path": str(instruction_path),
+                "event_count": len(events),
+                "events": events,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return StyleDistillationBundleResult(
+        ok=True,
+        path=str(output_path),
+        target_user=target,
+        event_count=len(events),
+        instruction_path=str(instruction_path),
+    )
+
+
 class StyleAnchorDistiller:
     def __init__(self, store: SQLiteMemoryStore) -> None:
         self.store = store
@@ -106,9 +157,9 @@ class StyleAnchorDistiller:
         target_user: str,
         output_path: Path,
         run_log_dir: Path | None = None,
-        event_limit: int = 800,
-        run_log_limit: int = 5,
-        sample_limit: int = 28,
+        event_limit: int = 0,
+        run_log_limit: int = 0,
+        sample_limit: int = 80,
     ) -> StyleAnchorResult:
         target = target_user.strip()
         if not target:
@@ -137,7 +188,8 @@ class StyleAnchorDistiller:
     def _samples_from_events(self, target_user: str, *, event_limit: int) -> tuple[list[str], list[str]]:
         samples: list[str] = []
         feedback: list[str] = []
-        for event in self.store.recent_events(limit=event_limit):
+        events = self._style_source_events(event_limit=event_limit)
+        for event in events:
             if event.kind == "group_message":
                 sender = str(event.metadata.get("sender_name") or event.source).strip()
                 if self._same_person(sender, target_user):
@@ -152,6 +204,22 @@ class StyleAnchorDistiller:
                     feedback.append(self._clean_sample(note))
         return samples, feedback
 
+    def _style_source_events(self, *, event_limit: int) -> list[Any]:
+        if event_limit > 0:
+            return self.store.recent_events(limit=event_limit)
+
+        with self.store.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, created_at, source, kind, content, metadata_json
+                FROM events
+                WHERE kind IN ('group_message', 'behavior_feedback')
+                ORDER BY id ASC
+                """
+            ).fetchall()
+
+        return [self.store._event_from_row(row) for row in rows]
+
     def _samples_from_run_logs(
         self,
         target_user: str,
@@ -164,7 +232,9 @@ class StyleAnchorDistiller:
 
         samples: list[str] = []
         feedback: list[str] = []
-        logs = sorted(run_log_dir.glob("run_log_*.json"), key=lambda path: path.stat().st_mtime)[-run_log_limit:]
+        logs = sorted(run_log_dir.glob("run_log_*.json"), key=lambda path: path.stat().st_mtime)
+        if run_log_limit > 0:
+            logs = logs[-run_log_limit:]
         for path in logs:
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
@@ -325,3 +395,86 @@ class StyleAnchorDistiller:
         if any(fragment in compact for fragment in noise):
             return True
         return compact in {"detail", "details", "force", "enforce", "ignore", "debug", "log", "logs"}
+
+
+def _clean_style_events(
+    store: SQLiteMemoryStore,
+    *,
+    target_user: str,
+    run_log_dir: Path | None,
+    event_limit: int,
+) -> list[dict[str, Any]]:
+    distiller = StyleAnchorDistiller(store)
+    result: list[dict[str, Any]] = []
+    for event in distiller._style_source_events(event_limit=event_limit):
+        if event.kind == "group_message":
+            sender = str(event.metadata.get("sender_name") or event.source).strip()
+            text = distiller._clean_sample(str(event.metadata.get("clean_text") or event.content))
+            if not text:
+                continue
+            result.append(
+                {
+                    "kind": "group_message",
+                    "time": event.created_at,
+                    "sender": sender,
+                    "is_target_user": distiller._same_person(sender, target_user),
+                    "text": text,
+                    "agent_action": event.metadata.get("agent_action"),
+                    "agent_reason": event.metadata.get("agent_reason"),
+                }
+            )
+        elif event.kind == "behavior_feedback":
+            note = distiller._clean_sample(str(event.metadata.get("score_note") or event.content))
+            if note:
+                result.append(
+                    {
+                        "kind": "behavior_feedback",
+                        "time": event.created_at,
+                        "score": event.metadata.get("score_value"),
+                        "note": note,
+                        "recent_reply": distiller._clean_sample(str(event.metadata.get("recent_reply") or "")),
+                    }
+                )
+
+    if run_log_dir is None or not run_log_dir.exists():
+        return result
+
+    for path in sorted(run_log_dir.glob("run_log_*.json"), key=lambda item: item.stat().st_mtime):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        events = payload.get("events")
+        if not isinstance(events, list):
+            continue
+        for item in events:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind", ""))
+            if kind == "group_message":
+                sender = str(item.get("sender", "")).strip()
+                text = distiller._clean_sample(str(item.get("text", "")))
+                if text:
+                    result.append(
+                        {
+                            "kind": kind,
+                            "time": item.get("time"),
+                            "sender": sender,
+                            "is_target_user": distiller._same_person(sender, target_user),
+                            "text": text,
+                            "source_log": path.name,
+                        }
+                    )
+            elif kind in {"assistant_reply", "assistant_blocked", "behavior_feedback"}:
+                text = distiller._clean_sample(str(item.get("text") or item.get("note") or item.get("summary") or ""))
+                if text:
+                    result.append(
+                        {
+                            "kind": kind,
+                            "time": item.get("time"),
+                            "text": text,
+                            "reason": item.get("reason"),
+                            "source_log": path.name,
+                        }
+                    )
+    return result

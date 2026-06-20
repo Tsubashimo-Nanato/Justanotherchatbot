@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import time
@@ -96,25 +97,37 @@ class GrokClient:
             "base_url": self.provider_config.grok_base_url,
         }
 
-    async def chat(self, messages: list[dict[str, str]], *, max_tokens: int | None = None) -> ModelReply:
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None = None,
+        operation: str = "final_reply",
+    ) -> ModelReply:
         messages, input_budget = self._messages_within_input_budget(messages)
-        payload = self._base_payload(messages, max_tokens=max_tokens)
+        if self._use_responses_endpoint():
+            return await self._responses_chat(messages, max_tokens=max_tokens, operation=operation, input_budget=input_budget)
+
+        payload = self._base_payload(messages, max_tokens=max_tokens, operation=operation)
         trace = self.traces.start(
             provider=self.provider_name,
             model=self.provider_config.grok_model,
-            operation="chat",
+            operation=operation,
             metadata={
                 "message_count": len(messages),
                 "max_tokens": payload.get("max_tokens"),
+                "reasoning_effort": payload.get("reasoning_effort", ""),
+                "cache_key": self._cache_key(),
+                "endpoint": "chat_completions",
                 "usage_requested": bool(payload.get("stream_options")),
                 "input_budget": input_budget,
             },
         )
-        return await self._stream_chat_with_compat(payload, trace=trace, operation="chat")
+        return await self._stream_chat_with_compat(payload, trace=trace, operation=operation)
 
     async def chat_decision(self, messages: list[dict[str, str]], *, max_tokens: int | None = None) -> ModelReply:
         messages, input_budget = self._messages_within_input_budget(messages)
-        payload = self._base_payload(messages, max_tokens=max_tokens)
+        payload = self._base_payload(messages, max_tokens=max_tokens, operation="decision")
         payload["response_format"] = {
             "type": "json_schema",
             "json_schema": {
@@ -133,6 +146,9 @@ class GrokClient:
             metadata={
                 "message_count": len(messages),
                 "max_tokens": payload.get("max_tokens"),
+                "reasoning_effort": payload.get("reasoning_effort", ""),
+                "cache_key": self._cache_key(),
+                "endpoint": "chat_completions",
                 "web_search_requested": bool(payload.get("tools")),
                 "daily_usage": self.usage.snapshot().to_dict(),
                 "input_budget": input_budget,
@@ -178,18 +194,25 @@ class GrokClient:
             "store": False,
             "temperature": self.model_config.temperature,
             "top_p": self.model_config.top_p,
+            "reasoning": {"effort": self.provider_config.grok_reasoning_web_fact},
         }
+        cache_key = self._cache_key()
+        if cache_key:
+            payload["prompt_cache_key"] = cache_key
         trace = self.traces.start(
             provider=self.provider_name,
             model=self.provider_config.grok_model,
             operation="web_search",
-            metadata={"query": query, "max_output_tokens": max_tokens, "endpoint": "responses"},
+            metadata={
+                "query": query,
+                "max_output_tokens": max_tokens,
+                "endpoint": "responses",
+                "reasoning_effort": self.provider_config.grok_reasoning_web_fact,
+                "cache_key": cache_key,
+            },
         )
         started_at = time.perf_counter()
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = self._headers()
         trace.add("api_request_started", "Responses web_search request started.", {"query": query})
         try:
             async with httpx.AsyncClient(timeout=self.provider_config.grok_timeout_seconds) as client:
@@ -255,6 +278,8 @@ class GrokClient:
             local_time_used=False,
             search_used=bool(tool_calls or sources),
             browser_used=False,
+            usage=usage,
+            trace_id=trace.trace_id,
         )
 
     def cloud_loop_preflight(self) -> dict[str, Any]:
@@ -286,12 +311,18 @@ class GrokClient:
             },
         }
 
-    def _base_payload(self, messages: list[dict[str, str]], *, max_tokens: int | None) -> dict[str, Any]:
+    def _base_payload(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None,
+        operation: str,
+    ) -> dict[str, Any]:
         if not messages:
             raise ValueError("messages must not be empty")
         if not self.api_key:
             raise RuntimeError("XAI_API_KEY is not configured")
-        return {
+        payload = {
             "model": self.provider_config.grok_model,
             "messages": messages,
             "temperature": self.model_config.temperature,
@@ -300,6 +331,10 @@ class GrokClient:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        reasoning_effort = self._reasoning_effort(operation)
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
+        return payload
 
     def _messages_within_input_budget(
         self,
@@ -355,29 +390,188 @@ class GrokClient:
         trace: ProviderTrace,
         operation: str,
     ) -> ModelReply:
-        try:
-            return await self._stream_chat(payload, trace=trace, operation=operation)
-        except httpx.HTTPStatusError as error:
-            if not self._can_retry_without_stream_options(error, payload):
+        current_payload = dict(payload)
+        current_operation = operation
+        removed_reasoning = False
+        removed_stream_options = False
+        while True:
+            try:
+                return await self._stream_chat(current_payload, trace=trace, operation=current_operation)
+            except httpx.HTTPStatusError as error:
+                if not removed_reasoning and self._can_retry_without_reasoning(error, current_payload):
+                    removed_reasoning = True
+                    trace.add(
+                        "reasoning_effort_retry",
+                        "Provider rejected reasoning_effort; retrying without it.",
+                        {"status_code": error.response.status_code, "body": error.response.text[:1000]},
+                    )
+                    current_payload = dict(current_payload)
+                    current_payload.pop("reasoning_effort", None)
+                    current_operation = f"{current_operation}_retry_no_reasoning"
+                    continue
+                if not removed_stream_options and self._can_retry_without_stream_options(error, current_payload):
+                    removed_stream_options = True
+                    trace.add(
+                        "stream_options_retry",
+                        "Provider rejected stream_options; retrying without streamed usage accounting.",
+                        {"status_code": error.response.status_code, "body": error.response.text[:1000]},
+                    )
+                    current_payload = dict(current_payload)
+                    current_payload.pop("stream_options", None)
+                    current_operation = f"{current_operation}_retry_no_stream_usage"
+                    continue
                 raise
-            trace.add(
-                "stream_options_retry",
-                "Provider rejected stream_options; retrying without streamed usage accounting.",
-                {"status_code": error.response.status_code, "body": error.response.text[:1000]},
-            )
-            retry_payload = dict(payload)
-            retry_payload.pop("stream_options", None)
-            return await self._stream_chat(
-                retry_payload,
-                trace=trace,
-                operation=f"{operation}_retry_no_stream_usage",
-            )
+
+    def _can_retry_without_reasoning(self, error: httpx.HTTPStatusError, payload: dict[str, Any]) -> bool:
+        if error.response.status_code != 400 or "reasoning_effort" not in payload:
+            return False
+        body = error.response.text.casefold()
+        return "reasoning_effort" in body or "extra inputs" in body or "unsupported" in body
 
     def _can_retry_without_stream_options(self, error: httpx.HTTPStatusError, payload: dict[str, Any]) -> bool:
         if error.response.status_code != 400 or "stream_options" not in payload:
             return False
         body = error.response.text.casefold()
         return "stream_options" in body or "extra inputs" in body or "unsupported" in body
+
+    async def _responses_chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None,
+        operation: str,
+        input_budget: dict[str, Any],
+    ) -> ModelReply:
+        payload = self._responses_payload(messages, max_tokens=max_tokens, operation=operation)
+        trace = self.traces.start(
+            provider=self.provider_name,
+            model=self.provider_config.grok_model,
+            operation=operation,
+            metadata={
+                "message_count": len(messages),
+                "max_output_tokens": payload.get("max_output_tokens"),
+                "reasoning_effort": payload.get("reasoning", {}).get("effort", ""),
+                "cache_key": payload.get("prompt_cache_key", ""),
+                "endpoint": "responses",
+                "input_budget": input_budget,
+            },
+        )
+        started_at = time.perf_counter()
+        trace.add("api_request_started", "Responses request started.", {"operation": operation})
+        try:
+            async with httpx.AsyncClient(timeout=self.provider_config.grok_timeout_seconds) as client:
+                response = await client.post(
+                    f"{self.provider_config.grok_base_url}/responses",
+                    headers=self._headers(),
+                    json=payload,
+                )
+            if response.status_code >= 400:
+                body = response.text[:1000]
+                trace.finish(error=body)
+                raise httpx.HTTPStatusError(
+                    f"xAI responses request failed with HTTP {response.status_code}",
+                    request=response.request,
+                    response=response,
+                )
+            data = response.json()
+        except Exception as error:
+            trace.finish(error=str(error))
+            raise
+
+        content = _responses_text(data).strip()
+        if not content:
+            trace.finish(error="empty response content")
+            raise RuntimeError("xAI response content was empty")
+
+        latency = time.perf_counter() - started_at
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        normalized_usage = _normalized_reply_usage(usage)
+        trace.add(
+            "final_output",
+            "Responses request completed.",
+            {"usage": usage, "content_preview": content[:800]},
+        )
+        trace.finish()
+        model = str(data.get("model", self.provider_config.grok_model))
+        self.usage.record(
+            provider=self.provider_name,
+            model=model,
+            usage=usage,
+            trace_id=trace.trace_id,
+            operation=operation,
+        )
+        return ModelReply(
+            content=content,
+            model=model,
+            latency_seconds=latency,
+            usage=normalized_usage,
+            tokens_per_second=tokens_per_second(normalized_usage, latency),
+            metadata={
+                "trace_id": trace.trace_id,
+                "provider": self.provider_name,
+                "endpoint": "responses",
+                "reasoning_effort": payload.get("reasoning", {}).get("effort", ""),
+            },
+        )
+
+    def _responses_payload(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None,
+        operation: str,
+    ) -> dict[str, Any]:
+        if not messages:
+            raise ValueError("messages must not be empty")
+        if not self.api_key:
+            raise RuntimeError("XAI_API_KEY is not configured")
+        payload: dict[str, Any] = {
+            "model": self.provider_config.grok_model,
+            "input": messages,
+            "max_output_tokens": max_tokens if max_tokens is not None else self.provider_config.grok_max_tokens,
+            "store": False,
+            "temperature": self.model_config.temperature,
+            "top_p": self.model_config.top_p,
+            "reasoning": {"effort": self._reasoning_effort(operation)},
+        }
+        cache_key = self._cache_key()
+        if cache_key:
+            payload["prompt_cache_key"] = cache_key
+        return payload
+
+    def _use_responses_endpoint(self) -> bool:
+        return self.provider_config.grok_endpoint == "responses" or self.provider_config.active_provider.endswith(
+            "_responses"
+        )
+
+    def _reasoning_effort(self, operation: str) -> str:
+        if operation in {"simple_chat", "placeholder"}:
+            return self.provider_config.grok_reasoning_simple_chat
+        if operation in {"rewrite", "quality_rewrite"}:
+            return self.provider_config.grok_reasoning_rewrite
+        if operation in {"web_fact", "web_search"}:
+            return self.provider_config.grok_reasoning_web_fact
+        if operation in {"complex_reasoning", "math_reasoning"}:
+            return self.provider_config.grok_reasoning_complex_reasoning
+        return self.provider_config.grok_reasoning_final_reply
+
+    def _cache_key(self) -> str:
+        if not self.provider_config.grok_cache_enabled:
+            return ""
+        raw = f"{self.provider_config.grok_cache_scope}:{self.provider_config.grok_model}"
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+        return f"qq-agent-{digest}"
+
+    def _headers(self, *, chat_cache: bool = False) -> dict[str, str]:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        if chat_cache:
+            cache_key = self._cache_key()
+            if cache_key:
+                headers["x-grok-conv-id"] = cache_key
+        return headers
 
     async def _stream_chat(self, payload: dict[str, Any], *, trace: ProviderTrace, operation: str) -> ModelReply:
         started_at = time.perf_counter()
@@ -387,10 +581,7 @@ class GrokClient:
         usage: dict[str, Any] = {}
         model = self.provider_config.grok_model
         first_token_seen = False
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = self._headers(chat_cache=True)
         try:
             async with httpx.AsyncClient(timeout=self.provider_config.grok_timeout_seconds) as client:
                 async with client.stream(
@@ -456,6 +647,7 @@ class GrokClient:
             {"usage": usage, "content_preview": content[:800]},
         )
         trace.finish()
+        normalized_usage = _normalized_reply_usage(usage)
         self.usage.record(
             provider=self.provider_name,
             model=model,
@@ -467,9 +659,14 @@ class GrokClient:
             content=content,
             model=model,
             latency_seconds=latency,
-            usage=usage,
-            tokens_per_second=tokens_per_second(usage, latency),
-            metadata={"trace_id": trace.trace_id, "provider": self.provider_name},
+            usage=normalized_usage,
+            tokens_per_second=tokens_per_second(normalized_usage, latency),
+            metadata={
+                "trace_id": trace.trace_id,
+                "provider": self.provider_name,
+                "endpoint": "chat_completions",
+                "reasoning_effort": payload.get("reasoning_effort", ""),
+            },
         )
 
 
@@ -526,6 +723,37 @@ def _responses_web_context(data: dict[str, Any]) -> tuple[str, list[WebSource], 
         for url in unique_urls
     ]
     return text, sources, tool_calls
+
+
+def _responses_text(data: dict[str, Any]) -> str:
+    text = str(data.get("output_text", "")).strip()
+    if text:
+        return text
+    text, _sources, _tool_calls = _responses_web_context(data)
+    return text
+
+
+def _normalized_reply_usage(usage: dict[str, Any]) -> dict[str, Any]:
+    prompt_tokens = _positive_int(usage.get("prompt_tokens")) or _positive_int(usage.get("input_tokens"))
+    completion_tokens = _positive_int(usage.get("completion_tokens")) or _positive_int(usage.get("output_tokens"))
+    total_tokens = _positive_int(usage.get("total_tokens")) or prompt_tokens + completion_tokens
+    normalized = dict(usage)
+    normalized["prompt_tokens"] = prompt_tokens
+    normalized["completion_tokens"] = completion_tokens
+    normalized["total_tokens"] = total_tokens
+    if "input_tokens_details" in usage and "prompt_tokens_details" not in normalized:
+        normalized["prompt_tokens_details"] = usage["input_tokens_details"]
+    if "output_tokens_details" in usage and "completion_tokens_details" not in normalized:
+        normalized["completion_tokens_details"] = usage["output_tokens_details"]
+    return normalized
+
+
+def _positive_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int | float) and value > 0:
+        return int(value)
+    return 0
 
 
 def _format_provider_web_context(query: str, text: str, sources: list[WebSource]) -> str:

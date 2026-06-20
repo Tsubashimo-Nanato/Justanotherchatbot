@@ -109,6 +109,38 @@ def test_agent_loop_backs_off_after_idle_reads():
     assert loop.status()["idle_read_ticks"] == 0
 
 
+def test_agent_loop_merges_same_sender_messages_after_quiet_period():
+    loop = build_loop()
+    first = message("沐浴露", "fp-bath-1", top=100)
+    second = message("好闻", "fp-bath-2", top=150)
+
+    assert loop._enqueue_visible_targets([first], respect_quiet_period=True, now=10.0) == []
+    assert loop.status()["aggregating_message_count"] == 1
+
+    assert loop._enqueue_visible_targets([second], respect_quiet_period=True, now=12.0) == []
+
+    enqueued = loop._enqueue_visible_targets([], respect_quiet_period=True, now=19.0)
+
+    assert len(enqueued) == 1
+    assert enqueued[0].text == "沐浴露\n好闻"
+    assert enqueued[0].turn.reason == "quiet_period_merged"
+    assert loop.status()["aggregating_message_count"] == 0
+    assert loop.status()["pending_message_count"] == 1
+    assert not loop._turn_ledger.can_enqueue(enqueued[0].identity, "fp-bath-1")
+    assert not loop._turn_ledger.can_enqueue(enqueued[0].identity, "fp-bath-2")
+
+
+def test_agent_loop_does_not_duplicate_buffered_coordinate_shift():
+    loop = build_loop()
+    original = message("还没想好", "fp-noodle-1", top=100)
+    shifted = message("还没想好", "fp-noodle-2", top=130)
+
+    loop._enqueue_visible_targets([original], respect_quiet_period=True, now=10.0)
+    loop._enqueue_visible_targets([shifted], respect_quiet_period=True, now=11.0)
+
+    assert loop.status()["aggregating_messages"][0]["message_count"] == 1
+
+
 def test_agent_loop_marks_cleaned_message_seen_after_polluted_raw_block():
     loop = build_loop()
     polluted = message("old bot reply\n[debug elapsed=10s, prompt_tokens=99]\nwhat time is it .detail", "fp-1", top=100)
@@ -337,7 +369,7 @@ def test_record_visible_read_initializes_contacts_and_context():
     assert [item["source"] for item in events] == ["other user"]
 
 
-def test_tick_queues_all_visible_target_messages_before_processing():
+def test_tick_buffers_visible_target_messages_before_processing():
     import asyncio
 
     loop = build_loop(max_messages_per_tick=1)
@@ -375,13 +407,16 @@ def test_tick_queues_all_visible_target_messages_before_processing():
 
     result = asyncio.run(loop.tick())
 
-    assert result["pending_message_count"] == 2
-    assert [item["fingerprint"] for item in result["enqueued"]] == ["fp-first", "fp-second"]
+    assert result["pending_message_count"] == 0
+    assert result["aggregating_message_count"] == 1
+    assert result["new_observation_count"] == 2
+    assert result["enqueued"] == []
     assert not loop._message_seen(first.sender_name, first.text, first.fingerprint)
-    assert [event["metadata"]["agent_action"] for event in events] == ["queued", "queued"]
+    message_events = [event for event in events if event.get("kind") == "group_message"]
+    assert [event["metadata"]["agent_action"] for event in message_events] == ["aggregating", "aggregating"]
 
 
-def test_tick_queues_non_target_visible_messages_for_gate_decision():
+def test_tick_buffers_non_target_visible_messages_for_gate_decision():
     import asyncio
 
     loop = build_loop(max_messages_per_tick=3)
@@ -417,8 +452,10 @@ def test_tick_queues_non_target_visible_messages_for_gate_decision():
 
     result = asyncio.run(loop.tick())
 
-    assert result["pending_message_count"] == 1
-    assert result["enqueued"][0]["sender_name"] == "other user"
+    assert result["pending_message_count"] == 0
+    assert result["aggregating_message_count"] == 1
+    assert result["new_observation_count"] == 1
+    assert result["enqueued"] == []
 
 
 def test_processor_handles_queued_messages_in_fifo_order():

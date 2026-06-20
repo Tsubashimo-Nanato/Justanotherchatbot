@@ -12,8 +12,13 @@ COMMAND_ALIASES = {
     ".ignore": "ignore",
 }
 COMMAND_TOKEN_ALIASES = {
+    ".e": ".enforce",
+    ".enforece": ".enforce",
+    ".f": ".enforce",
     ".force": ".enforce",
     ".forced": ".enforce",
+    ".d": ".debug",
+    ".l": ".debug",
     ".log": ".debug",
     ".logs": ".debug",
     ".dbg": ".debug",
@@ -26,9 +31,13 @@ KNOWN_COMMAND_TOKENS = {
     ".enforce",
     ".help",
     ".ignore",
+    ".loop",
     ".reboot",
     ".score",
     ".set",
+    ".s",
+    ".spon",
+    ".spontaneous",
     ".status",
     ".think",
 }
@@ -79,6 +88,8 @@ class ParsedMessage:
     reboot_requested: bool
     set_requested: bool
     score_requested: bool
+    loop_command: str
+    spontaneous_requested: bool
     score_value: float | None
     score_note: str
     thinking_level: int | None
@@ -101,6 +112,55 @@ def parse_message_commands(message: str, resolution: CommandResolution | None = 
         return _parsed_empty(resolution)
 
     standalone_text = _standalone_command_text(text)
+    loop_command = _loop_command(standalone_text)
+    if loop_command:
+        return ParsedMessage(
+            content="",
+            enforced=False,
+            debug_requested=False,
+            diagnostic_requested=False,
+            ignored=False,
+            help_requested=False,
+            status_requested=False,
+            reboot_requested=False,
+            set_requested=False,
+            score_requested=False,
+            loop_command=loop_command,
+            spontaneous_requested=False,
+            score_value=None,
+            score_note="",
+            thinking_level=None,
+            setting_updates={},
+            setting_errors=(),
+            command_suffixes=tuple(standalone_text.split()),
+            command_resolution_notice=resolution.notice,
+            command_resolution=resolution.to_metadata(),
+        )
+
+    if _spontaneous_command(standalone_text):
+        return ParsedMessage(
+            content="",
+            enforced=False,
+            debug_requested=False,
+            diagnostic_requested=False,
+            ignored=False,
+            help_requested=False,
+            status_requested=False,
+            reboot_requested=False,
+            set_requested=False,
+            score_requested=False,
+            loop_command="",
+            spontaneous_requested=True,
+            score_value=None,
+            score_note="",
+            thinking_level=None,
+            setting_updates={},
+            setting_errors=(),
+            command_suffixes=(standalone_text,),
+            command_resolution_notice=resolution.notice,
+            command_resolution=resolution.to_metadata(),
+        )
+
     standalone_commands = {
         ".help": "help_requested",
         ".status": "status_requested",
@@ -120,6 +180,8 @@ def parse_message_commands(message: str, resolution: CommandResolution | None = 
             reboot_requested=requested_flag == "reboot_requested",
             set_requested=False,
             score_requested=False,
+            loop_command="",
+            spontaneous_requested=False,
             score_value=None,
             score_note="",
             thinking_level=None,
@@ -176,6 +238,8 @@ def parse_message_commands(message: str, resolution: CommandResolution | None = 
         reboot_requested=False,
         set_requested=False,
         score_requested=False,
+        loop_command="",
+        spontaneous_requested=False,
         score_value=None,
         score_note="",
         thinking_level=thinking_level,
@@ -264,6 +328,8 @@ def _parsed_empty(resolution: CommandResolution | None = None) -> ParsedMessage:
         reboot_requested=False,
         set_requested=False,
         score_requested=False,
+        loop_command="",
+        spontaneous_requested=False,
         score_value=None,
         score_note="",
         thinking_level=None,
@@ -281,11 +347,26 @@ def _standalone_command_text(text: str) -> str:
         return text
     last_line = lines[-1]
     lowered = last_line.casefold()
-    if lowered in {".help", ".status", ".reboot", ".debug"}:
+    if lowered in {".help", ".status", ".reboot", ".debug", ".s", ".spon", ".spontaneous"}:
+        return last_line
+    if lowered in {".loop start", ".loop stop"}:
         return last_line
     if lowered.startswith(".set") or lowered.startswith(".score"):
         return last_line
     return text
+
+
+def _loop_command(text: str) -> str:
+    tokens = text.strip().casefold().split()
+    if len(tokens) != 2 or tokens[0] != ".loop":
+        return ""
+    if tokens[1] in {"start", "stop"}:
+        return tokens[1]
+    return ""
+
+
+def _spontaneous_command(text: str) -> bool:
+    return text.strip().casefold() in {".s", ".spon", ".spontaneous"}
 
 
 def _parse_set_command(text: str, *, resolution: CommandResolution | None = None) -> ParsedMessage:
@@ -345,6 +426,8 @@ def _parse_set_command(text: str, *, resolution: CommandResolution | None = None
         reboot_requested=False,
         set_requested=True,
         score_requested=False,
+        loop_command="",
+        spontaneous_requested=False,
         score_value=None,
         score_note="",
         thinking_level=None,
@@ -393,6 +476,8 @@ def _parse_score_command(text: str, *, resolution: CommandResolution | None = No
         reboot_requested=False,
         set_requested=False,
         score_requested=True,
+        loop_command="",
+        spontaneous_requested=False,
         score_value=score_value,
         score_note=note,
         thinking_level=None,

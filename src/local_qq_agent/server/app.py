@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict
+from datetime import UTC, datetime
 import json
 from typing import Any
 
@@ -11,8 +12,8 @@ from pydantic import BaseModel, Field
 
 from local_qq_agent.agent import LocalAgent, PersonaGuard, SocialStateTracker
 from local_qq_agent.agent.context import ContextBuilder
-from local_qq_agent.agent.style_learning import StyleAnchorDistiller
-from local_qq_agent.config import MemoryConfig, ModelConfig, PersonaConfig, QQConfig, WebConfig
+from local_qq_agent.agent.style_learning import StyleAnchorDistiller, export_style_distillation_bundle
+from local_qq_agent.config import AutonomyConfig, MemoryConfig, ModelConfig, PersonaConfig, QQConfig, WebConfig
 from local_qq_agent.memory import SQLiteMemoryStore
 from local_qq_agent.model import (
     download_model,
@@ -27,6 +28,7 @@ from local_qq_agent.paths import ensure_parent, project_path
 from local_qq_agent.provider import ProviderRuntime
 from local_qq_agent.qq import QQWindowAdapter
 from local_qq_agent.server.agent_loop import AgentLoop
+from local_qq_agent.server.debug_timeline import build_debug_timeline
 from local_qq_agent.server.debug_page import DEBUG_HTML
 from local_qq_agent.server.instance_guard import AgentInstanceGuard
 from local_qq_agent.server.reboot import AgentRebooter
@@ -123,6 +125,14 @@ class SpontaneousTopicRequest(BaseModel):
     context: str = Field(default="", max_length=4000)
 
 
+class ManualForceReplyRequest(BaseModel):
+    sender_name: str = Field(min_length=1, max_length=120)
+    message_text: str = Field(min_length=1, max_length=4000)
+    event_id: int | None = Field(default=None, ge=1)
+    extra_instruction: str = Field(default="", max_length=2000)
+    send_to_qq: bool = True
+
+
 class ModelSwitchRequest(BaseModel):
     profile: str = Field(min_length=1, max_length=120)
     restart_loop: bool = True
@@ -147,6 +157,7 @@ class Runtime:
         self.persona_config = PersonaConfig.load()
         self.memory_config = MemoryConfig.load()
         self.qq_config = QQConfig.load()
+        self.autonomy_config = AutonomyConfig.load()
         self.web_config = WebConfig.load()
 
         self.store = SQLiteMemoryStore(self.memory_config.database_path)
@@ -181,16 +192,19 @@ class Runtime:
             qq=self.qq,
             store=self.store,
             config=self.qq_config,
+            autonomy_config=self.autonomy_config,
             reboot_scheduler=lambda reason: self.rebooter.schedule(reason=reason),
             is_active_instance=self.instance_guard.is_current,
         )
 
-    def rebuild_agent(self) -> None:
+    def rebuild_agent(self, *, refresh_style_anchor: bool = True) -> None:
         self.model_config = ModelConfig.load()
         self.persona_config = PersonaConfig.load()
+        self.autonomy_config = AutonomyConfig.load()
         self.model_clients = self.provider_runtime.build_clients(self.model_config)
         self.model_client = self.model_clients.primary
-        self._refresh_generated_style_anchor()
+        if refresh_style_anchor:
+            self._refresh_generated_style_anchor()
         self.persona_guard = PersonaGuard(self.persona_config)
         self.context_builder = ContextBuilder(self.store, self.persona_guard, self.social_state)
         self.agent = LocalAgent(
@@ -210,13 +224,42 @@ class Runtime:
             qq=self.qq,
             store=self.store,
             config=self.qq_config,
+            autonomy_config=self.autonomy_config,
             reboot_scheduler=lambda reason: self.rebooter.schedule(reason=reason),
             is_active_instance=self.instance_guard.is_current,
         )
 
-    def _refresh_generated_style_anchor(self) -> dict[str, Any] | None:
+    def refresh_generated_style_anchor(self) -> dict[str, Any] | None:
+        return self._refresh_generated_style_anchor(force=True)
+
+    def export_style_distillation_bundle(self) -> dict[str, Any] | None:
         config = self.persona_config
-        if not config.style_learning_enabled or not config.style_learning_auto_distill:
+        if not config.style_learning_enabled:
+            return None
+        target = config.style_learning_target_user
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        output_path = project_path(f"personality/nanato/workspace/style_distillation_bundle_{timestamp}.json")
+        instruction_path = project_path("personality/nanato/workspace/style_distillation_handoff.md")
+        result = export_style_distillation_bundle(
+            self.store,
+            target_user=target,
+            output_path=output_path,
+            instruction_path=instruction_path,
+            run_log_dir=config.style_learning_run_log_dir,
+        )
+        self.store.append_event(
+            source="agent",
+            kind="style_distillation_bundle_exported",
+            content="Style distillation bundle exported for manual review.",
+            metadata=result.to_dict(),
+        )
+        return result.to_dict()
+
+    def _refresh_generated_style_anchor(self, *, force: bool = False) -> dict[str, Any] | None:
+        config = self.persona_config
+        if not config.style_learning_enabled:
+            return None
+        if not force and not config.style_learning_auto_distill:
             return None
         output_path = config.style_learning_generated_anchor_path
         if output_path is None:
@@ -263,7 +306,7 @@ class Runtime:
         if not restart_result.get("ready", {}).get("ok"):
             raise HTTPException(status_code=500, detail={"reason": "model_server_not_ready", "restart": restart_result})
 
-        if self.provider_runtime.config.active_provider != "hybrid":
+        if self.provider_runtime.config.active_provider not in {"hybrid", "hybrid_responses"}:
             self.provider_runtime.switch_provider("local")
         self.rebuild_agent()
         loop_status: dict[str, Any] | None = None
@@ -392,6 +435,7 @@ def create_app() -> FastAPI:
             "agent_loop": {
                 "running": loop_status.get("running"),
                 "pending_message_count": loop_status.get("pending_message_count"),
+                "aggregating_message_count": loop_status.get("aggregating_message_count"),
                 "queued_message_count": loop_status.get("queued_message_count"),
                 "inflight_message_count": loop_status.get("inflight_message_count"),
                 "active_message": loop_status.get("active_message"),
@@ -401,6 +445,16 @@ def create_app() -> FastAPI:
             },
             "instance": runtime.instance_guard.status(),
             "agent_settings": runtime.agent.settings.to_dict(),
+        }
+
+    @app.get("/api/debug/timeline")
+    async def debug_timeline(limit: int = 80) -> dict[str, Any]:
+        safe_limit = min(max(limit, 1), 200)
+        source_events = runtime.store.recent_events(limit=max(safe_limit * 8, safe_limit), newest_first=False)
+        return {
+            "items": build_debug_timeline(source_events, limit=safe_limit),
+            "source_event_count": len(source_events),
+            "limit": safe_limit,
         }
 
     @app.get("/api/model/runtime")
@@ -468,7 +522,7 @@ def create_app() -> FastAPI:
             {"role": "system", "content": "You are running a provider connectivity test. Reply briefly."},
             {"role": "user", "content": request.message},
         ]
-        reply = await runtime.model_client.chat(messages, max_tokens=128)
+        reply = await runtime.model_client.chat(messages, max_tokens=128, operation="simple_chat")
         return {
             "content": reply.content,
             "model": reply.model,
@@ -526,6 +580,33 @@ def create_app() -> FastAPI:
         )
         return runtime.rebooter.schedule(reason="api")
 
+    @app.post("/api/system/restart")
+    async def system_restart() -> dict[str, Any]:
+        runtime.store.append_event(
+            source="server",
+            kind="reboot_scheduled",
+            content="Full service restart scheduled from API",
+            metadata={"scope": "full_service", "frontend_expected_to_reconnect": True},
+        )
+        return runtime.rebooter.schedule(reason="full_restart_api")
+
+    @app.post("/api/persona/style-anchor/refresh")
+    async def persona_style_anchor_refresh() -> dict[str, Any]:
+        result = runtime.refresh_generated_style_anchor()
+        runtime.rebuild_agent(refresh_style_anchor=False)
+        return {
+            "style_anchor_refresh": result,
+            "persona": runtime.persona_guard.profile_status(),
+        }
+
+    @app.post("/api/persona/style-distillation/export")
+    async def persona_style_distillation_export() -> dict[str, Any]:
+        result = runtime.export_style_distillation_bundle()
+        return {
+            "style_distillation_bundle": result,
+            "instruction_path": str(project_path("personality/nanato/workspace/style_distillation_handoff.md")),
+        }
+
     @app.post("/api/agent-loop/start")
     async def agent_loop_start() -> dict[str, Any]:
         return await runtime.loop.start()
@@ -541,6 +622,19 @@ def create_app() -> FastAPI:
     @app.post("/api/agent-loop/collect-scrollback")
     async def agent_loop_collect_scrollback(pages: int = 3) -> dict[str, Any]:
         return await runtime.loop.collect_scrollback(pages=pages)
+
+    @app.post("/api/agent-loop/manual-reply")
+    async def agent_loop_manual_reply(request: ManualForceReplyRequest) -> dict[str, Any]:
+        try:
+            return await runtime.loop.force_reply(
+                sender_name=request.sender_name,
+                message_text=request.message_text,
+                event_id=request.event_id,
+                extra_instruction=request.extra_instruction,
+                send_to_qq=request.send_to_qq,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/api/events/recent")
     async def recent_events(limit: int = 30) -> list[dict[str, Any]]:
@@ -809,7 +903,21 @@ def create_app() -> FastAPI:
 
     @app.post("/api/qq/arm")
     async def qq_arm() -> dict[str, Any]:
-        return runtime.qq.arm().to_dict()
+        status = runtime.qq.arm().to_dict()
+        send_result = (await asyncio.to_thread(runtime.qq.send_text, "QQ armed")).to_dict()
+        focus_result = await asyncio.to_thread(runtime.qq.focus_window, maximize=True)
+        payload = {
+            **status,
+            "arm_notice": send_result,
+            "focus": focus_result,
+        }
+        runtime.store.append_event(
+            source="qq",
+            kind="armed",
+            content="QQ armed",
+            metadata=payload,
+        )
+        return payload
 
     @app.post("/api/qq/disarm")
     async def qq_disarm() -> dict[str, Any]:

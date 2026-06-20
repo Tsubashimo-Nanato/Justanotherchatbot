@@ -9,10 +9,13 @@ send_requires_armed: true
 verify_after_send: true
 probe_max_depth: 6
 probe_max_children: 450
-poll_interval_seconds: 1.0
+poll_interval_seconds: 0.5
 idle_poll_interval_seconds: 5.0
 idle_poll_after_ticks: 3
-max_messages_per_tick: 1
+max_messages_per_tick: 4
 ignore_existing_on_start: true
 read_timeout_seconds: 8.0
 duplicate_suppression_seconds: 3600.0
+turn_quiet_period_seconds: 6.0
+scrollback_on_new_messages: true
+scrollback_pages_on_new_messages: 2

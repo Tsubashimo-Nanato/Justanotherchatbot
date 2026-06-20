@@ -5,6 +5,16 @@ grok:
   timeout_seconds: 180
   max_tokens: 512
   enable_web_search: true
+  endpoint: chat_completions
+  reasoning:
+    simple_chat: none
+    final_reply: low
+    rewrite: none
+    web_fact: medium
+    complex_reasoning: high
+  cache:
+    enabled: true
+    scope: qq_group_session
 budget:
   smoke_daily_token_budget: 1000000
   degrade_at_ratio: 0.8

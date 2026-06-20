@@ -1,6 +1,10 @@
 mode: "manual-demo"
 min_seconds_between_messages: 90
 max_messages_per_hour: 12
-allow_spontaneous_topics: false
-require_human_trigger_for_demo: true
-
+allow_spontaneous_topics: true
+require_human_trigger_for_demo: false
+spontaneous_min_idle_seconds: 900
+spontaneous_bot_cooldown_seconds: 1200
+spontaneous_backoff_seconds: 420
+spontaneous_token_capacity: 2
+spontaneous_token_refill_per_hour: 2
