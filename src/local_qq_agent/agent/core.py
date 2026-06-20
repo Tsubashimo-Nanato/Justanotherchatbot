@@ -1168,6 +1168,7 @@ class LocalAgent:
                 message=message,
                 reply=reply,
                 interaction_plan=interaction_plan,
+                dialogue_state=dialogue_state,
             )
             if not reply:
                 action = "no_reply"
@@ -1372,6 +1373,7 @@ class LocalAgent:
                 message=message,
                 reply=reply,
                 interaction_plan=interaction_plan,
+                dialogue_state=dialogue_state,
             )
             if not reply:
                 action = "no_reply"
@@ -1472,11 +1474,14 @@ class LocalAgent:
         message: str,
         reply: str,
         interaction_plan: InteractionPlan,
+        dialogue_state: DialogueState | None = None,
     ) -> tuple[str, dict[str, Any]]:
+        recent_agent_replies = tuple(dialogue_state.recent_agent_replies) if dialogue_state else ()
         review = self.quality_gate.review_rules(
             message=message,
             reply=reply,
             interaction_plan=interaction_plan,
+            recent_agent_replies=recent_agent_replies,
         )
         metadata: dict[str, Any] = {
             "quality_review": review.to_metadata(),
@@ -1495,6 +1500,7 @@ class LocalAgent:
                     reply=reply,
                     reasons=review.reasons,
                     interaction_plan=interaction_plan,
+                    recent_agent_replies=recent_agent_replies,
                 ),
                 max_tokens=96,
                 operation="rewrite",
@@ -1508,6 +1514,7 @@ class LocalAgent:
             message=message,
             reply=rewritten,
             interaction_plan=interaction_plan,
+            recent_agent_replies=recent_agent_replies,
         )
         metadata.update(
             {
@@ -1527,7 +1534,7 @@ class LocalAgent:
         return ("", metadata) if self._must_rewrite(review) else (reply, metadata)
 
     def _must_rewrite(self, review: QualityReview) -> bool:
-        return bool({"dead_end_echo", "empty_ack_without_hook"} & set(review.rule_hits))
+        return bool({"dead_end_echo", "empty_ack_without_hook", "recent_self_repeat"} & set(review.rule_hits))
 
     def _base_metadata(
         self,

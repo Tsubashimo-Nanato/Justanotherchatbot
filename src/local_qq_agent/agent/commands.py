@@ -42,6 +42,28 @@ KNOWN_COMMAND_TOKENS = {
     ".think",
 }
 THINKING_LEVELS = {0, 1, 2, 3}
+SPACED_DOT_COMMANDS = {
+    "d": ".debug",
+    "debug": ".debug",
+    "detail": ".detail",
+    "details": ".detail",
+    "e": ".enforce",
+    "enforce": ".enforce",
+    "f": ".enforce",
+    "force": ".enforce",
+    "help": ".help",
+    "l": ".debug",
+    "log": ".debug",
+    "logs": ".debug",
+    "reboot": ".reboot",
+    "s": ".s",
+    "score": ".score",
+    "set": ".set",
+    "spon": ".spon",
+    "spontaneous": ".spontaneous",
+    "status": ".status",
+    "think": ".think",
+}
 
 
 @dataclass(frozen=True)
@@ -252,11 +274,19 @@ def parse_message_commands(message: str, resolution: CommandResolution | None = 
 
 
 def resolve_command_aliases(message: str) -> CommandResolution:
+    original_message = message
+    message, spaced_replacements = _resolve_spaced_dot_commands(message)
     tokens = re.findall(r"\S+", message)
     if not tokens:
-        return CommandResolution(text=message)
+        return CommandResolution(
+            text=message,
+            changed=bool(spaced_replacements),
+            source="alias" if spaced_replacements else "exact",
+            replacements=tuple(spaced_replacements),
+            original_text=original_message,
+        )
 
-    replacements: list[tuple[str, str]] = []
+    replacements: list[tuple[str, str]] = list(spaced_replacements)
     resolved_text = message
     unresolved: list[str] = []
     for token in tokens:
@@ -278,8 +308,24 @@ def resolve_command_aliases(message: str) -> CommandResolution:
         source="alias" if replacements else "exact",
         replacements=tuple(replacements),
         unresolved_tokens=tuple(unresolved),
-        original_text=message,
+        original_text=original_message,
     )
+
+
+def _resolve_spaced_dot_commands(message: str) -> tuple[str, list[tuple[str, str]]]:
+    replacements: list[tuple[str, str]] = []
+
+    def replace(match: re.Match[str]) -> str:
+        word = match.group("word")
+        replacement = SPACED_DOT_COMMANDS.get(word.casefold())
+        if replacement is None:
+            return match.group(0)
+        original = f". {word}"
+        replacements.append((original, replacement))
+        return replacement
+
+    resolved = re.sub(r"(?<!\S)\.\s+(?P<word>[A-Za-z]+)(?!\S)", replace, message)
+    return resolved, replacements
 
 
 def resolution_from_model(

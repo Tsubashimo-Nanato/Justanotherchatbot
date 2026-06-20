@@ -524,6 +524,46 @@ def test_processor_handles_queued_messages_in_fifo_order():
     assert loop._message_seen(second.sender_name, second.text, second.fingerprint)
 
 
+def test_processor_task_restarts_when_loop_is_still_running():
+    import asyncio
+
+    events = []
+
+    class Store:
+        def append_event(self, **kwargs):
+            events.append(kwargs)
+
+            class Event:
+                id = len(events)
+
+            return Event()
+
+    async def finished_task():
+        return None
+
+    async def run():
+        loop = build_loop(store=Store())
+        old_task = asyncio.create_task(finished_task())
+        await old_task
+
+        loop._processor_task = old_task
+        loop._ensure_processor_running("test")
+
+        assert loop._processor_task is not old_task
+        assert not loop._processor_task.done()
+        assert events[-1]["kind"] == "loop_processor_started"
+
+        loop._stop_requested = True
+        loop._processor_wakeup.set()
+        loop._processor_task.cancel()
+        try:
+            await loop._processor_task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run())
+
+
 def test_placeholder_send_uses_qq_quote_reply_target():
     import asyncio
 

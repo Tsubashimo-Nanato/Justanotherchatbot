@@ -28,6 +28,7 @@ class QualityGate:
         message: str,
         reply: str,
         interaction_plan: Any | None = None,
+        recent_agent_replies: tuple[str, ...] = (),
     ) -> QualityReview:
         reply = reply.strip()
         if not reply:
@@ -43,7 +44,12 @@ class QualityGate:
                 rule_hits=tuple(severe_hits),
             )
 
-        rewrite_hits = self._rewrite_hits(message=message, reply=reply, interaction_plan=interaction_plan)
+        rewrite_hits = self._rewrite_hits(
+            message=message,
+            reply=reply,
+            interaction_plan=interaction_plan,
+            recent_agent_replies=recent_agent_replies,
+        )
         if rewrite_hits:
             return QualityReview(
                 send_allowed=True,
@@ -102,8 +108,10 @@ class QualityGate:
         reply: str,
         reasons: tuple[str, ...],
         interaction_plan: Any | None = None,
+        recent_agent_replies: tuple[str, ...] = (),
     ) -> list[dict[str, str]]:
         interaction_text = self._interaction_summary(interaction_plan)
+        recent_text = "\n".join(f"- {item}" for item in recent_agent_replies if item.strip()) or "none"
         return [
             {
                 "role": "system",
@@ -122,6 +130,7 @@ class QualityGate:
                 "content": (
                     f"latest user message:\n{message}\n\n"
                     f"bad reply:\n{reply}\n\n"
+                    f"recent assistant replies:\n{recent_text}\n\n"
                     f"interaction policy:\n{interaction_text}\n\n"
                     f"problems:\n{'; '.join(reasons)}"
                 ),
@@ -162,13 +171,38 @@ class QualityGate:
         )
         return [term for term in terms if term in lowered]
 
-    def _rewrite_hits(self, *, message: str, reply: str, interaction_plan: Any | None = None) -> list[str]:
+    def _rewrite_hits(
+        self,
+        *,
+        message: str,
+        reply: str,
+        interaction_plan: Any | None = None,
+        recent_agent_replies: tuple[str, ...] = (),
+    ) -> list[str]:
         hits: list[str] = []
         if self._is_dead_end_echo(message=message, reply=reply):
             hits.append("dead_end_echo")
         if self._needs_information_gain(reply=reply, interaction_plan=interaction_plan) and self._is_low_value_reply(reply):
             hits.append("dead_end_without_hook")
+        if self._repeats_recent_agent_reply(reply=reply, recent_agent_replies=recent_agent_replies):
+            hits.append("recent_self_repeat")
         return hits
+
+    def _repeats_recent_agent_reply(self, *, reply: str, recent_agent_replies: tuple[str, ...]) -> bool:
+        reply_key = self._semantic_key(reply)
+        if len(reply_key) < 3:
+            return False
+        for recent in recent_agent_replies[-4:]:
+            recent_key = self._semantic_key(recent)
+            if len(recent_key) < 3:
+                continue
+            if reply_key == recent_key:
+                return True
+            if reply_key in recent_key and len(reply_key) >= 4:
+                return True
+            if recent_key in reply_key and len(reply_key) <= len(recent_key) + 3:
+                return True
+        return False
 
     def _is_dead_end_echo(self, *, message: str, reply: str) -> bool:
         message_key = self._semantic_key(message)
