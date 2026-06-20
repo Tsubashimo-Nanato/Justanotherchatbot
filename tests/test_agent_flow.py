@@ -1115,6 +1115,26 @@ def test_dialogue_state_keeps_recent_agent_reply_through_log_noise(tmp_path):
     assert any(line.startswith("consistency_rule:") for line in state.lines)
 
 
+def test_dialogue_state_treats_question_after_agent_reply_as_active_followup(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    store.append_event(source="agent", kind="assistant_reply", content="status is loaded", metadata={})
+    store.append_event(
+        source="tester",
+        kind="group_message",
+        content="why is it broken?",
+        metadata={"sender_name": "tester", "clean_text": "why is it broken?"},
+    )
+
+    state = DialogueStateTracker(store).for_turn(
+        user_name="tester",
+        message="why is it broken?",
+        reply_to_bot=False,
+    )
+
+    assert state.obligation == "answer_required"
+    assert state.reason == "question_after_recent_agent_reply"
+
+
 def test_agent_gate_extracts_json_from_noisy_output(tmp_path):
     agent, _store = build_agent(tmp_path)
     agent.model_client = SequenceModelClient(

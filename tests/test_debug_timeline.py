@@ -51,14 +51,15 @@ def test_debug_timeline_keeps_human_readable_decision_fields(tmp_path):
 
     timeline = build_debug_timeline(store.recent_events(limit=20), limit=10)
 
+    assert len(timeline) == 1
     assert timeline[0]["who"] == "Tsubashimo Nanato"
     assert timeline[0]["message"] == "going to work"
     assert "window_title" not in timeline[0]
-    assert timeline[1]["decision"] == "reply"
-    assert timeline[1]["reply"] == "then eat first"
-    assert timeline[1]["tokens"]["prompt"] == 1200
-    assert timeline[1]["tokens"]["local"]["total"] == 34
-    assert timeline[1]["tokens"]["api"]["cached"] == 900
+    assert timeline[0]["decision"] == "reply"
+    assert timeline[0]["reply"] == "then eat first"
+    assert timeline[0]["tokens"]["prompt"] == 1200
+    assert timeline[0]["tokens"]["local"]["total"] == 34
+    assert timeline[0]["tokens"]["api"]["cached"] == 900
 
 
 def test_debug_timeline_collapses_linked_assistant_reply(tmp_path):
@@ -89,3 +90,60 @@ def test_debug_timeline_collapses_linked_assistant_reply(tmp_path):
     assert len(timeline) == 1
     assert timeline[0]["kind"] == "loop_decision"
     assert timeline[0]["reply"] == "still thinking, you?"
+
+
+def test_debug_timeline_collapses_group_message_lifecycle(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    for action in ("aggregating", "queued"):
+        store.append_event(
+            source="Tsubashimo Nanato",
+            kind="group_message",
+            content="raw text",
+            metadata={
+                "sender_name": "Tsubashimo Nanato",
+                "clean_text": "why is it broken",
+                "clean_identity": "turn-1",
+                "agent_action": action,
+                "agent_reason": f"{action}_reason",
+            },
+        )
+
+    timeline = build_debug_timeline(store.recent_events(limit=20), limit=10)
+
+    assert len(timeline) == 1
+    assert timeline[0]["kind"] == "group_message"
+    assert timeline[0]["decision"] == "queued"
+
+
+def test_debug_timeline_hides_group_lifecycle_after_decision(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    store.append_event(
+        source="Tsubashimo Nanato",
+        kind="group_message",
+        content="raw text",
+        metadata={
+            "sender_name": "Tsubashimo Nanato",
+            "clean_text": "why is it broken",
+            "clean_identity": "turn-1",
+            "agent_action": "queued",
+        },
+    )
+    store.append_event(
+        source="loop",
+        kind="loop_decision",
+        content="reply decision",
+        metadata={
+            "sender_name": "Tsubashimo Nanato",
+            "message_text": "why is it broken",
+            "message_identity": "turn-1",
+            "action": "no_reply",
+            "reason": "gate",
+            "sent": False,
+        },
+    )
+
+    timeline = build_debug_timeline(store.recent_events(limit=20), limit=10)
+
+    assert len(timeline) == 1
+    assert timeline[0]["kind"] == "loop_decision"
+    assert timeline[0]["decision"] == "no_reply"

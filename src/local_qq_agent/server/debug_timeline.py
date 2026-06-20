@@ -54,10 +54,17 @@ class TimelineItem:
 
 def build_debug_timeline(events: list[EventRecord], *, limit: int = 80) -> list[dict[str, Any]]:
     linked_assistant_ids = _linked_assistant_event_ids(events)
+    decision_identities = _loop_decision_identities(events)
+    latest_group_event_ids = _latest_group_event_ids(events, decision_identities)
     items = [
         _timeline_item(event)
         for event in events
-        if event.kind in VISIBLE_KINDS and event.id not in linked_assistant_ids
+        if _is_visible_event(
+            event,
+            linked_assistant_ids=linked_assistant_ids,
+            decision_identities=decision_identities,
+            latest_group_event_ids=latest_group_event_ids,
+        )
     ]
     visible = [item.to_dict() for item in items if item is not None]
     if limit <= 0:
@@ -74,6 +81,77 @@ def _linked_assistant_event_ids(events: list[EventRecord]) -> set[int]:
         if isinstance(assistant_id, int):
             linked.add(assistant_id)
     return linked
+
+
+def _loop_decision_identities(events: list[EventRecord]) -> set[str]:
+    identities: set[str] = set()
+    for event in events:
+        if event.kind != "loop_decision":
+            continue
+        identity = _loop_decision_identity(event)
+        if identity:
+            identities.add(identity)
+    return identities
+
+
+def _latest_group_event_ids(events: list[EventRecord], decision_identities: set[str]) -> set[int]:
+    latest_by_identity: dict[str, int] = {}
+    for event in events:
+        if event.kind != "group_message":
+            continue
+        identity = _group_message_identity(event)
+        if not identity or identity in decision_identities:
+            continue
+        latest_by_identity[identity] = event.id
+    return set(latest_by_identity.values())
+
+
+def _is_visible_event(
+    event: EventRecord,
+    *,
+    linked_assistant_ids: set[int],
+    decision_identities: set[str],
+    latest_group_event_ids: set[int],
+) -> bool:
+    if event.kind not in VISIBLE_KINDS or event.id in linked_assistant_ids:
+        return False
+    if event.kind != "group_message":
+        return True
+
+    identity = _group_message_identity(event)
+    if not identity:
+        return True
+    if identity in decision_identities:
+        return False
+    return event.id in latest_group_event_ids
+
+
+def _loop_decision_identity(event: EventRecord) -> str:
+    metadata = event.metadata or {}
+    return _text(
+        metadata.get("message_identity")
+        or metadata.get("clean_identity")
+        or metadata.get("turn_identity")
+        or _fallback_identity(metadata.get("sender_name") or event.source, metadata.get("message_text") or event.content)
+    )
+
+
+def _group_message_identity(event: EventRecord) -> str:
+    metadata = event.metadata or {}
+    return _text(
+        metadata.get("clean_identity")
+        or metadata.get("message_identity")
+        or metadata.get("turn_identity")
+        or _fallback_identity(metadata.get("sender_name") or event.source, metadata.get("clean_text") or event.content)
+    )
+
+
+def _fallback_identity(sender: Any, message: Any) -> str:
+    who = _text(sender).casefold()
+    text = _message_text(message).casefold()
+    if not who or not text:
+        return ""
+    return f"{who}:{text}"
 
 
 def _timeline_item(event: EventRecord) -> TimelineItem | None:

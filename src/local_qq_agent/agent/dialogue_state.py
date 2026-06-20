@@ -35,13 +35,19 @@ class DialogueStateTracker:
         user_turns = self._recent_user_turns(events, user_name=user_name)
         question_like = self._is_question_or_clarification(message)
         repair_like = reply_to_bot and question_like and bool(agent_replies)
+        implicit_followup = (
+            not reply_to_bot
+            and question_like
+            and bool(agent_replies)
+            and self._recent_agent_reply_is_active(events, user_name=user_name, message=message)
+        )
 
         if repair_like:
             obligation = "repair_required"
             reason = "quoted_or_followup_question_about_previous_agent_reply"
-        elif reply_to_bot:
+        elif reply_to_bot or implicit_followup:
             obligation = "answer_required"
-            reason = "message_replies_to_agent"
+            reason = "message_replies_to_agent" if reply_to_bot else "question_after_recent_agent_reply"
         else:
             obligation = "none"
             reason = "no_active_dialogue_obligation"
@@ -91,6 +97,29 @@ class DialogueStateTracker:
             if text:
                 turns.append(text)
         return turns[-4:]
+
+    def _recent_agent_reply_is_active(self, events: list[EventRecord], *, user_name: str, message: str) -> bool:
+        current = message.strip()
+        for event in reversed(events):
+            if self._is_current_turn_echo(event, user_name=user_name, message=current):
+                continue
+            if event.kind in {"assistant_reply", "assistant_blocked"}:
+                return bool(event.content.strip())
+            if event.kind == "loop_decision":
+                metadata = event.metadata or {}
+                return bool(metadata.get("sent")) and str(metadata.get("action") or "").strip() == "reply"
+            if event.kind == "group_message":
+                return False
+        return False
+
+    def _is_current_turn_echo(self, event: EventRecord, *, user_name: str, message: str) -> bool:
+        if event.kind != "group_message":
+            return False
+        sender = str(event.metadata.get("sender_name") or event.source).strip()
+        if sender != user_name:
+            return False
+        text = str(event.metadata.get("clean_text") or event.content).strip()
+        return bool(message) and text == message
 
     def _is_question_or_clarification(self, message: str) -> bool:
         text = message.strip().casefold()
