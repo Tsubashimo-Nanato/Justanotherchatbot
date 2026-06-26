@@ -416,6 +416,22 @@ def test_agent_qwen_first_rewrites_recent_self_repeat(tmp_path):
     assert len(model.messages) == 2
 
 
+def test_agent_qwen_first_skips_low_affinity_ambient_short_ping(tmp_path):
+    agent, store = build_agent(tmp_path)
+    agent.model_client = FailingModelClient()
+    agent.final_model_client = FailingModelClient()
+    agent.qwen_first_mode = True
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="other user", message="😛"))
+
+    assert result.action == "no_reply"
+    assert result.reason == "ambient_short_ping_context_only"
+    assert result.used_model is False
+    assert result.metadata["qwen_first_pre_model_skip"] is True
+    assert result.metadata["interaction_plan"]["message_kind"] == "short_ping"
+    assert [event.kind for event in store.recent_events()] == ["group_message", "assistant_no_reply"]
+
+
 def test_qwen_decision_normalizes_null_memory_to_empty_text():
     decision = normalize_qwen_decision(
         {

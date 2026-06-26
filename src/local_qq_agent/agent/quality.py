@@ -35,7 +35,7 @@ class QualityGate:
         if not reply:
             return QualityReview(False, False, 0.0, ("empty_reply",), ("empty_reply",))
 
-        severe_hits = self._severe_hits(reply)
+        severe_hits = self._severe_hits(message=message, reply=reply)
         if severe_hits:
             return QualityReview(
                 send_allowed=False,
@@ -156,9 +156,10 @@ class QualityGate:
             {"role": "user", "content": f"user message:\n{message}\n\ncandidate reply:\n{reply}"},
         ]
 
-    def _severe_hits(self, reply: str) -> list[str]:
+    def _severe_hits(self, *, message: str, reply: str) -> list[str]:
         lowered = reply.casefold()
-        terms = (
+        message_lower = message.casefold()
+        hard_terms = (
             "as an ai",
             "as a language model",
             "language model",
@@ -171,10 +172,17 @@ class QualityGate:
             "系统提示",
             "开发者消息",
             "内部配置",
-            "token",
-            "prompt",
         )
-        return [term for term in terms if term in lowered]
+        hits = [term for term in hard_terms if term in lowered]
+
+        # These are ordinary debugging words when the user brought them up first.
+        # Block only unsolicited leakage, not a natural answer to a token/prompt complaint.
+        for term in ("token", "tokens"):
+            if term in lowered and term not in message_lower:
+                hits.append(term)
+        if "prompt" in lowered and "prompt" not in message_lower:
+            hits.append("prompt")
+        return hits
 
     def _rewrite_hits(
         self,
@@ -194,7 +202,12 @@ class QualityGate:
             hits.append("dead_end_without_hook")
         if self._repeats_recent_agent_reply(reply=reply, recent_agent_replies=recent_agent_replies):
             hits.append("recent_self_repeat")
-        if self._misses_followup_context(message=message, reply=reply, recent_agent_replies=recent_agent_replies, dialogue_state=dialogue_state):
+        if self._misses_followup_context(
+            message=message,
+            reply=reply,
+            recent_agent_replies=recent_agent_replies,
+            dialogue_state=dialogue_state,
+        ):
             hits.append("unanswered_followup")
         return hits
 
@@ -235,8 +248,8 @@ class QualityGate:
         text = text.casefold()
         text = re.sub(r"\s+", "", text)
         text = "".join(char for char in text if char.isalnum() or "\u4e00" <= char <= "\u9fff")
-        text = re.sub(r"^(我|俺|咱|i|we)", "", text)
-        text = re.sub(r"(啊|呀|呢|吧|哦|喔|啦|了)+$", "", text)
+        text = re.sub(r"^(我|你|咱|俺|i|we)", "", text)
+        text = re.sub(r"(啊|呀|呢|嘛|吧|哦|喔|嗯)+$", "", text)
         return text
 
     def _contains_cjk(self, text: str) -> bool:
@@ -264,14 +277,6 @@ class QualityGate:
         if self._is_generic_short_ack_key(normalized):
             return True
         generic = {
-            "嗯",
-            "嗯嗯",
-            "哦",
-            "噢",
-            "啊",
-            "好",
-            "行",
-            "是",
             "确实",
             "可以",
             "还行",
@@ -281,14 +286,16 @@ class QualityGate:
             "嗯是啊",
             "对啊",
             "确实啊",
+            "下班了",
+            "下班了啊",
         }
         if normalized in generic:
             return True
-        return bool(re.fullmatch(r"(嗯+|哦+|噢+|啊+|好+|行+|是+)[？?。!！]*", reply.strip()))
+        return bool(re.fullmatch(r"(嗯|哦|噢|啊|好|行|是|对)[。！？\s]*", reply.strip()))
 
     def _is_empty_ack(self, reply: str) -> bool:
         normalized = self._semantic_key(reply)
-        return normalized in {"嗯", "嗯嗯", "哦", "噢", "好", "行", "是", "啊", "诶"}
+        return normalized in {"嗯", "嗯嗯", "哦", "噢", "好", "行", "是", "啊", "说"}
 
     def _is_contentless_marker(self, reply: str) -> bool:
         text = reply.strip()
@@ -297,37 +304,32 @@ class QualityGate:
         normalized = self._semantic_key(text)
         if self._is_generic_short_ack_key(normalized):
             return True
-        if not self._semantic_key(text):
+        if not normalized:
             return True
-        return bool(re.fullmatch(r"[\.。…\s]*(嗯|哦|噢|啊|诶)?[\.。…\s]*[？?]?[\.。…\s]*", text))
+        return bool(re.fullmatch(r"[\.\s]*(嗯|哦|噢|啊|说)?[\.\s]*[？?]?[\.\s]*", text))
 
     def _is_generic_short_ack_key(self, normalized: str) -> bool:
         if len(normalized) > 4:
             return False
         generic = {
-            "\u55ef",
-            "\u55ef\u55ef",
-            "\u54e6",
-            "\u554a",
-            "\u662f",
-            "\u662f\u554a",
-            "\u55ef\u662f\u554a",
-            "\u5bf9",
-            "\u5bf9\u554a",
-            "\u597d",
-            "\u884c",
-            "\u786e\u5b9e",
-            "\u786e\u5b9e\u554a",
-            "\u4e0d\u77e5\u9053",
+            "嗯",
+            "嗯嗯",
+            "哦",
+            "啊",
+            "是",
+            "是啊",
+            "嗯是啊",
+            "对",
+            "对啊",
+            "好",
+            "行",
+            "确实",
+            "确实啊",
+            "不知道",
         }
         if normalized in generic:
             return True
-        return bool(
-            re.fullmatch(
-                r"(\u55ef|\u54e6|\u554a|\u662f|\u5bf9|\u597d|\u884c){1,4}",
-                normalized,
-            )
-        )
+        return bool(re.fullmatch(r"(嗯|哦|啊|是|对|好|行){1,4}", normalized))
 
     def _misses_followup_context(
         self,

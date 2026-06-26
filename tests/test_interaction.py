@@ -20,9 +20,24 @@ def test_interaction_policy_gives_high_affinity_status_a_hook_budget():
     assert plan.message_kind == "life_status"
 
 
+def test_interaction_policy_classifies_chinese_complaint():
+    plan = InteractionPolicy().plan(
+        message="你延迟好高",
+        social_snapshot={"affinity": 1.0},
+        gate_metadata={"attention": "direct"},
+        dialogue_state=None,
+        direct_address=True,
+        reply_to_bot=False,
+    )
+
+    assert plan.message_kind == "complaint"
+    assert plan.reply_shape == "ack_with_light_hook"
+    assert plan.hook_budget == 2
+
+
 def test_interaction_policy_gives_direct_questions_a_reply_shape():
     high = InteractionPolicy().plan(
-        message="what should I eat today?",
+        message="今天吃什么？",
         social_snapshot={"affinity": 1.0},
         gate_metadata={"attention": "direct"},
         dialogue_state=None,
@@ -61,6 +76,20 @@ def test_interaction_policy_does_not_force_hook_for_low_affinity_ambient_status(
     assert plan.hook_budget == 0
     assert plan.mode == "minimal_or_no_extra"
     assert plan.reply_shape == "minimal_ack"
+
+
+def test_interaction_policy_keeps_emoji_as_short_ping():
+    plan = InteractionPolicy().plan(
+        message="😛",
+        social_snapshot={"affinity": 0.5},
+        gate_metadata={"attention": "ambient"},
+        dialogue_state=None,
+        direct_address=False,
+        reply_to_bot=False,
+    )
+
+    assert plan.message_kind == "short_ping"
+    assert plan.hook_budget == 0
 
 
 def test_quality_gate_rewrites_dead_end_echo():
@@ -165,7 +194,7 @@ def test_quality_gate_keeps_concrete_short_answer():
 
     review = QualityGate().review_rules(
         message="what should I eat today?",
-        reply="火锅吧",
+        reply="火锅吧，冷天比较省脑子。",
         interaction_plan=plan,
     )
 
@@ -208,3 +237,24 @@ def test_quality_gate_blocks_internal_leak():
     assert not review.send_allowed
     assert "as an ai" in review.rule_hits
 
+
+def test_quality_gate_does_not_block_token_when_user_brought_it_up():
+    review = QualityGate().review_rules(
+        message="你说话能不能多花点token",
+        reply="token不够也不是借口，我刚才回太短了。",
+        interaction_plan=None,
+    )
+
+    assert review.send_allowed
+    assert "token" not in review.rule_hits
+
+
+def test_quality_gate_blocks_unsolicited_token_leak():
+    review = QualityGate().review_rules(
+        message="hello",
+        reply="I cannot answer because my token budget is low.",
+        interaction_plan=None,
+    )
+
+    assert not review.send_allowed
+    assert "token" in review.rule_hits

@@ -1507,6 +1507,18 @@ class AgentLoop:
             if isinstance(verification, dict):
                 verification["quote_refresh"] = quote_refresh
                 verification["stage"] = stage
+            if allow_unquoted_fallback and not result.get("sent") and self._quote_send_failed(result):
+                fallback = await self._send_unquoted_text_unlocked(
+                    text=text,
+                    stage=stage,
+                    mode="quote_fallback_unquoted",
+                )
+                fallback_verification = fallback.setdefault("verification", {})
+                if isinstance(fallback_verification, dict):
+                    fallback_verification["quote_refresh"] = quote_refresh
+                    fallback_verification["quote_fallback"] = "unquoted_after_quote_send_failed"
+                    fallback_verification["quote_send_result"] = result
+                return fallback
             return result
 
     async def _send_unquoted_text_unlocked(self, *, text: str, stage: str, mode: str) -> dict[str, Any]:
@@ -1517,6 +1529,16 @@ class AgentLoop:
             verification["stage"] = stage
             verification["mode"] = mode
         return result
+
+    def _quote_send_failed(self, result: dict[str, Any]) -> bool:
+        reason = str(result.get("reason", "")).casefold()
+        if reason in {"quote_failed", "quote_menu_item_not_found", "quote_target_not_visible"}:
+            return True
+        verification = result.get("verification")
+        if isinstance(verification, dict):
+            detail = str(verification.get("reason", "") or verification.get("error", "")).casefold()
+            return "quote" in detail and ("fail" in detail or "not_found" in detail)
+        return False
 
     async def _fresh_quote_target(self, message: CleanedQQMessage | QQChatMessage) -> tuple[QQChatMessage | None, dict[str, Any]]:
         async with self._qq_io_lock:

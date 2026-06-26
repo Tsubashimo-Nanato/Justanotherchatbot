@@ -919,6 +919,56 @@ def test_final_reply_can_fallback_to_unquoted_when_quote_target_is_missing():
     assert result["verification"]["quote_fallback"] == "unquoted_after_missing_quote_target"
 
 
+def test_final_reply_can_fallback_to_unquoted_when_quote_send_fails():
+    import asyncio
+
+    loop = build_loop()
+    calls = []
+    target = message("please check", "fp-target", top=140, sender_name="target user")
+
+    class QuoteFailure:
+        def to_dict(self):
+            return {"sent": False, "reason": "quote_failed", "verification": {"reason": "quote_menu_item_not_found"}}
+
+    class Success:
+        def to_dict(self):
+            return {"sent": True, "reason": "sent", "verification": {}}
+
+    class QQ:
+        def read_visible_context(self, *, passive=False):
+            return QQReadResult(
+                active_group_name="target group",
+                expected_group_name="target group",
+                target_sender_name="target user",
+                bot_sender_name="bot user",
+                group_matched=True,
+                visible_items=[],
+                chat_messages=[target],
+                target_messages=[target],
+            )
+
+        def send_text(self, text, *, reply_to=None):
+            calls.append({"text": text, "reply_to": reply_to})
+            return QuoteFailure() if reply_to is not None else Success()
+
+    loop.qq = QQ()
+
+    result = asyncio.run(
+        loop._send_quoted_text(
+            message=target,
+            text="reply",
+            stage="final_reply",
+            allow_unquoted_fallback=True,
+        )
+    )
+
+    assert result["sent"]
+    assert calls == [{"text": "reply", "reply_to": target}, {"text": "reply", "reply_to": None}]
+    assert result["verification"]["mode"] == "quote_fallback_unquoted"
+    assert result["verification"]["quote_fallback"] == "unquoted_after_quote_send_failed"
+    assert result["verification"]["quote_send_result"]["reason"] == "quote_failed"
+
+
 def test_quote_refresh_matches_clean_identity_when_raw_block_changes():
     import asyncio
 

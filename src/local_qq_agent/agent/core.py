@@ -1357,6 +1357,22 @@ class LocalAgent:
             turn=turn,
             reply_to_bot=bool(reply_to_bot or turn.references_bot),
         )
+        pre_model_result = self._qwen_first_pre_model_no_reply(
+            user_name=user_name,
+            message=message,
+            parsed=parsed,
+            external_context=external_context,
+            record_incoming_event=record_incoming_event,
+            persona_boundary_hit=persona_boundary_hit,
+            social_snapshot=social_snapshot,
+            turn=turn,
+            dialogue_state=dialogue_state,
+            interaction_plan=interaction_plan,
+            started_at=started_at,
+        )
+        if pre_model_result is not None:
+            return pre_model_result
+
         built_context = self.context_builder.build(
             user_name,
             message,
@@ -1539,6 +1555,63 @@ class LocalAgent:
             used_model=True,
             blocked=False,
             metadata=metadata,
+        )
+
+    def _qwen_first_pre_model_no_reply(
+        self,
+        *,
+        user_name: str,
+        message: str,
+        parsed,
+        external_context: str,
+        record_incoming_event: bool,
+        persona_boundary_hit: bool,
+        social_snapshot: dict[str, Any],
+        turn: CleanTurn,
+        dialogue_state: DialogueState,
+        interaction_plan: InteractionPlan,
+        started_at: float,
+    ) -> AgentResult | None:
+        if parsed.enforced or persona_boundary_hit:
+            return None
+        if interaction_plan.directness not in {"ambient", "ambient_candidate"}:
+            return None
+        if interaction_plan.message_kind != "short_ping":
+            return None
+        if interaction_plan.affinity >= 0.75:
+            return None
+
+        reason = "ambient_short_ping_context_only"
+        self._record_incoming_after_reply(
+            user_name,
+            message,
+            parsed,
+            external_context,
+            "no_reply",
+            reason,
+            record_event=record_incoming_event,
+        )
+        return self._record_reply(
+            reply="",
+            action="no_reply",
+            reason=reason,
+            used_model=False,
+            blocked=False,
+            metadata={
+                **self._command_metadata(parsed),
+                "qwen_first": True,
+                "qwen_first_pre_model_skip": True,
+                "turn_cleaning": turn.to_metadata(),
+                "dialogue_state": dialogue_state.to_metadata(),
+                "interaction_plan": interaction_plan.to_metadata(),
+                "persona_boundary_hit": persona_boundary_hit,
+                "social_state": social_snapshot,
+                "settings": self.settings.to_dict(),
+                "token_usage": empty_token_usage(),
+                "stage_timings": self._stage_timings(started_at),
+                **self._empty_web_context(reason).to_metadata(),
+                **self._empty_math_context(reason).to_metadata(),
+            },
         )
 
     def _qwen_decision_from_reply(self, reply: ModelReply) -> dict[str, Any]:

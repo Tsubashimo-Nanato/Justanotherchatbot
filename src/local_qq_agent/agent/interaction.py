@@ -115,16 +115,17 @@ class InteractionPolicy:
         return "ambient"
 
     def _message_kind(self, message: str) -> str:
-        text = message.strip().casefold()
+        text = message.strip()
         if not text:
             return "empty"
-        if self._is_question(text):
+        lowered = text.casefold()
+        if self._is_question(lowered):
             return "question"
-        if self._is_life_status(text):
+        if self._is_life_status(lowered):
             return "life_status"
-        if self._is_complaint(text):
+        if self._is_complaint(lowered):
             return "complaint"
-        if len(text) <= 10:
+        if self._is_emoji_or_symbol_only(text) or len(text) <= 10:
             return "short_ping"
         return "statement"
 
@@ -138,7 +139,7 @@ class InteractionPolicy:
     ) -> int:
         if continuation_budget is not None:
             return max(0, min(3, int(continuation_budget)))
-        if message_kind in {"empty"}:
+        if message_kind == "empty":
             return 0
         if message_kind == "question":
             if directness in {"reply_to_bot", "direct_address", "answer_required", "repair_required", "direct", "followup"}:
@@ -177,23 +178,40 @@ class InteractionPolicy:
     def _is_question(self, text: str) -> bool:
         if "?" in text or "？" in text:
             return True
-        return bool(
-            re.search(
-                r"\b(what|which|who|where|when|why|how)\b|"
-                r"(什么|哪种|哪个|哪一个|谁|哪里|几点|几天|为什么|怎么|到底)",
-                text,
-            )
+        english = r"\b(what|which|who|where|when|why|how|can|could|should|would|do|does|did|is|are)\b"
+        chinese = (
+            "什么|哪种|哪个|哪一个|谁|哪里|哪儿|几点|几号|多久|几天|"
+            "为什么|怎么|咋|如何|是否|是不是|能不能|会不会|要不要|"
+            "干什么|做什么|吃什么|喝什么|吗|呢"
         )
+        return bool(re.search(english, text) or re.search(chinese, text))
 
     def _is_life_status(self, text: str) -> bool:
+        if re.search(r"\b(i|we)\s+(am|was|were|had|ate|finished|got|went|go|going|will|plan)\b", text):
+            return True
         return bool(
             re.search(
-                r"(我|i|we)?.*(下班|上班|放假|吃了|吃完|吃饭|睡了|睡不着|起床|到家|出门|"
-                r"去学校|去上课|去医院|看医生|崩溃|累|困)|"
-                r"\b(i|we)\s+(am|was|were|had|ate|finished|got|went|go|going)\b",
+                r"(我|俺|咱|我们)?.*("
+                r"下班|上班|放假|吃了|吃完|吃饭|晚饭|午饭|早饭|"
+                r"睡了|睡不着|起床|到家|出门|去学校|去上课|去医院|看医生|"
+                r"拿处方|胃不舒服|不舒服|好困|困死|累|昨晚没睡好|今天要|一会去"
+                r")",
                 text,
             )
         )
 
     def _is_complaint(self, text: str) -> bool:
-        return bool(re.search(r"(烦|累死|困死|崩溃|不想|难受|头疼|糟糕|讨厌|撑不住)", text))
+        return bool(
+            re.search(
+                r"(烦|累死|困死|崩溃|不想|难受|头疼|糟糕|讨厌|撑不住|"
+                r"慢|卡|延迟|高延迟|蠢|傻|坏掉|不会聊天|神经|抽象|怪怪的|不合理)",
+                text,
+            )
+        )
+
+    def _is_emoji_or_symbol_only(self, text: str) -> bool:
+        visible = [char for char in text if not char.isspace()]
+        if not visible:
+            return False
+        has_word = any(char.isalnum() or "\u4e00" <= char <= "\u9fff" for char in visible)
+        return not has_word
