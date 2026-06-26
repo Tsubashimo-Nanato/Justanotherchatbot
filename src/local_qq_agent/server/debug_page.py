@@ -351,6 +351,15 @@ DEBUG_HTML = """<!doctype html>
       white-space: pre-wrap;
       overflow-wrap: anywhere;
     }
+    .chat-detail {
+      margin-top: 6px;
+      padding-top: 6px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
     .mono-small {
       font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
       font-size: 12px;
@@ -1105,11 +1114,16 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       const onclick = selectable ? ` onclick="selectTimelineItem(${index})"` : "";
       const label = isAgent ? "bot" : (item.who || "unknown");
       const text = item.reply || item.message || item.reason || "";
+      const details = Array.isArray(item.summary_lines) ? item.summary_lines.slice(1, 4) : [];
+      const detailHtml = details.length
+        ? `<div class="chat-detail">${details.map((line) => escapeHtml(shortLine(line, 180))).join("<br>")}</div>`
+        : "";
       const decision = item.decision && kind !== "group_message" ? ` · ${escapeHtml(item.decision)}` : "";
       return `
         <button class="${classes.join(" ")}" type="button"${onclick}>
           <div class="chat-meta"><span>${escapeHtml(shortTime(item.time))} · #${item.event_id} · ${escapeHtml(label)}${decision}</span><span>${item.sent === true ? "sent" : ""}</span></div>
           <div class="chat-text">${escapeHtml(text || "(empty)")}</div>
+          ${detailHtml}
         </button>
       `;
     }
@@ -1136,6 +1150,12 @@ qwen3-30b-iq2m-cpu-ram</textarea>
     }
 
     function formatTimelineItem(item) {
+      if (Array.isArray(item.summary_lines) && item.summary_lines.length) {
+        return item.summary_lines.map((line) => shortLine(line, 240)).join("\\n");
+      }
+      if (item.summary) {
+        return shortLine(item.summary, 320);
+      }
       const time = shortTime(item.time);
       const who = item.who || "unknown";
       const message = item.message ? ` said "${shortLine(item.message, 120)}"` : "";
