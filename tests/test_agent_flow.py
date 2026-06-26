@@ -560,12 +560,12 @@ def test_agent_qwen_first_uses_api_only_after_local_quality_repair_fails(tmp_pat
     local_model = SequenceModelClient(
         [
             (
-                '{"action":"reply","reply":"我草跑的我想吐","reason":"minimal_ack",'
+                '{"action":"reply","reply":"why do I feel sick after running?","reason":"minimal_ack",'
                 '"thinking_summary":"echoed user","target_message_ids":["current"],'
                 '"tool_name":"none","tool_query":"","memory_to_save":""}'
             ),
             (
-                '{"action":"reply","reply":"我草跑的我想吐","reason":"still_echo",'
+                '{"action":"reply","reply":"why do I feel sick after running?","reason":"still_echo",'
                 '"thinking_summary":"failed repair","target_message_ids":["current"],'
                 '"tool_name":"none","tool_query":"","memory_to_save":""}'
             ),
@@ -574,7 +574,7 @@ def test_agent_qwen_first_uses_api_only_after_local_quality_repair_fails(tmp_pat
     api_model = SequenceModelClient(
         [
             (
-                '{"action":"reply","reply":"跑哪去了，跑到想吐？先别硬撑。","reason":"api_quality_fallback",'
+                '{"action":"reply","reply":"Sounds like you pushed too hard; sit down first and drink a little water.","reason":"api_quality_fallback",'
                 '"thinking_summary":"grounded fallback","target_message_ids":["current"],'
                 '"tool_name":"none","tool_query":"","memory_to_save":""}'
             )
@@ -589,13 +589,13 @@ def test_agent_qwen_first_uses_api_only_after_local_quality_repair_fails(tmp_pat
     result = asyncio.run(
         agent.respond_to_incoming(
             user_name="Tsubashimo Nanato",
-            message="我草跑的我想吐",
+            message="why do I feel sick after running?",
             reply_to_bot=True,
         )
     )
 
     assert result.action == "reply"
-    assert result.reply == "跑哪去了，跑到想吐？先别硬撑。"
+    assert result.reply == "Sounds like you pushed too hard; sit down first and drink a little water."
     assert result.metadata["qwen_first_quality_repair_used"] is True
     assert result.metadata["api_quality_fallback_used"] is True
     assert result.metadata["quality_reviewer_uncertain"] is True
@@ -608,17 +608,66 @@ def test_agent_qwen_first_uses_api_only_after_local_quality_repair_fails(tmp_pat
     assert "Do not invent facts" in api_prompt
 
 
+def test_agent_qwen_first_does_not_use_api_for_simple_short_ping(tmp_path):
+    agent, store = build_agent(tmp_path)
+    store.append_event(
+        source="loop",
+        kind="loop_decision",
+        content="reply: old",
+        metadata={"agent_reply": "same stale reply"},
+    )
+    local_model = SequenceModelClient(
+        [
+            (
+                '{"action":"reply","reply":"same stale reply","reason":"short_ping",'
+                '"thinking_summary":"bad repeat","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+            (
+                '{"action":"reply","reply":"same stale reply","reason":"still_repeat",'
+                '"thinking_summary":"failed local repair","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+        ]
+    )
+    api_model = SequenceModelClient(
+        [
+            (
+                '{"action":"reply","reply":"api should not be used","reason":"api_quality_fallback",'
+                '"thinking_summary":"","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            )
+        ]
+    )
+    api_model.provider_name = "grok"
+    agent.model_client = local_model
+    agent.final_model_client = local_model
+    agent.api_fallback_model_client = api_model
+    agent.qwen_first_mode = True
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="Tsubashimo Nanato", message="hi", reply_to_bot=True))
+
+    assert result.action == "no_reply"
+    assert result.reason == "quality_blocked"
+    assert result.metadata["interaction_plan"]["message_kind"] == "short_ping"
+    assert result.metadata["qwen_first_quality_repair_used"] is True
+    assert result.metadata["api_quality_fallback_used"] is False
+    assert result.metadata["api_quality_fallback_reason"] == "simple_turn_suppressed"
+    assert len(local_model.messages) == 2
+    assert len(api_model.messages) == 0
+
+
 def test_agent_qwen_first_outputs_short_error_when_full_quality_chain_errors(tmp_path):
     agent, _store = build_agent(tmp_path)
     local_model = SequenceModelClient(
         [
             (
-                '{"action":"reply","reply":"我草跑的我想吐","reason":"minimal_ack",'
+                '{"action":"reply","reply":"why do I feel sick after running?","reason":"minimal_ack",'
                 '"thinking_summary":"echoed user","target_message_ids":["current"],'
                 '"tool_name":"none","tool_query":"","memory_to_save":""}'
             ),
             (
-                '{"action":"reply","reply":"我草跑的我想吐","reason":"still_echo",'
+                '{"action":"reply","reply":"why do I feel sick after running?","reason":"still_echo",'
                 '"thinking_summary":"failed repair","target_message_ids":["current"],'
                 '"tool_name":"none","tool_query":"","memory_to_save":""}'
             ),
@@ -632,14 +681,14 @@ def test_agent_qwen_first_outputs_short_error_when_full_quality_chain_errors(tmp
     result = asyncio.run(
         agent.respond_to_incoming(
             user_name="Tsubashimo Nanato",
-            message="我草跑的我想吐",
+            message="why do I feel sick after running?",
             reply_to_bot=True,
         )
     )
 
     assert result.action == "reply"
     assert result.reason == "api_quality_fallback_error"
-    assert result.reply == "这条处理出错了，后台有详情。"
+    assert result.reply == "This turn errored; the debug log has the details."
     assert result.metadata["quality_chain_error"] is True
     assert result.metadata["quality_chain_error_stage"] == "api_quality_fallback"
     assert result.metadata["quality_chain_error_short_reply"] == result.reply

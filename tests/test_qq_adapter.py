@@ -99,7 +99,10 @@ class VerifyingSendAdapter(QQWindowAdapter):
     def _scroll_to_latest(self, window):
         return None
 
-    def _paste_and_submit(self, text):
+    def _focus_message_editor(self, window, *, clear_existing, dismiss_menus):
+        return None
+
+    def _paste_and_submit(self, window, text):
         self.submitted_texts.append(text)
 
     def _read_context_snapshot(self, window):

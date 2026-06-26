@@ -1642,6 +1642,7 @@ class LocalAgent:
                 built_context=built_context,
                 command_metadata=command_metadata,
                 turn=turn,
+                interaction_plan=interaction_plan,
                 dialogue_state=dialogue_state,
                 social_snapshot=social_snapshot,
                 external_context=external_context,
@@ -1700,6 +1701,7 @@ class LocalAgent:
             built_context=built_context,
             command_metadata=command_metadata,
             turn=turn,
+            interaction_plan=interaction_plan,
             dialogue_state=dialogue_state,
             social_snapshot=social_snapshot,
             external_context=external_context,
@@ -1720,6 +1722,7 @@ class LocalAgent:
         built_context,
         command_metadata: dict[str, Any],
         turn: CleanTurn,
+        interaction_plan: InteractionPlan,
         dialogue_state: DialogueState | None,
         social_snapshot: dict[str, Any],
         external_context: str,
@@ -1731,6 +1734,17 @@ class LocalAgent:
         local_repair_reply: str,
         metadata: dict[str, Any],
     ) -> tuple[str, dict[str, Any], dict[str, Any] | None, ModelReply | None]:
+        if not self._allows_api_quality_fallback(
+            interaction_plan=interaction_plan,
+            command_metadata=command_metadata,
+            external_context=external_context,
+            tool_result=tool_result,
+        ):
+            metadata["api_quality_fallback_used"] = False
+            metadata["api_quality_fallback_reason"] = "simple_turn_suppressed"
+            metadata["quality_reviewer_uncertain"] = True
+            return "", metadata, local_repair_decision, None
+
         client = self._quality_fallback_client()
         if client is None:
             metadata["api_quality_fallback_used"] = False
@@ -1852,6 +1866,22 @@ class LocalAgent:
         if str(getattr(client, "provider_name", "")).casefold() != "grok":
             return None
         return client
+
+    def _allows_api_quality_fallback(
+        self,
+        *,
+        interaction_plan: InteractionPlan,
+        command_metadata: dict[str, Any],
+        external_context: str,
+        tool_result: str,
+    ) -> bool:
+        if command_metadata.get("enforced"):
+            return True
+        if external_context.strip() or tool_result.strip():
+            return True
+        if interaction_plan.message_kind in {"question", "complaint", "correction", "life_status"}:
+            return True
+        return interaction_plan.reply_shape in {"answer_with_context_hook", "repair_with_context"}
 
     def _qwen_quality_feedback(self, *, review: QualityReview, bad_reply: str) -> str:
         return (

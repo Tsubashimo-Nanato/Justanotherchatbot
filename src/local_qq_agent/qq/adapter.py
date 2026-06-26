@@ -268,6 +268,7 @@ class QQWindowAdapter:
             timings["focus_seconds"] = round(time.perf_counter() - step_started, 3)
 
             if reply_to is not None:
+                self._focus_message_editor(window, clear_existing=True, dismiss_menus=True)
                 step_started = time.perf_counter()
                 quote_result = self._open_quote_reply(window, reply_to)
                 timings["quote_seconds"] = round(time.perf_counter() - step_started, 3)
@@ -282,14 +283,17 @@ class QQWindowAdapter:
                     )
                 step_started = time.perf_counter()
                 self._clear_quote_mention_prefix()
+                self._focus_message_editor(window, clear_existing=False, dismiss_menus=False)
                 timings["quote_cleanup_seconds"] = round(time.perf_counter() - step_started, 3)
+            else:
+                self._focus_message_editor(window, clear_existing=True, dismiss_menus=True)
 
             before_keys: set[tuple[str, str, int, int, int, int]] = set()
             if self.config.verify_after_send:
                 before_keys = self._visible_item_keys(self._read_context_snapshot(window).visible_items)
 
             step_started = time.perf_counter()
-            self._paste_and_submit(text)
+            self._paste_and_submit(window, text)
             timings["input_seconds"] = round(time.perf_counter() - step_started, 3)
 
             verification = {
@@ -328,12 +332,89 @@ class QQWindowAdapter:
         finally:
             self._restore_minimized(window, was_minimized)
 
-    def _paste_and_submit(self, text: str) -> None:
+    def _paste_and_submit(self, window: Any, text: str) -> None:
         import pyperclip
         from pywinauto import keyboard
 
         pyperclip.copy(text)
-        keyboard.send_keys("^v{ENTER}")
+        keyboard.send_keys("^v")
+        time.sleep(0.05)
+        if not self._click_send_button(window):
+            keyboard.send_keys("{ENTER}")
+
+    def _focus_message_editor(self, window: Any, *, clear_existing: bool, dismiss_menus: bool) -> None:
+        from pywinauto import keyboard, mouse
+
+        if dismiss_menus:
+            keyboard.send_keys("{ESC}")
+            time.sleep(0.05)
+
+        editor = self._find_message_editor(window)
+        rect = self._rectangle_value(editor) if editor is not None else None
+        try:
+            if editor is not None:
+                editor.click_input()
+            elif rect is not None:
+                mouse.click(coords=(rect["left"] + 24, rect["top"] + max(8, min(24, (rect["bottom"] - rect["top"]) // 2))))
+        except Exception:
+            if rect is not None:
+                mouse.click(coords=(rect["left"] + 24, rect["top"] + max(8, min(24, (rect["bottom"] - rect["top"]) // 2))))
+        time.sleep(0.05)
+
+        if clear_existing:
+            keyboard.send_keys("^a{BACKSPACE}")
+            time.sleep(0.05)
+
+    def _find_message_editor(self, window: Any) -> Any | None:
+        window_rect = self._rectangle_value(window)
+        if window_rect is None:
+            return None
+
+        best: tuple[int, Any] | None = None
+        stack: list[tuple[Any, int]] = [(window, 0)]
+        while stack:
+            current, depth = stack.pop()
+            rect = self._rectangle_value(current)
+            try:
+                info = getattr(current, "element_info", None)
+                control_type = str(getattr(info, "control_type", "") if info else "")
+            except Exception:
+                control_type = ""
+
+            if control_type == "Edit" and rect and self._looks_like_message_editor(rect, window_rect):
+                area = (rect["right"] - rect["left"]) * (rect["bottom"] - rect["top"])
+                if best is None or area > best[0]:
+                    best = (area, current)
+
+            if depth >= self.config.probe_max_depth:
+                continue
+            try:
+                children = current.children()
+            except Exception:
+                continue
+            for child in children:
+                stack.append((child, depth + 1))
+        return best[1] if best is not None else None
+
+    def _looks_like_message_editor(self, rect: dict[str, int], window_rect: dict[str, int]) -> bool:
+        width = rect["right"] - rect["left"]
+        height = rect["bottom"] - rect["top"]
+        if width < 240 or height < 28:
+            return False
+        if rect["top"] < window_rect["bottom"] - 240:
+            return False
+        return rect["bottom"] <= window_rect["bottom"]
+
+    def _click_send_button(self, window: Any) -> bool:
+        button = self._find_named_descendant(window, ("发送", "Send"), max_depth=self.config.probe_max_depth)
+        if button is None:
+            return False
+        try:
+            button.click_input()
+            time.sleep(0.1)
+            return True
+        except Exception:
+            return False
 
     def _verify_sent_text(
         self,
