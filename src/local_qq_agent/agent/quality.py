@@ -125,6 +125,7 @@ class QualityGate:
                     "answer_with_reaction answers first and adds a small reaction; "
                     "answer_with_context_hook answers first and adds one light hook; "
                     "ack_with_light_hook acknowledges and adds a small context connection. "
+                    "repair_with_context directly addresses the user's correction or criticism before adding anything else. "
                     "If the user is asking what a previous bot reply meant, explain or repair that previous reply directly. "
                     "Do not answer a clarification with another confused marker. "
                     "Output only the rewritten chat message."
@@ -200,6 +201,8 @@ class QualityGate:
             hits.append("contentless_marker")
         if self._needs_information_gain(reply=reply, interaction_plan=interaction_plan) and self._is_low_value_reply(reply):
             hits.append("dead_end_without_hook")
+        if self._misses_correction_repair(message=message, reply=reply, interaction_plan=interaction_plan):
+            hits.append("unrepaired_correction")
         if self._repeats_recent_agent_reply(reply=reply, recent_agent_replies=recent_agent_replies):
             hits.append("recent_self_repeat")
         if self._misses_followup_context(
@@ -260,13 +263,13 @@ class QualityGate:
         if message_kind == "short_ping":
             return False
         reply_shape = str(getattr(interaction_plan, "reply_shape", "") or "")
-        if reply_shape in {"answer_with_reaction", "answer_with_context_hook", "ack_with_light_hook"}:
+        if reply_shape in {"answer_with_reaction", "answer_with_context_hook", "ack_with_light_hook", "repair_with_context"}:
             return True
         try:
             hook_budget = int(getattr(interaction_plan, "hook_budget", 0))
         except (TypeError, ValueError):
             hook_budget = 0
-        return hook_budget > 0 and message_kind in {"life_status", "complaint", "statement"}
+        return hook_budget > 0 and message_kind in {"life_status", "complaint", "correction", "statement"}
 
     def _is_low_value_reply(self, reply: str) -> bool:
         if self._is_contentless_marker(reply):
@@ -292,6 +295,45 @@ class QualityGate:
         if normalized in generic:
             return True
         return bool(re.fullmatch(r"(嗯|哦|噢|啊|好|行|是|对)[。！？\s]*", reply.strip()))
+
+    def _misses_correction_repair(self, *, message: str, reply: str, interaction_plan: Any | None) -> bool:
+        if str(getattr(interaction_plan, "message_kind", "")) != "correction":
+            return False
+        reply_key = self._semantic_key(reply)
+        if self._is_contentless_marker(reply):
+            return True
+        dodges = (
+            "还活着",
+            "装傻",
+            "怎么突然",
+            "什么情况",
+            "满分",
+            "懂了",
+        )
+        if any(term in reply for term in dodges):
+            return True
+        repair_markers = (
+            "错",
+            "不对",
+            "刚才",
+            "我看",
+            "看错",
+            "读错",
+            "回错",
+            "发错",
+            "引用",
+            "艾特",
+            "@",
+            "接错",
+            "漏",
+            "重新",
+            "这句",
+            "那句",
+        )
+        if any(marker in reply for marker in repair_markers):
+            return False
+        message_key = self._semantic_key(message)
+        return len(message_key) >= 3 and message_key not in reply_key
 
     def _is_empty_ack(self, reply: str) -> bool:
         normalized = self._semantic_key(reply)

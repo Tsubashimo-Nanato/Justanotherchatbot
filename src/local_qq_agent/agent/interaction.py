@@ -32,6 +32,11 @@ class InteractionPlan:
             lines.append("interaction_rule: Answer first, then add one light context hook or low-pressure follow-up if natural.")
         elif self.reply_shape == "answer_with_reaction":
             lines.append("interaction_rule: Answer first, then add a small reaction; do not turn it into an interview.")
+        elif self.reply_shape == "repair_with_context":
+            lines.append(
+                "interaction_rule: The user is correcting or criticizing the bot. Address the concrete problem first, "
+                "then add one small natural recovery line. Do not dodge with a generic joke or confused marker."
+            )
         elif self.reply_shape == "answer_only":
             lines.append("interaction_rule: Answer the concrete question cleanly; no extra topic needed.")
         elif self.reply_shape == "ack_with_light_hook":
@@ -123,6 +128,8 @@ class InteractionPolicy:
             return "question"
         if self._is_life_status(lowered):
             return "life_status"
+        if self._is_correction_or_debug_complaint(lowered):
+            return "correction"
         if self._is_complaint(lowered):
             return "complaint"
         if self._is_emoji_or_symbol_only(text) or len(text) <= 10:
@@ -145,6 +152,10 @@ class InteractionPolicy:
             if directness in {"reply_to_bot", "direct_address", "answer_required", "repair_required", "direct", "followup"}:
                 return 2 if affinity >= 0.75 else 1
             return 1 if affinity >= 0.75 else 0
+        if message_kind == "correction":
+            if directness in {"reply_to_bot", "direct_address", "answer_required", "repair_required", "direct", "followup"}:
+                return 2 if affinity >= 0.45 else 1
+            return 1 if affinity >= 0.75 else 0
         if directness in {"reply_to_bot", "direct_address", "answer_required", "repair_required", "direct", "followup"}:
             if message_kind in {"life_status", "complaint"}:
                 return 2 if affinity >= 0.75 else 1
@@ -156,6 +167,8 @@ class InteractionPolicy:
     def _mode(self, *, message_kind: str, hook_budget: int, directness: str) -> str:
         if message_kind == "question":
             return "answer_directly"
+        if message_kind == "correction":
+            return "repair_context" if hook_budget > 0 else "answer_directly"
         if hook_budget >= 2:
             return "acknowledge_plus_hook"
         if hook_budget == 1:
@@ -171,6 +184,8 @@ class InteractionPolicy:
             if hook_budget == 1:
                 return "answer_with_reaction"
             return "answer_only"
+        if message_kind == "correction":
+            return "repair_with_context" if hook_budget > 0 else "answer_only"
         if hook_budget > 0:
             return "ack_with_light_hook"
         return "minimal_ack"
@@ -208,6 +223,28 @@ class InteractionPolicy:
                 text,
             )
         )
+
+    def _is_correction_or_debug_complaint(self, text: str) -> bool:
+        if re.search(
+            r"(@错|at错|艾特错|引用错|回错|发错|看错|读错|漏读|没读到|没看到|"
+            r"理解错|搞错|弄错|错了|不对|不是这个|不是这句|答非所问|接不上|"
+            r"上下文不对|没有上下文|没上下文|重复回复|回复两次|双重回复|"
+            r"为什么不发|没发出去|没有发送|发送失败|quality_blocked)",
+            text,
+        ):
+            return True
+        english = (
+            "wrong",
+            "misread",
+            "missed",
+            "duplicate reply",
+            "double reply",
+            "sent twice",
+            "did not send",
+            "failed to send",
+            "wrong context",
+        )
+        return any(term in text for term in english)
 
     def _is_emoji_or_symbol_only(self, text: str) -> bool:
         visible = [char for char in text if not char.isspace()]

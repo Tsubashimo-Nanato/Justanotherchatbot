@@ -35,6 +35,22 @@ def test_interaction_policy_classifies_chinese_complaint():
     assert plan.hook_budget == 2
 
 
+def test_interaction_policy_classifies_bot_correction_as_repair():
+    plan = InteractionPolicy().plan(
+        message="你刚才@错了",
+        social_snapshot={"affinity": 1.0},
+        gate_metadata={"attention": "followup"},
+        dialogue_state=None,
+        direct_address=False,
+        reply_to_bot=True,
+    )
+
+    assert plan.message_kind == "correction"
+    assert plan.mode == "repair_context"
+    assert plan.reply_shape == "repair_with_context"
+    assert plan.hook_budget == 2
+
+
 def test_interaction_policy_gives_direct_questions_a_reply_shape():
     high = InteractionPolicy().plan(
         message="今天吃什么？",
@@ -180,6 +196,47 @@ def test_quality_gate_rewrites_followup_that_ignores_previous_bot_reply():
     assert review.send_allowed
     assert review.rewrite_needed
     assert "unanswered_followup" in review.rule_hits
+
+
+def test_quality_gate_rewrites_correction_that_gets_dodged():
+    plan = InteractionPolicy().plan(
+        message="你刚才@错了",
+        social_snapshot={"affinity": 1.0},
+        gate_metadata={"attention": "followup"},
+        dialogue_state=None,
+        direct_address=False,
+        reply_to_bot=True,
+    )
+
+    review = QualityGate().review_rules(
+        message="你刚才@错了",
+        reply="？？？你刚才@错了，还活着呢。",
+        interaction_plan=plan,
+    )
+
+    assert review.send_allowed
+    assert review.rewrite_needed
+    assert "unrepaired_correction" in review.rule_hits
+
+
+def test_quality_gate_accepts_concrete_correction_repair():
+    plan = InteractionPolicy().plan(
+        message="你刚才@错了",
+        social_snapshot={"affinity": 1.0},
+        gate_metadata={"attention": "followup"},
+        dialogue_state=None,
+        direct_address=False,
+        reply_to_bot=True,
+    )
+
+    review = QualityGate().review_rules(
+        message="你刚才@错了",
+        reply="嗯，刚才引用接错了，不该把那句算到你头上。",
+        interaction_plan=plan,
+    )
+
+    assert review.send_allowed
+    assert not review.rewrite_needed
 
 
 def test_quality_gate_keeps_concrete_short_answer():

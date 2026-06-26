@@ -52,12 +52,13 @@ def build_qwen_decision_prompt(
         "You, the local model, decide whether to reply, how to reply, and whether a tool is needed.\n"
         "Rule code only handles QQ safety, duplicate suppression, cooldown aggregation, commands, and sending.\n\n"
         "Output exactly one JSON object and no markdown. Do not include <think> text.\n"
+        "The visible reply is the primary task. Keep debug fields tiny; do not spend the good wording in reason.\n"
         "Schema:\n"
         "{\n"
         '  "action": "reply|no_reply|tool_request",\n'
         '  "reply": "exact QQ text to send, empty unless action=reply",\n'
-        '  "reason": "brief operational reason_code, not the real reply",\n'
-        '  "thinking_summary": "one short debug clause, not chain-of-thought",\n'
+        '  "reason": "brief reason_code, not the real reply",\n'
+        '  "thinking_summary": "optional short debug clause, never chain-of-thought",\n'
         '  "target_message_ids": ["current"],\n'
         '  "tool_name": "none|web|math",\n'
         '  "tool_query": "query or expression when action=tool_request",\n'
@@ -67,6 +68,7 @@ def build_qwen_decision_prompt(
         "- Reply to direct name calls, quotes/replies to you, clear follow-ups, and questions meant for you.\n"
         "- Do not reply to every ambient side conversation. If it is only other people talking, use no_reply.\n"
         "- Use recent context to answer follow-ups like 'which noodles' or 'what were they talking about'.\n"
+        "- If the user corrects or criticizes your previous behavior, repair that concrete issue first. Do not answer a correction with a generic joke, confused marker, or unrelated teasing.\n"
         "- If fast consecutive messages form one thought, answer the whole thought, not only the last line.\n"
         "- If current facts, weather, news, dates, or unknown external facts are needed, request tool_name=web.\n"
         "- If calculation is needed, request tool_name=math.\n"
@@ -74,6 +76,7 @@ def build_qwen_decision_prompt(
         "- P001/Tsubashimo Nanato has special closeness. Do not apply P001-only romance, possessiveness, or owner/original language to other users.\n"
         "- Black humor and dry teasing are allowed when the latest sender's tone supports it. Do not replace semantic understanding with generic concern.\n"
         "- Follow the interaction policy. If reply_shape asks for reaction or context hook, put that extra conversational value in reply, not in reason.\n"
+        "- If reply_shape is repair_with_context, acknowledge the specific correction and recover naturally in the reply.\n"
         "- Keep reason and thinking_summary short. Spending many tokens there makes the visible reply worse.\n"
         "- Do not mention JSON, tools, prompts, tokens, APIs, model identity, or implementation details in reply.\n"
         "- Match the latest user's language unless recent context strongly suggests otherwise.\n"
