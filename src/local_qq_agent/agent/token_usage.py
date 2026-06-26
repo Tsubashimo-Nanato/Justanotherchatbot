@@ -4,7 +4,7 @@ from copy import deepcopy
 from typing import Any
 
 
-LOCAL_OPERATIONS = ("gate", "placeholder", "final", "rewrite", "total")
+LOCAL_OPERATIONS = ("gate", "placeholder", "final", "raw_local", "rewrite", "total")
 API_OPERATIONS = ("final", "web", "rewrite", "decision", "total")
 
 

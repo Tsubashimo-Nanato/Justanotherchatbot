@@ -10,6 +10,7 @@ COMMAND_ALIASES = {
     ".detail": "detail",
     ".debug": "debug",
     ".ignore": "ignore",
+    ".i": "ignore",
 }
 COMMAND_TOKEN_ALIASES = {
     ".e": ".enforce",
@@ -28,9 +29,13 @@ KNOWN_COMMAND_TOKENS = {
     ".activity",
     ".debug",
     ".detail",
+    ".dm",
+    ".dmode",
     ".enforce",
     ".help",
+    ".i",
     ".ignore",
+    ".l",
     ".loop",
     ".reboot",
     ".score",
@@ -47,12 +52,16 @@ SPACED_DOT_COMMANDS = {
     "debug": ".debug",
     "detail": ".detail",
     "details": ".detail",
+    "dm": ".dm",
+    "dmode": ".dmode",
     "e": ".enforce",
     "enforce": ".enforce",
     "f": ".enforce",
     "force": ".enforce",
     "help": ".help",
+    "i": ".i",
     "l": ".debug",
+    "loop": ".loop",
     "log": ".debug",
     "logs": ".debug",
     "reboot": ".reboot",
@@ -111,6 +120,7 @@ class ParsedMessage:
     set_requested: bool
     score_requested: bool
     loop_command: str
+    debug_mode_command: int | None
     spontaneous_requested: bool
     score_value: float | None
     score_note: str
@@ -148,6 +158,33 @@ def parse_message_commands(message: str, resolution: CommandResolution | None = 
             set_requested=False,
             score_requested=False,
             loop_command=loop_command,
+            debug_mode_command=None,
+            spontaneous_requested=False,
+            score_value=None,
+            score_note="",
+            thinking_level=None,
+            setting_updates={},
+            setting_errors=(),
+            command_suffixes=tuple(standalone_text.split()),
+            command_resolution_notice=resolution.notice,
+            command_resolution=resolution.to_metadata(),
+        )
+
+    debug_mode_command = _debug_mode_command(standalone_text)
+    if debug_mode_command is not None:
+        return ParsedMessage(
+            content="",
+            enforced=False,
+            debug_requested=False,
+            diagnostic_requested=False,
+            ignored=False,
+            help_requested=False,
+            status_requested=False,
+            reboot_requested=False,
+            set_requested=False,
+            score_requested=False,
+            loop_command="",
+            debug_mode_command=debug_mode_command,
             spontaneous_requested=False,
             score_value=None,
             score_note="",
@@ -172,7 +209,33 @@ def parse_message_commands(message: str, resolution: CommandResolution | None = 
             set_requested=False,
             score_requested=False,
             loop_command="",
+            debug_mode_command=None,
             spontaneous_requested=True,
+            score_value=None,
+            score_note="",
+            thinking_level=None,
+            setting_updates={},
+            setting_errors=(),
+            command_suffixes=(standalone_text,),
+            command_resolution_notice=resolution.notice,
+            command_resolution=resolution.to_metadata(),
+        )
+
+    if standalone_text.casefold() in {".ignore", ".i"}:
+        return ParsedMessage(
+            content="",
+            enforced=False,
+            debug_requested=False,
+            diagnostic_requested=False,
+            ignored=True,
+            help_requested=False,
+            status_requested=False,
+            reboot_requested=False,
+            set_requested=False,
+            score_requested=False,
+            loop_command="",
+            debug_mode_command=None,
+            spontaneous_requested=False,
             score_value=None,
             score_note="",
             thinking_level=None,
@@ -203,6 +266,7 @@ def parse_message_commands(message: str, resolution: CommandResolution | None = 
             set_requested=False,
             score_requested=False,
             loop_command="",
+            debug_mode_command=None,
             spontaneous_requested=False,
             score_value=None,
             score_note="",
@@ -220,35 +284,7 @@ def parse_message_commands(message: str, resolution: CommandResolution | None = 
     if standalone_text.casefold().startswith(".score"):
         return _parse_score_command(standalone_text, resolution=resolution)
 
-    tokens = text.split()
-    suffixes: list[str] = []
-    command_names: set[str] = set()
-    thinking_level: int | None = None
-
-    while tokens:
-        token = tokens[-1].casefold()
-        command = COMMAND_ALIASES.get(token)
-        if command is not None:
-            suffixes.append(tokens.pop())
-            command_names.add(command)
-            continue
-
-        if _is_thinking_level_token(token) and len(tokens) >= 2 and tokens[-2].casefold() == ".think":
-            level_token = tokens.pop()
-            think_token = tokens.pop()
-            thinking_level = int(level_token)
-            suffixes.append(f"{think_token} {level_token}")
-            continue
-
-        if token == ".think":
-            suffixes.append(tokens.pop())
-            thinking_level = 1
-            continue
-
-        break
-
-    content = " ".join(tokens).strip()
-    suffixes.reverse()
+    content, suffixes, command_names, thinking_level = _scan_suffix_commands(text)
     return ParsedMessage(
         content=content,
         enforced="enforce" in command_names,
@@ -261,6 +297,7 @@ def parse_message_commands(message: str, resolution: CommandResolution | None = 
         set_requested=False,
         score_requested=False,
         loop_command="",
+        debug_mode_command=None,
         spontaneous_requested=False,
         score_value=None,
         score_note="",
@@ -283,6 +320,16 @@ def resolve_command_aliases(message: str) -> CommandResolution:
             changed=bool(spaced_replacements),
             source="alias" if spaced_replacements else "exact",
             replacements=tuple(spaced_replacements),
+            original_text=original_message,
+        )
+
+    if len(tokens) == 2 and tokens[0].casefold() == ".l" and tokens[1].casefold() in {"on", "off", "start", "stop"}:
+        resolved_text = re.sub(r"(?<!\S)\.l(?!\S)", ".loop", message, count=1, flags=re.IGNORECASE)
+        return CommandResolution(
+            text=resolved_text,
+            changed=True,
+            source="alias",
+            replacements=((".l", ".loop"),),
             original_text=original_message,
         )
 
@@ -375,6 +422,7 @@ def _parsed_empty(resolution: CommandResolution | None = None) -> ParsedMessage:
         set_requested=False,
         score_requested=False,
         loop_command="",
+        debug_mode_command=None,
         spontaneous_requested=False,
         score_value=None,
         score_note="",
@@ -393,9 +441,34 @@ def _standalone_command_text(text: str) -> str:
         return text
     last_line = lines[-1]
     lowered = last_line.casefold()
-    if lowered in {".help", ".status", ".reboot", ".debug", ".s", ".spon", ".spontaneous"}:
+    if lowered in {
+        ".help",
+        ".status",
+        ".reboot",
+        ".debug",
+        ".dm",
+        ".dmode",
+        ".ignore",
+        ".i",
+        ".s",
+        ".spon",
+        ".spontaneous",
+    }:
         return last_line
-    if lowered in {".loop start", ".loop stop"}:
+    if lowered in {
+        ".loop start",
+        ".loop stop",
+        ".loop on",
+        ".loop off",
+        ".l start",
+        ".l stop",
+        ".l on",
+        ".l off",
+        ".dm 0",
+        ".dm 1",
+        ".dmode 0",
+        ".dmode 1",
+    }:
         return last_line
     if lowered.startswith(".set") or lowered.startswith(".score"):
         return last_line
@@ -404,15 +477,65 @@ def _standalone_command_text(text: str) -> str:
 
 def _loop_command(text: str) -> str:
     tokens = text.strip().casefold().split()
-    if len(tokens) != 2 or tokens[0] != ".loop":
+    if len(tokens) != 2 or tokens[0] not in {".loop", ".l"}:
         return ""
-    if tokens[1] in {"start", "stop"}:
-        return tokens[1]
+    if tokens[1] in {"start", "on"}:
+        return "start"
+    if tokens[1] in {"stop", "off"}:
+        return "stop"
     return ""
+
+
+def _debug_mode_command(text: str) -> int | None:
+    tokens = text.strip().casefold().split()
+    if len(tokens) != 2 or tokens[0] not in {".dm", ".dmode"}:
+        return None
+    if tokens[1] in {"0", "1"}:
+        return int(tokens[1])
+    return None
 
 
 def _spontaneous_command(text: str) -> bool:
     return text.strip().casefold() in {".s", ".spon", ".spontaneous"}
+
+
+def _scan_suffix_commands(text: str) -> tuple[str, tuple[str, ...], set[str], int | None]:
+    remaining = text.strip()
+    suffixes: list[str] = []
+    command_names: set[str] = set()
+    thinking_level: int | None = None
+
+    while remaining:
+        level_match = re.search(r"(?:^|\s)(\.think)\s+([0-3])\s*$", remaining, flags=re.IGNORECASE)
+        if level_match:
+            thinking_level = int(level_match.group(2))
+            suffixes.append(f"{level_match.group(1)} {level_match.group(2)}")
+            remaining = remaining[: level_match.start()].strip()
+            continue
+
+        command_match = re.search(r"(\.[A-Za-z]+)\s*$", remaining)
+        if not command_match:
+            break
+
+        token = command_match.group(1)
+        lowered = token.casefold()
+        command = COMMAND_ALIASES.get(lowered)
+        if command is not None:
+            suffixes.append(token)
+            command_names.add(command)
+            remaining = remaining[: command_match.start()].strip()
+            continue
+
+        if lowered == ".think":
+            suffixes.append(token)
+            thinking_level = 1
+            remaining = remaining[: command_match.start()].strip()
+            continue
+
+        break
+
+    suffixes.reverse()
+    return remaining.strip(), tuple(suffixes), command_names, thinking_level
 
 
 def _parse_set_command(text: str, *, resolution: CommandResolution | None = None) -> ParsedMessage:
@@ -455,6 +578,18 @@ def _parse_set_command(text: str, *, resolution: CommandResolution | None = None
             index += 2
             continue
 
+        if key in {".dm", ".dmode"}:
+            if index + 1 >= len(tokens):
+                errors.append(f"{key} requires 0 or 1")
+                break
+            value = tokens[index + 1]
+            if value not in {"0", "1"}:
+                errors.append(f"{key} must be 0 or 1, got {value}")
+            else:
+                updates["debug_mode"] = int(value)
+            index += 2
+            continue
+
         errors.append(f"unsupported setting: {tokens[index]}")
         index += 1
 
@@ -473,6 +608,7 @@ def _parse_set_command(text: str, *, resolution: CommandResolution | None = None
         set_requested=True,
         score_requested=False,
         loop_command="",
+        debug_mode_command=None,
         spontaneous_requested=False,
         score_value=None,
         score_note="",
@@ -523,6 +659,7 @@ def _parse_score_command(text: str, *, resolution: CommandResolution | None = No
         set_requested=False,
         score_requested=True,
         loop_command="",
+        debug_mode_command=None,
         spontaneous_requested=False,
         score_value=score_value,
         score_note=note,

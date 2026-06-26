@@ -18,6 +18,7 @@ class BuiltContext:
     memory_lines: list[str]
     recent_lines: list[str]
     dialogue_lines: list[str]
+    interaction_lines: list[str]
 
 
 class ContextBuilder:
@@ -84,6 +85,7 @@ class ContextBuilder:
             memory_lines=memory_lines,
             recent_lines=recent_lines,
             dialogue_lines=dialogue_lines,
+            interaction_lines=interaction_lines,
         )
 
     def _memory_lines(self, memories) -> list[str]:

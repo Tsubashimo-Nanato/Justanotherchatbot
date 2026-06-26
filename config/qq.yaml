@@ -19,3 +19,6 @@ duplicate_suppression_seconds: 3600.0
 turn_quiet_period_seconds: 6.0
 scrollback_on_new_messages: true
 scrollback_pages_on_new_messages: 2
+startup_scrollback_on_start: true
+startup_scrollback_readable_messages: 30
+startup_scrollback_pages_on_start: 6

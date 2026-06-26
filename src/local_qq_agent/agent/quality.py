@@ -29,12 +29,13 @@ class QualityGate:
         reply: str,
         interaction_plan: Any | None = None,
         recent_agent_replies: tuple[str, ...] = (),
+        dialogue_state: Any | None = None,
     ) -> QualityReview:
         reply = reply.strip()
         if not reply:
             return QualityReview(False, False, 0.0, ("empty_reply",), ("empty_reply",))
 
-        severe_hits = self._severe_hits(reply)
+        severe_hits = self._severe_hits(message=message, reply=reply)
         if severe_hits:
             return QualityReview(
                 send_allowed=False,
@@ -49,6 +50,7 @@ class QualityGate:
             reply=reply,
             interaction_plan=interaction_plan,
             recent_agent_replies=recent_agent_replies,
+            dialogue_state=dialogue_state,
         )
         if rewrite_hits:
             return QualityReview(
@@ -109,6 +111,7 @@ class QualityGate:
         reasons: tuple[str, ...],
         interaction_plan: Any | None = None,
         recent_agent_replies: tuple[str, ...] = (),
+        dialogue_state: Any | None = None,
     ) -> list[dict[str, str]]:
         interaction_text = self._interaction_summary(interaction_plan)
         recent_text = "\n".join(f"- {item}" for item in recent_agent_replies if item.strip()) or "none"
@@ -122,6 +125,9 @@ class QualityGate:
                     "answer_with_reaction answers first and adds a small reaction; "
                     "answer_with_context_hook answers first and adds one light hook; "
                     "ack_with_light_hook acknowledges and adds a small context connection. "
+                    "repair_with_context directly addresses the user's correction or criticism before adding anything else. "
+                    "If the user is asking what a previous bot reply meant, explain or repair that previous reply directly. "
+                    "Do not answer a clarification with another confused marker. "
                     "Output only the rewritten chat message."
                 ),
             },
@@ -151,9 +157,10 @@ class QualityGate:
             {"role": "user", "content": f"user message:\n{message}\n\ncandidate reply:\n{reply}"},
         ]
 
-    def _severe_hits(self, reply: str) -> list[str]:
+    def _severe_hits(self, *, message: str, reply: str) -> list[str]:
         lowered = reply.casefold()
-        terms = (
+        message_lower = message.casefold()
+        hard_terms = (
             "as an ai",
             "as a language model",
             "language model",
@@ -166,10 +173,17 @@ class QualityGate:
             "系统提示",
             "开发者消息",
             "内部配置",
-            "token",
-            "prompt",
         )
-        return [term for term in terms if term in lowered]
+        hits = [term for term in hard_terms if term in lowered]
+
+        # These are ordinary debugging words when the user brought them up first.
+        # Block only unsolicited leakage, not a natural answer to a token/prompt complaint.
+        for term in ("token", "tokens"):
+            if term in lowered and term not in message_lower:
+                hits.append(term)
+        if "prompt" in lowered and "prompt" not in message_lower:
+            hits.append("prompt")
+        return hits
 
     def _rewrite_hits(
         self,
@@ -178,14 +192,26 @@ class QualityGate:
         reply: str,
         interaction_plan: Any | None = None,
         recent_agent_replies: tuple[str, ...] = (),
+        dialogue_state: Any | None = None,
     ) -> list[str]:
         hits: list[str] = []
         if self._is_dead_end_echo(message=message, reply=reply):
             hits.append("dead_end_echo")
+        if self._is_contentless_marker(reply):
+            hits.append("contentless_marker")
         if self._needs_information_gain(reply=reply, interaction_plan=interaction_plan) and self._is_low_value_reply(reply):
             hits.append("dead_end_without_hook")
+        if self._misses_correction_repair(message=message, reply=reply, interaction_plan=interaction_plan):
+            hits.append("unrepaired_correction")
         if self._repeats_recent_agent_reply(reply=reply, recent_agent_replies=recent_agent_replies):
             hits.append("recent_self_repeat")
+        if self._misses_followup_context(
+            message=message,
+            reply=reply,
+            recent_agent_replies=recent_agent_replies,
+            dialogue_state=dialogue_state,
+        ):
+            hits.append("unanswered_followup")
         return hits
 
     def _repeats_recent_agent_reply(self, *, reply: str, recent_agent_replies: tuple[str, ...]) -> bool:
@@ -225,8 +251,8 @@ class QualityGate:
         text = text.casefold()
         text = re.sub(r"\s+", "", text)
         text = "".join(char for char in text if char.isalnum() or "\u4e00" <= char <= "\u9fff")
-        text = re.sub(r"^(我|俺|咱|i|we)", "", text)
-        text = re.sub(r"(啊|呀|呢|吧|哦|喔|啦|了)+$", "", text)
+        text = re.sub(r"^(我|你|咱|俺|i|we)", "", text)
+        text = re.sub(r"(啊|呀|呢|嘛|吧|哦|喔|嗯)+$", "", text)
         return text
 
     def _contains_cjk(self, text: str) -> bool:
@@ -237,40 +263,156 @@ class QualityGate:
         if message_kind == "short_ping":
             return False
         reply_shape = str(getattr(interaction_plan, "reply_shape", "") or "")
-        if reply_shape in {"answer_with_reaction", "answer_with_context_hook", "ack_with_light_hook"}:
+        if reply_shape in {"answer_with_reaction", "answer_with_context_hook", "ack_with_light_hook", "repair_with_context"}:
             return True
         try:
             hook_budget = int(getattr(interaction_plan, "hook_budget", 0))
         except (TypeError, ValueError):
             hook_budget = 0
-        return hook_budget > 0 and message_kind in {"life_status", "complaint", "statement"}
+        return hook_budget > 0 and message_kind in {"life_status", "complaint", "correction", "statement"}
 
     def _is_low_value_reply(self, reply: str) -> bool:
+        if self._is_contentless_marker(reply):
+            return True
         if self._is_empty_ack(reply):
             return True
         normalized = self._semantic_key(reply)
+        if self._is_generic_short_ack_key(normalized):
+            return True
         generic = {
-            "嗯",
-            "嗯嗯",
-            "哦",
-            "噢",
-            "啊",
-            "好",
-            "行",
-            "是",
             "确实",
             "可以",
             "还行",
             "不知道",
             "没想好",
+            "是啊",
+            "嗯是啊",
+            "对啊",
+            "确实啊",
+            "下班了",
+            "下班了啊",
         }
         if normalized in generic:
             return True
-        return bool(re.fullmatch(r"(嗯+|哦+|噢+|啊+|好+|行+|是+)[？?。!！]*", reply.strip()))
+        return bool(re.fullmatch(r"(嗯|哦|噢|啊|好|行|是|对)[。！？\s]*", reply.strip()))
+
+    def _misses_correction_repair(self, *, message: str, reply: str, interaction_plan: Any | None) -> bool:
+        if str(getattr(interaction_plan, "message_kind", "")) != "correction":
+            return False
+        reply_key = self._semantic_key(reply)
+        if self._is_contentless_marker(reply):
+            return True
+        dodges = (
+            "还活着",
+            "装傻",
+            "怎么突然",
+            "什么情况",
+            "满分",
+            "懂了",
+        )
+        if any(term in reply for term in dodges):
+            return True
+        repair_markers = (
+            "错",
+            "不对",
+            "刚才",
+            "我看",
+            "看错",
+            "读错",
+            "回错",
+            "发错",
+            "引用",
+            "艾特",
+            "@",
+            "接错",
+            "漏",
+            "重新",
+            "这句",
+            "那句",
+        )
+        if any(marker in reply for marker in repair_markers):
+            return False
+        message_key = self._semantic_key(message)
+        return len(message_key) >= 3 and message_key not in reply_key
 
     def _is_empty_ack(self, reply: str) -> bool:
         normalized = self._semantic_key(reply)
-        return normalized in {"嗯", "嗯嗯", "哦", "噢", "好", "行", "是", "啊", "诶"}
+        return normalized in {"嗯", "嗯嗯", "哦", "噢", "好", "行", "是", "啊", "说"}
+
+    def _is_contentless_marker(self, reply: str) -> bool:
+        text = reply.strip()
+        if not text:
+            return True
+        normalized = self._semantic_key(text)
+        if self._is_generic_short_ack_key(normalized):
+            return True
+        if not normalized:
+            return True
+        return bool(re.fullmatch(r"[\.\s]*(嗯|哦|噢|啊|说)?[\.\s]*[？?]?[\.\s]*", text))
+
+    def _is_generic_short_ack_key(self, normalized: str) -> bool:
+        if len(normalized) > 4:
+            return False
+        generic = {
+            "嗯",
+            "嗯嗯",
+            "哦",
+            "啊",
+            "是",
+            "是啊",
+            "嗯是啊",
+            "对",
+            "对啊",
+            "好",
+            "行",
+            "确实",
+            "确实啊",
+            "不知道",
+        }
+        if normalized in generic:
+            return True
+        return bool(re.fullmatch(r"(嗯|哦|啊|是|对|好|行){1,4}", normalized))
+
+    def _misses_followup_context(
+        self,
+        *,
+        message: str,
+        reply: str,
+        recent_agent_replies: tuple[str, ...],
+        dialogue_state: Any | None,
+    ) -> bool:
+        if not recent_agent_replies:
+            return False
+        obligation = str(getattr(dialogue_state, "obligation", "") or "")
+        question_like = bool(getattr(dialogue_state, "metadata", {}).get("question_or_clarification")) if dialogue_state else False
+        if obligation not in {"answer_required", "repair_required"} and not question_like:
+            return False
+
+        message_key = self._semantic_key(message)
+        if not self._asks_about_previous_words(message_key):
+            return False
+        if self._is_contentless_marker(reply):
+            return True
+        reply_key = self._semantic_key(reply)
+        if "突然" in reply or "怎么突然" in reply:
+            return True
+        if "不知道" in reply_key or "不懂" in reply_key:
+            return True
+        return False
+
+    def _asks_about_previous_words(self, message_key: str) -> bool:
+        markers = (
+            "懂啥",
+            "啥意思",
+            "什么意思",
+            "说啥",
+            "哪种",
+            "哪个",
+            "哪一个",
+            "什么",
+            "谁",
+        )
+        return any(marker in message_key for marker in markers)
 
     def _interaction_summary(self, interaction_plan: Any | None) -> str:
         if interaction_plan is None:

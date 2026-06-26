@@ -1,5 +1,6 @@
 from local_qq_agent.config import QQConfig
-from local_qq_agent.qq import QQWindowAdapter
+import local_qq_agent.qq.adapter as adapter_module
+from local_qq_agent.qq import QQReadResult, QQWindowAdapter
 
 
 class FakeWindow:
@@ -17,6 +18,11 @@ class GuardedQQWindowAdapter(QQWindowAdapter):
 
     def _active_group_name(self, window):
         return self._test_active_group_name
+
+
+class MissingWindowQQWindowAdapter(QQWindowAdapter):
+    def _find_window(self):
+        raise RuntimeError("QQ window not found")
 
 
 class TitleWindow:
@@ -77,8 +83,36 @@ class PassiveReadAdapter(QQWindowAdapter):
         return []
 
 
+class VerifyingSendAdapter(QQWindowAdapter):
+    def __init__(self, config, snapshots):
+        super().__init__(config)
+        self.window = InteractionWindow("target group")
+        self.snapshots = list(snapshots)
+        self.submitted_texts = []
+
+    def _find_window(self):
+        return self.window
+
+    def _active_group_name(self, window):
+        return "target group"
+
+    def _scroll_to_latest(self, window):
+        return None
+
+    def _focus_message_editor(self, window, *, clear_existing, dismiss_menus):
+        return None
+
+    def _paste_and_submit(self, window, text):
+        self.submitted_texts.append(text)
+
+    def _read_context_snapshot(self, window):
+        if len(self.snapshots) > 1:
+            return self.snapshots.pop(0)
+        return self.snapshots[0]
+
+
 def test_qq_send_is_blocked_when_not_armed():
-    adapter = QQWindowAdapter(
+    adapter = MissingWindowQQWindowAdapter(
         QQConfig(
             window_title_regex="QQ",
             expected_group_name="",
@@ -98,7 +132,7 @@ def test_qq_send_is_blocked_when_not_armed():
     result = adapter.send_text("hello")
 
     assert not result.sent
-    assert result.reason == "not_armed"
+    assert result.reason == "qq_window_unavailable"
 
 
 def test_qq_send_dry_run_after_arm():
@@ -179,6 +213,68 @@ def test_qq_send_requires_expected_group_for_real_send():
 
     assert not result.sent
     assert result.reason == "expected_group_missing"
+
+
+def test_real_send_requires_new_visible_message(monkeypatch):
+    monkeypatch.setattr(adapter_module.time, "sleep", lambda _: None)
+    adapter = VerifyingSendAdapter(
+        QQConfig(
+            window_title_regex="QQ",
+            expected_group_name="target group",
+            target_sender_name="target user",
+            bot_sender_name="bot user",
+            dry_run=False,
+            send_requires_armed=True,
+            verify_after_send=True,
+            probe_max_depth=1,
+            probe_max_children=10,
+            poll_interval_seconds=1.0,
+            max_messages_per_tick=2,
+            ignore_existing_on_start=True,
+        ),
+        snapshots=[
+            read_result([]),
+            read_result([visible_item("hello", "Text", 320, 300, 420, 330)]),
+        ],
+    )
+
+    result = adapter.send_text("hello")
+
+    assert result.sent
+    assert result.reason == "sent"
+    assert result.verification["ok"]
+    assert result.verification["reason"] == "sent_text_visible"
+    assert adapter.submitted_texts == ["hello"]
+
+
+def test_real_send_fails_when_visible_message_is_missing(monkeypatch):
+    monkeypatch.setattr(adapter_module.time, "sleep", lambda _: None)
+    adapter = VerifyingSendAdapter(
+        QQConfig(
+            window_title_regex="QQ",
+            expected_group_name="target group",
+            target_sender_name="target user",
+            bot_sender_name="bot user",
+            dry_run=False,
+            send_requires_armed=True,
+            verify_after_send=True,
+            probe_max_depth=1,
+            probe_max_children=10,
+            poll_interval_seconds=1.0,
+            max_messages_per_tick=2,
+            ignore_existing_on_start=True,
+        ),
+        snapshots=[
+            read_result([]),
+            read_result([visible_item("other text", "Text", 320, 300, 420, 330)]),
+        ],
+    )
+
+    result = adapter.send_text("hello")
+
+    assert not result.sent
+    assert result.reason == "send_verification_failed"
+    assert result.verification["reason"] == "sent_text_not_observed"
 
 
 def test_quote_click_point_prefers_message_content_start():
@@ -456,3 +552,16 @@ def visible_item(text, control_type, left, top, right, bottom):
         "control_type": control_type,
         "rectangle": {"left": left, "top": top, "right": right, "bottom": bottom},
     }
+
+
+def read_result(visible_items):
+    return QQReadResult(
+        active_group_name="target group",
+        expected_group_name="target group",
+        target_sender_name="target user",
+        bot_sender_name="bot user",
+        group_matched=True,
+        visible_items=visible_items,
+        chat_messages=[],
+        target_messages=[],
+    )

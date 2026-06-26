@@ -237,6 +237,12 @@ DEBUG_HTML = """<!doctype html>
       grid-template-columns: 1fr;
       gap: 0 12px;
     }
+    .compact-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .compact-textarea {
+      min-height: 72px;
+    }
     .metric-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -349,6 +355,15 @@ DEBUG_HTML = """<!doctype html>
     }
     .chat-text {
       white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .chat-detail {
+      margin-top: 6px;
+      padding-top: 6px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
       overflow-wrap: anywhere;
     }
     .mono-small {
@@ -514,8 +529,8 @@ DEBUG_HTML = """<!doctype html>
             <h2>QQ Control</h2>
             <p>Open the target QQ group window first. Send obeys arm state, group verification and config dry_run.</p>
             <div class="actions">
-              <button id="qqArmButton" onclick="qqArm()">Arm</button>
-              <button id="qqDisarmButton" class="danger" onclick="qqDisarm()">Disarm</button>
+              <button id="qqArmButton" onclick="qqArm()">Check / focus QQ</button>
+              <button id="qqDisarmButton" class="secondary" onclick="loadQQStatus()">Disarm disabled</button>
               <button id="qqProbeButton" class="secondary" onclick="qqProbe()">Probe window</button>
               <button id="qqReadButton" class="secondary" onclick="qqRead()">Read visible QQ</button>
               <button id="qqScrollbackButton" class="secondary" onclick="qqScrollback()">Read scrollback</button>
@@ -530,8 +545,8 @@ DEBUG_HTML = """<!doctype html>
             <h2>Agent Loop</h2>
             <p>Reads the configured QQ group, records visible context, and processes queued target messages.</p>
             <div class="actions">
-              <button id="loopStartButton" onclick="loopStart()">Start loop</button>
-              <button id="loopStopButton" class="danger" onclick="loopStop()">Stop loop</button>
+              <button id="loopStartButton" onclick="loopStart()">Loop on</button>
+              <button id="loopStopButton" class="danger" onclick="loopStop()">Loop off</button>
               <button id="loopTickButton" class="secondary" onclick="loopTick()">Tick once</button>
               <button id="loopScrollbackButton" class="secondary" onclick="loopCollectScrollback()">Collect scrollback</button>
               <button id="loopStatusButton" class="secondary" onclick="loopStatus()">Loop status</button>
@@ -547,17 +562,22 @@ DEBUG_HTML = """<!doctype html>
         <div id="panel-provider" class="tab-panel" role="tabpanel" aria-labelledby="tab-provider">
           <section>
             <h2>Provider Runtime</h2>
-            <p>Deploy now starts the active hybrid local model by default. Hybrid uses local gate/utility calls and Grok for final replies when an API key is configured.</p>
+            <p>Qwen persona mode is the default local production path. Legacy raw Qwen is only for model diagnostics; hybrid Grok keeps the API final-reply route available.</p>
             <label for="providerSelect">Active provider</label>
             <select id="providerSelect">
               <option value="unloaded">unloaded</option>
-              <option value="local">local</option>
-              <option value="hybrid">hybrid: local gate + Grok final</option>
+              <option value="local_raw">legacy raw qwen: no persona/context</option>
+              <option value="qwen">qwen: persona + long context</option>
+              <option value="hybrid">hybrid grok: qwen local + API final</option>
+              <option value="local">legacy local</option>
               <option value="grok">grok</option>
             </select>
             <div class="actions">
               <button id="providerStatusButton" class="secondary" onclick="loadProviderStatus()">Provider status</button>
               <button id="providerSwitchButton" class="danger" onclick="switchProvider()">Switch provider</button>
+              <button class="secondary" onclick="switchProviderTo('qwen')">Qwen persona ON</button>
+              <button class="secondary" onclick="switchProviderTo('local_raw')">Legacy raw Qwen</button>
+              <button class="secondary" onclick="switchProviderTo('hybrid')">Hybrid Grok ON</button>
               <button id="providerTestButton" onclick="testProvider()">Test provider</button>
               <button id="providerSoakButton" class="secondary" onclick="runProviderSoak()">Run duplicate soak</button>
             </div>
@@ -608,6 +628,34 @@ DEBUG_HTML = """<!doctype html>
           </section>
 
           <section>
+            <h2>Raw Local Chat</h2>
+            <p>Calls the local OpenAI-compatible endpoint with one user message only. No persona, memory, web, gate, or custom system prompt is added.</p>
+            <label for="rawLocalMessage">Message</label>
+            <textarea id="rawLocalMessage">你好，直接用模型本身的能力随便聊两句。</textarea>
+            <div class="form-grid compact-grid">
+              <div>
+                <label for="rawLocalMaxTokens">Max new tokens</label>
+                <input id="rawLocalMaxTokens" type="number" min="1" max="4096" value="512">
+              </div>
+              <div>
+                <label for="rawLocalTemperature">Temperature</label>
+                <input id="rawLocalTemperature" type="number" min="0" max="2" step="0.05" value="0.7">
+              </div>
+              <div>
+                <label for="rawLocalTopP">Top P</label>
+                <input id="rawLocalTopP" type="number" min="0" max="1" step="0.05" value="0.9">
+              </div>
+            </div>
+            <label for="rawLocalStop">Stop sequences, one per line</label>
+            <textarea id="rawLocalStop" class="compact-textarea"></textarea>
+            <div class="actions">
+              <button id="rawLocalChatButton" onclick="rawLocalChat()">Run raw local chat</button>
+              <button class="secondary" onclick="switchProviderTo('local_raw')">Use legacy raw Qwen in QQ loop</button>
+              <button class="secondary" onclick="switchProviderTo('qwen')">Use Qwen persona in QQ loop</button>
+            </div>
+          </section>
+
+          <section>
             <h2>Offload Benchmark</h2>
             <p>Temporarily restarts the model server across current IQ2M GPU/RAM profiles, records speed and memory snapshots, then restores the active model profile.</p>
             <label for="offloadProfiles">Profiles</label>
@@ -631,6 +679,11 @@ qwen3-30b-iq2m-cpu-ram</textarea>
             </select>
             <label for="activityLevel">Activity <span id="activityValue" class="inline-value">0.35</span></label>
             <input id="activityLevel" type="range" min="0" max="1" step="0.05" value="0.35" oninput="updateSettingLabels()">
+            <label for="debugMode">Debug mode</label>
+            <select id="debugMode">
+              <option value="0">0 default: reply policy for all users</option>
+              <option value="1">1 target only: show no-reply reasons</option>
+            </select>
             <div class="actions">
               <button id="settingsApplyButton" onclick="applyAgentSettings()">Apply settings</button>
               <button id="settingsLoadButton" class="secondary" onclick="loadAgentSettings()">Load settings</button>
@@ -1105,11 +1158,16 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       const onclick = selectable ? ` onclick="selectTimelineItem(${index})"` : "";
       const label = isAgent ? "bot" : (item.who || "unknown");
       const text = item.reply || item.message || item.reason || "";
+      const details = Array.isArray(item.summary_lines) ? item.summary_lines.slice(1, 4) : [];
+      const detailHtml = details.length
+        ? `<div class="chat-detail">${details.map((line) => escapeHtml(shortLine(line, 180))).join("<br>")}</div>`
+        : "";
       const decision = item.decision && kind !== "group_message" ? ` · ${escapeHtml(item.decision)}` : "";
       return `
         <button class="${classes.join(" ")}" type="button"${onclick}>
           <div class="chat-meta"><span>${escapeHtml(shortTime(item.time))} · #${item.event_id} · ${escapeHtml(label)}${decision}</span><span>${item.sent === true ? "sent" : ""}</span></div>
           <div class="chat-text">${escapeHtml(text || "(empty)")}</div>
+          ${detailHtml}
         </button>
       `;
     }
@@ -1136,6 +1194,12 @@ qwen3-30b-iq2m-cpu-ram</textarea>
     }
 
     function formatTimelineItem(item) {
+      if (Array.isArray(item.summary_lines) && item.summary_lines.length) {
+        return item.summary_lines.map((line) => shortLine(line, 240)).join("\\n");
+      }
+      if (item.summary) {
+        return shortLine(item.summary, 320);
+      }
       const time = shortTime(item.time);
       const who = item.who || "unknown";
       const message = item.message ? ` said "${shortLine(item.message, 120)}"` : "";
@@ -1654,23 +1718,39 @@ qwen3-30b-iq2m-cpu-ram</textarea>
           `loop running: ${(result.loop_status || {}).running ?? "unknown"}`
         ].join("\\n");
       }
+      if (operation === "raw_local_chat") {
+        const usage = result.usage || {};
+        const tps = result.tokens_per_second || {};
+        return [
+          "Raw local chat completed.",
+          `model: ${result.model || "unknown"}`,
+          `latency: ${result.latency_seconds ?? "unknown"}s`,
+          `usage: ${formatUsageLine(usage)}`,
+          `completion tok/s: ${tps.completion_tokens ?? "unknown"}`,
+          "",
+          result.content || ""
+        ].join("\\n");
+      }
       if (operation === "provider_status" || operation === "provider_switch" || operation === "provider_key") {
         const provider = result.provider || result;
         const budget = provider.budget || {};
         const grok = provider.grok || {};
         const routing = provider.routing || {};
+        const rawLocal = provider.raw_local || {};
         const latestUsage = latestTraceUsage(provider.latest_trace || {});
         return [
           "Provider updated.",
           `active: ${provider.active_provider || "unknown"}`,
           `routing: gate=${routing.gate || "?"} final=${routing.final || "?"} utility=${routing.utility || "?"}`,
+          `raw local: enabled=${rawLocal.enabled ?? false} max=${rawLocal.max_tokens ?? "?"} temp=${rawLocal.temperature ?? "?"} top_p=${rawLocal.top_p ?? "?"}`,
           `grok model: ${grok.model || "unknown"}`,
           `api key: ${grok.api_key_configured ? grok.api_key_masked || "configured" : "missing"}`,
           `usage telemetry: total=${formatInteger(budget.total_tokens)}, prompt=${formatInteger(budget.prompt_tokens)}, completion=${formatInteger(budget.completion_tokens)}`,
           `smoke budget reference: ${formatInteger(budget.budget)} (${formatPercentRatio(budget.used_ratio)} used)`,
           `runtime input cap: ${formatInteger(provider.runtime?.per_message_input_token_budget)} est. tokens/message`,
           `latest trace usage: ${latestUsage ? formatUsageLine(latestUsage) : "none"}`,
-          `cloud loop allowed: ${(provider.safety || {}).cloud_loop_allowed ?? false}`
+          `cloud loop allowed: ${(provider.safety || {}).cloud_loop_allowed ?? false}`,
+          `QQ announcement: ${(result.announcement || {}).sent ?? false} ${(result.announcement || {}).reason || ""}`
         ].join("\\n");
       }
       if (operation === "provider_duplicate_soak") {
@@ -1702,7 +1782,8 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         return [
           "Runtime settings loaded.",
           `default thinking: ${result.default_thinking_level ?? "unknown"}`,
-          `activity: ${Number(result.activity ?? 0).toFixed(2)}`
+          `activity: ${Number(result.activity ?? 0).toFixed(2)}`,
+          `debug mode: ${result.debug_mode ?? 0}`
         ].join("\\n");
       }
       if (operation === "social_state" || operation === "social_state_update") {
@@ -1749,6 +1830,9 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       if (settings.activity !== undefined) {
         document.getElementById("activityLevel").value = String(settings.activity);
       }
+      if (settings.debug_mode !== undefined) {
+        document.getElementById("debugMode").value = String(settings.debug_mode);
+      }
       updateSettingLabels();
     }
 
@@ -1781,11 +1865,14 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       const safety = provider.safety || {};
       const routing = provider.routing || {};
       const runtime = provider.runtime || {};
+      const rawLocal = provider.raw_local || {};
       const latestTrace = provider.latest_trace || {};
       const apiUsageLines = formatApiUsage(provider).split("\\n");
       const lines = [
         `provider: ${provider.active_provider || "unloaded"}`,
         `routing: gate=${routing.gate || "?"} final=${routing.final || "?"} utility=${routing.utility || "?"}`,
+        `raw local: enabled=${rawLocal.enabled ?? false} max=${rawLocal.max_tokens ?? "?"} temp=${rawLocal.temperature ?? "?"} top_p=${rawLocal.top_p ?? "?"}`,
+        `raw local context: ${rawLocal.instructions || "unknown"} / ${rawLocal.context || "unknown"}`,
         `grok model: ${grok.model || "unknown"}`,
         `grok endpoint: ${grok.endpoint || "chat_completions"}`,
         `reasoning: simple=${grok.reasoning?.simple_chat || "?"} final=${grok.reasoning?.final_reply || "?"} web=${grok.reasoning?.web_fact || "?"}`,
@@ -2428,11 +2515,19 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         const result = await requestJson("/api/provider/switch", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({provider, restart_loop: true})
+          body: JSON.stringify({provider, restart_loop: true, announce_to_qq: true})
         });
         syncProviderStatus(result.provider);
         return result;
       });
+    }
+
+    async function switchProviderTo(provider) {
+      const select = document.getElementById("providerSelect");
+      if (select) {
+        select.value = provider;
+      }
+      await switchProvider();
     }
 
     async function saveProviderKey() {
@@ -2488,6 +2583,25 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       }));
     }
 
+    async function rawLocalChat() {
+      const stop = document.getElementById("rawLocalStop").value
+        .split(/\\r?\\n/)
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0);
+      const body = {
+        message: document.getElementById("rawLocalMessage").value,
+        max_tokens: Number(document.getElementById("rawLocalMaxTokens").value),
+        temperature: Number(document.getElementById("rawLocalTemperature").value),
+        top_p: Number(document.getElementById("rawLocalTopP").value),
+        stop
+      };
+      await runTimed("raw_local_chat", "rawLocalChatButton", async () => requestJson("/api/model/raw-chat", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body)
+      }));
+    }
+
     async function runOffloadBenchmark() {
       const profiles = document.getElementById("offloadProfiles").value
         .split(/\\r?\\n/)
@@ -2512,7 +2626,8 @@ qwen3-30b-iq2m-cpu-ram</textarea>
     async function applyAgentSettings() {
       const body = {
         default_thinking_level: Number(document.getElementById("thinkLevel").value),
-        activity: Number(document.getElementById("activityLevel").value)
+        activity: Number(document.getElementById("activityLevel").value),
+        debug_mode: Number(document.getElementById("debugMode").value)
       };
       await runTimed("agent_settings_update", "settingsApplyButton", async () => {
         const result = await requestJson("/api/agent/settings", {

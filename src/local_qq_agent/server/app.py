@@ -23,6 +23,7 @@ from local_qq_agent.model import (
     set_active_model_profile,
     stop_port_listener,
 )
+from local_qq_agent.model.openai_client import OpenAICompatibleClient
 from local_qq_agent.model.runtime import collect_model_runtime
 from local_qq_agent.paths import ensure_parent, project_path
 from local_qq_agent.provider import ProviderRuntime
@@ -83,6 +84,7 @@ class QQSendRequest(BaseModel):
 class AgentSettingsRequest(BaseModel):
     default_thinking_level: int | None = Field(default=None, ge=0, le=3)
     activity: float | None = Field(default=None, ge=0, le=1)
+    debug_mode: int | None = Field(default=None, ge=0, le=1)
 
 
 class SocialStateOverrideRequest(BaseModel):
@@ -141,6 +143,7 @@ class ModelSwitchRequest(BaseModel):
 class ProviderSwitchRequest(BaseModel):
     provider: str = Field(min_length=1, max_length=40)
     restart_loop: bool = True
+    announce_to_qq: bool = True
 
 
 class ProviderApiKeyRequest(BaseModel):
@@ -149,6 +152,14 @@ class ProviderApiKeyRequest(BaseModel):
 
 class ProviderTestRequest(BaseModel):
     message: str = Field(default="Return a short JSON health check.", min_length=1, max_length=1000)
+
+
+class RawLocalChatRequest(BaseModel):
+    message: str = Field(default="你好，随便聊两句。", min_length=1, max_length=4000)
+    max_tokens: int | None = Field(default=None, ge=1, le=4096)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    stop: list[str] = Field(default_factory=list, max_length=8)
 
 
 class Runtime:
@@ -181,9 +192,13 @@ class Runtime:
             gate_model_client=self.model_clients.gate,
             final_model_client=self.model_clients.final,
             utility_model_client=self.model_clients.utility,
+            api_fallback_model_client=self.model_clients.fallback,
             web_researcher=self.researcher,
             social_state=self.social_state,
             model_status_provider=self.model_status,
+            raw_local_mode=self.provider_runtime.raw_local_enabled(),
+            raw_local_options=self.provider_runtime.raw_local_options(),
+            qwen_first_mode=self.provider_runtime.qwen_first_enabled(),
         )
         self.qq = QQWindowAdapter(self.qq_config)
         self.rebooter = AgentRebooter()
@@ -215,9 +230,13 @@ class Runtime:
             gate_model_client=self.model_clients.gate,
             final_model_client=self.model_clients.final,
             utility_model_client=self.model_clients.utility,
+            api_fallback_model_client=self.model_clients.fallback,
             web_researcher=self.researcher,
             social_state=self.social_state,
             model_status_provider=self.model_status,
+            raw_local_mode=self.provider_runtime.raw_local_enabled(),
+            raw_local_options=self.provider_runtime.raw_local_options(),
+            qwen_first_mode=self.provider_runtime.qwen_first_enabled(),
         )
         self.loop = AgentLoop(
             agent=self.agent,
@@ -306,7 +325,7 @@ class Runtime:
         if not restart_result.get("ready", {}).get("ok"):
             raise HTTPException(status_code=500, detail={"reason": "model_server_not_ready", "restart": restart_result})
 
-        if self.provider_runtime.config.active_provider not in {"hybrid", "hybrid_responses"}:
+        if self.provider_runtime.config.active_provider not in {"hybrid", "hybrid_responses", "local_raw", "qwen"}:
             self.provider_runtime.switch_provider("local")
         self.rebuild_agent()
         loop_status: dict[str, Any] | None = None
@@ -339,13 +358,17 @@ class Runtime:
             "provider": self.provider_runtime.status(),
         }
 
-    async def switch_provider(self, provider: str, *, restart_loop: bool) -> dict[str, Any]:
+    async def switch_provider(self, provider: str, *, restart_loop: bool, announce_to_qq: bool = False) -> dict[str, Any]:
+        previous_provider = self.provider_runtime.config.active_provider
         loop_was_running = self.loop.running
         if loop_was_running and restart_loop:
             await self.loop.stop()
 
         provider_status = self.provider_runtime.switch_provider(provider)
         self.rebuild_agent()
+        announcement = None
+        if announce_to_qq:
+            announcement = await self._announce_provider_switch(previous_provider, provider_status["active_provider"])
 
         loop_status: dict[str, Any] | None = None
         if loop_was_running and restart_loop and self.provider_runtime.cloud_loop_allowed():
@@ -353,11 +376,42 @@ class Runtime:
 
         return {
             "provider": provider_status,
+            "announcement": announcement,
             "loop_was_running": loop_was_running,
             "loop_status": loop_status or self.loop.status(),
             "memory": self.store.status(),
             "persona": self.persona_guard.profile_status(),
         }
+
+    async def _announce_provider_switch(self, previous_provider: str, provider: str) -> dict[str, Any]:
+        text = self._provider_switch_notice(previous_provider, provider)
+        status = self.qq.status()
+        if not status.available or not status.armed or not status.group_matched:
+            return {
+                "sent": False,
+                "reason": "qq_not_ready",
+                "text": text,
+                "qq": status.to_dict(),
+            }
+        result = await asyncio.to_thread(self.qq.send_text, text, reply_to=None)
+        if result.sent:
+            self.loop.remember_sent_text(text)
+        return result.to_dict()
+
+    def _provider_switch_notice(self, previous_provider: str, provider: str) -> str:
+        if provider == "local_raw":
+            return "legacy raw Qwen mode: ON"
+        if previous_provider == "local_raw":
+            return f"legacy raw Qwen mode: OFF ({provider})"
+        if provider == "qwen":
+            return "Qwen persona mode: ON"
+        if provider == "local":
+            return "legacy local mode: ON"
+        if provider in {"hybrid", "hybrid_responses"}:
+            return "hybrid Grok mode: ON (Qwen local + API final)"
+        if provider in {"grok", "grok_responses"}:
+            return "API provider mode: ON"
+        return "provider unloaded"
 
 
 def latest_model_event(store: SQLiteMemoryStore) -> dict[str, Any] | None:
@@ -503,7 +557,11 @@ def create_app() -> FastAPI:
     @app.post("/api/provider/switch")
     async def provider_switch(request: ProviderSwitchRequest) -> dict[str, Any]:
         try:
-            return await runtime.switch_provider(request.provider, restart_loop=request.restart_loop)
+            return await runtime.switch_provider(
+                request.provider,
+                restart_loop=request.restart_loop,
+                announce_to_qq=request.announce_to_qq,
+            )
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
@@ -531,6 +589,53 @@ def create_app() -> FastAPI:
             "tokens_per_second": reply.tokens_per_second,
             "metadata": reply.metadata,
             "provider": runtime.provider_runtime.status(),
+        }
+
+    @app.post("/api/model/raw-chat")
+    async def model_raw_chat(request: RawLocalChatRequest) -> dict[str, Any]:
+        client = OpenAICompatibleClient(runtime.model_config)
+        options = runtime.provider_runtime.raw_local_options()
+        stop = [item for item in request.stop if item]
+        reply = await client.chat(
+            [{"role": "user", "content": request.message}],
+            max_tokens=request.max_tokens if request.max_tokens is not None else int(options["max_tokens"]),
+            temperature=request.temperature if request.temperature is not None else float(options["temperature"]),
+            top_p=request.top_p if request.top_p is not None else float(options["top_p"]),
+            stop=stop or list(options["stop"]),
+            extra_payload=dict(options["extra_payload"]),
+            operation="raw_local",
+        )
+        runtime.store.append_event(
+            source="model",
+            kind="raw_local_chat_test",
+            content=reply.content,
+            metadata={
+                "message": request.message,
+                "model": reply.model,
+                "latency_seconds": round(reply.latency_seconds, 3),
+                "usage": reply.usage,
+                "tokens_per_second": reply.tokens_per_second,
+                "finish_reason": reply.metadata.get("finish_reason"),
+                "options": {
+                    "max_tokens": request.max_tokens if request.max_tokens is not None else int(options["max_tokens"]),
+                    "temperature": request.temperature if request.temperature is not None else float(options["temperature"]),
+                    "top_p": request.top_p if request.top_p is not None else float(options["top_p"]),
+                    "stop": stop or list(options["stop"]),
+                    "extra_payload": dict(options["extra_payload"]),
+                    "instructions": "none",
+                    "context": "single user message only",
+                },
+            },
+        )
+        return {
+            "content": reply.content,
+            "model": reply.model,
+            "latency_seconds": round(reply.latency_seconds, 3),
+            "usage": reply.usage,
+            "tokens_per_second": reply.tokens_per_second,
+            "finish_reason": reply.metadata.get("finish_reason"),
+            "messages": [{"role": "user", "content": request.message}],
+            "raw_local": runtime.provider_runtime.raw_local_options(),
         }
 
     @app.post("/api/provider/duplicate-soak")
@@ -567,6 +672,7 @@ def create_app() -> FastAPI:
         return runtime.agent.update_settings(
             default_thinking_level=request.default_thinking_level,
             activity=request.activity,
+            debug_mode=request.debug_mode,
             source="debug_ui",
         )
 
@@ -904,24 +1010,24 @@ def create_app() -> FastAPI:
     @app.post("/api/qq/arm")
     async def qq_arm() -> dict[str, Any]:
         status = runtime.qq.arm().to_dict()
-        send_result = (await asyncio.to_thread(runtime.qq.send_text, "QQ armed")).to_dict()
         focus_result = await asyncio.to_thread(runtime.qq.focus_window, maximize=True)
         payload = {
             **status,
-            "arm_notice": send_result,
+            "arm_notice": {"sent": False, "reason": "arm_notice_disabled"},
             "focus": focus_result,
         }
         runtime.store.append_event(
             source="qq",
             kind="armed",
-            content="QQ armed",
+            content="QQ window checked",
             metadata=payload,
         )
         return payload
 
     @app.post("/api/qq/disarm")
     async def qq_disarm() -> dict[str, Any]:
-        return runtime.qq.disarm().to_dict()
+        status = runtime.qq.disarm().to_dict()
+        return {**status, "disarm_allowed": False, "reason": "armed_is_window_availability"}
 
     @app.post("/api/qq/probe")
     async def qq_probe() -> dict[str, Any]:

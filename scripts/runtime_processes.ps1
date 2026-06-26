@@ -70,7 +70,9 @@ function Stop-ProcessTree {
 
 function Get-LocalAgentServerProcesses {
     return @(Get-CimInstance Win32_Process | Where-Object {
-        $_.CommandLine -match "local_qq_agent\.server\.app:create_app"
+        $executable = [string]$_.ExecutablePath
+        $isPython = $executable -match "\\python(w)?\.exe$"
+        $isPython -and $_.CommandLine -match "local_qq_agent\.server\.app:create_app"
     })
 }
 

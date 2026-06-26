@@ -69,7 +69,9 @@ The default demo path now uses a hybrid provider: local llama.cpp handles low-la
 
 The current verified local path uses the `cu124` llama-cpp-python wheel plus the CUDA runtime DLL packages listed above. On the RTX 4070 Ti test machine, a short `/api/chat/simulate` call dropped from the old CPU path to about 1.2 seconds wall time, with full model offload reported by the llama server logs.
 
-The debug UI has `Provider` and `Model` panels. Provider `hybrid` means local gate/utility plus Grok final replies. `Load profiles` shows installed profiles and `Switch model` downloads the selected GGUF if needed, restarts the local llama server, rebuilds the agent, reloads the current persona, and keeps the active personality SQLite memory/context database. The `.status` command also reports the current active model/profile.
+The debug UI has `Provider` and `Model` panels. Provider `hybrid` means local gate/utility plus Grok final replies. Provider `local` keeps the full agent stack but routes every model call to the local llama server, so no Grok/API cost is used. Provider `local_raw` is a diagnostic mode for testing the base Qwen model directly: the QQ loop and `/api/model/raw-chat` send one user message to the local OpenAI-compatible endpoint with no persona, memory, web, soft gate, or custom system prompt. In QQ loop, raw local still keeps hard routing; ambient group chatter is ignored unless the message is enforced, quotes the bot, directly names the bot, or is a required follow-up. Switching providers from the debug UI can announce the new mode in the currently armed QQ group, for example `raw local mode: ON` or `local-only mode: ON (API off)`.
+
+`Load profiles` shows installed profiles and `Switch model` downloads the selected GGUF if needed, restarts the local llama server, rebuilds the agent, reloads the current persona, and keeps the active personality SQLite memory/context database. The `.status` command also reports the current active model/profile/provider and whether raw local mode is enabled.
 
 ## SearXNG
 
@@ -121,7 +123,7 @@ Commands are dot suffixes appended to the end of an incoming QQ message. They ar
 - `.detail`: debug reply. The QQ reply includes elapsed time, model latency, completion token/sec, prompt tokens, completion tokens, total tokens, thinking level, and web usage.
 - `.debug`: diagnostic reply. The QQ reply includes a compact diagnostic summary with event id, clean-turn reason, removed-line count, requested/effective thinking, web query, and source count. Full raw metadata stays in the debug UI/event log.
 - `.log`, `.logs`, `.dbg`, `.d`, and `.l`: aliases for `.debug`.
-- `.ignore`: ignore completely. The agent skips memory write, model inference, and QQ send.
+- `.ignore` / `.i`: ignore completely. The agent skips memory write, model inference, and QQ send. Both `hello .i` and `hello.i` are accepted when the command is at the end of the message.
 - `.think`: current message uses thinking level `1`, the lowest explicit thinking budget.
 - `.think 0|1|2|3`: current message thinking level. `0` means automatic selection from message complexity; `1`, `2`, and `3` force that level for the current message.
 - `.help`: standalone help command. It does not call the model and must be the whole message.
@@ -148,7 +150,7 @@ Suffix commands can be combined in any order, for example:
 hello .detail .debug .think 2 .enforce
 ```
 
-Commands in the middle of a sentence are plain text. Without `.detail` or `.debug`, the QQ reply only contains the model reply text. Full metadata is still stored in the debug UI and event log.
+Commands in the middle of a sentence are plain text, so `hello.i more` and normal prose containing `.i` are not treated as ignore. Without `.detail` or `.debug`, the QQ reply only contains the model reply text. Full metadata is still stored in the debug UI and event log.
 
 When `/api/qq/arm` is called from the debug UI, the adapter arms real sending, sends `QQ armed` to the currently matched group, then brings the QQ window to the foreground and maximizes it. The debug UI also exposes both an agent-service restart button and a full-service restart button; the browser page can stay open and reconnect as the service comes back.
 
@@ -205,3 +207,7 @@ This project does not train or fine-tune a model in v0.01, and runtime feedback 
 The public repository is sanitized source only. `.gitignore` excludes `.env`, model downloads, artifacts, runtime SQLite databases, exported run logs, root `workspace/` handoff files, personality references, profile backups, and personality runtime temp files.
 
 Release `0.01` is the first source snapshot. After it, new work should be done on feature branches such as `feature/social-users`, `feature/style-learning-loop`, or `feature/qq-ingestion-cleanup`.
+
+## License
+
+This codebase is licensed under the GNU Affero General Public License v3.0. See [LICENSE](LICENSE).

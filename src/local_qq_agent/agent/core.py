@@ -24,6 +24,7 @@ from local_qq_agent.agent.interaction import InteractionPlan, InteractionPolicy
 from local_qq_agent.agent.memory_capture import MemoryCapturePolicy
 from local_qq_agent.agent.persona import PersonaGuard
 from local_qq_agent.agent.quality import QualityGate, QualityReview
+from local_qq_agent.agent.qwen_harness import build_qwen_decision_prompt, normalize_qwen_decision
 from local_qq_agent.agent.social_state import SocialStateTracker
 from local_qq_agent.agent.token_usage import (
     add_usage,
@@ -104,6 +105,7 @@ class AddressMatch:
 class AgentSettings:
     default_thinking_level: int = 0
     activity: float = 0.35
+    debug_mode: int = 0
 
     def apply(self, updates: dict[str, Any]) -> None:
         if "default_thinking_level" in updates:
@@ -118,8 +120,18 @@ class AgentSettings:
                 raise ValueError(f"activity must be 0..1, got {activity}")
             self.activity = activity
 
+        if "debug_mode" in updates:
+            mode = int(updates["debug_mode"])
+            if mode not in {0, 1}:
+                raise ValueError(f"debug_mode must be 0 or 1, got {mode}")
+            self.debug_mode = mode
+
     def to_dict(self) -> dict[str, Any]:
-        return {"default_thinking_level": self.default_thinking_level, "activity": self.activity}
+        return {
+            "default_thinking_level": self.default_thinking_level,
+            "activity": self.activity,
+            "debug_mode": self.debug_mode,
+        }
 
 
 class LocalAgent:
@@ -133,12 +145,16 @@ class LocalAgent:
         gate_model_client: Any | None = None,
         final_model_client: Any | None = None,
         utility_model_client: Any | None = None,
+        api_fallback_model_client: Any | None = None,
         web_researcher: WebResearcher | None = None,
         math_tool: MathTool | None = None,
         social_state: SocialStateTracker | None = None,
         feedback_export_path: Path | None = None,
         model_status_provider: Callable[[], dict[str, Any]] | None = None,
         quality_gate: QualityGate | None = None,
+        raw_local_mode: bool = False,
+        raw_local_options: dict[str, Any] | None = None,
+        qwen_first_mode: bool = False,
     ) -> None:
         self.store = store
         self.persona_guard = persona_guard
@@ -148,6 +164,7 @@ class LocalAgent:
         self.gate_model_client = gate_model_client or model_client
         self.final_model_client = final_model_client or model_client
         self.utility_model_client = utility_model_client or self.gate_model_client
+        self.api_fallback_model_client = api_fallback_model_client
         self.web_researcher = web_researcher
         self.math_tool = math_tool or MathTool()
         self.social_state = social_state or SocialStateTracker(store)
@@ -155,6 +172,9 @@ class LocalAgent:
         self.feedback_export_path = feedback_export_path or self._default_feedback_export_path()
         self.model_status_provider = model_status_provider or (lambda: {})
         self.quality_gate = quality_gate or QualityGate()
+        self.raw_local_mode = bool(raw_local_mode)
+        self.raw_local_options = dict(raw_local_options or {})
+        self.qwen_first_mode = bool(qwen_first_mode)
         self.memory_capture_policy = MemoryCapturePolicy()
         self.dialogue_state = DialogueStateTracker(store)
         self.interaction_policy = InteractionPolicy()
@@ -264,6 +284,13 @@ class LocalAgent:
         if memory_clear_query:
             return self._clear_memory(memory_clear_query, user_name=user_name, command_source="simulate")
 
+        if self.raw_local_mode or self.qwen_first_mode:
+            return await self.respond_to_incoming(
+                user_name=user_name,
+                message=message,
+                external_context=external_context,
+            )
+
         self.store.append_event(
             source=user_name,
             kind="group_message",
@@ -331,6 +358,31 @@ class LocalAgent:
                 },
             )
 
+        if parsed.debug_mode_command is not None:
+            self.settings.apply({"debug_mode": parsed.debug_mode_command})
+            self.store.append_event(
+                source="agent",
+                kind="agent_settings_update",
+                content="runtime settings updated",
+                metadata={
+                    "settings": self.settings.to_dict(),
+                    "updates": {"debug_mode": parsed.debug_mode_command},
+                    "source": "qq_command",
+                },
+            )
+            return self._record_reply(
+                reply=self._debug_mode_reply(),
+                action="reply",
+                reason="debug_mode_updated",
+                used_model=False,
+                blocked=False,
+                metadata={
+                    **self._command_metadata(parsed),
+                    "turn_cleaning": turn.to_metadata(),
+                    "settings": self.settings.to_dict(),
+                },
+            )
+
         if parsed.spontaneous_requested:
             return self._record_reply(
                 reply="",
@@ -368,7 +420,7 @@ class LocalAgent:
 
         if parsed.reboot_requested:
             return self._record_reply(
-                reply="Reboot scheduled. Agent service will reload the current personality files.",
+                reply="重启了，等我一下",
                 action="reply",
                 reason="reboot_requested",
                 used_model=False,
@@ -422,6 +474,56 @@ class LocalAgent:
         if memory_clear_query:
             return self._clear_memory(memory_clear_query, user_name=user_name, command_source="chat")
 
+        if self.raw_local_mode:
+            dialogue_state = self.dialogue_state.for_turn(
+                user_name=user_name,
+                message=message,
+                reply_to_bot=reply_to_bot or turn.references_bot,
+            )
+            raw_route = self._raw_local_route(
+                message=message,
+                parsed=parsed,
+                turn=turn,
+                reply_to_bot=reply_to_bot,
+                dialogue_state=dialogue_state,
+            )
+            if raw_route["action"] != "reply":
+                if record_incoming_event:
+                    self._record_incoming_event(
+                        user_name=user_name,
+                        message=message,
+                        parsed=parsed,
+                        external_context="",
+                        agent_action="no_reply",
+                        agent_reason=raw_route["reason"],
+                    )
+                return self._record_reply(
+                    reply="",
+                    action="no_reply",
+                    reason=raw_route["reason"],
+                    used_model=False,
+                    blocked=False,
+                    metadata={
+                        **self._command_metadata(parsed),
+                        "turn_cleaning": turn.to_metadata(),
+                        "raw_local": True,
+                        "raw_local_route": raw_route,
+                        "dialogue_state": dialogue_state.to_metadata(),
+                        "token_usage": empty_token_usage(),
+                        "stage_timings": self._stage_timings(started_at),
+                    },
+                )
+            return await self._generate_raw_local_reply(
+                user_name=user_name,
+                message=message,
+                parsed=parsed,
+                turn=turn,
+                record_incoming_event=record_incoming_event,
+                started_at=started_at,
+                raw_route=raw_route,
+                dialogue_state=dialogue_state,
+            )
+
         self._maybe_store_user_memory(user_name, message)
 
         persona_boundary_hit = self._persona_boundary(message)
@@ -434,6 +536,22 @@ class LocalAgent:
             message=message,
             reply_to_bot=reply_to_bot or turn.references_bot,
         )
+        if self.qwen_first_mode:
+            result = await self._generate_qwen_first_decision(
+                user_name=user_name,
+                message=message,
+                external_context=external_context,
+                parsed=parsed,
+                persona_boundary_hit=persona_boundary_hit,
+                social_snapshot=snapshot.to_dict(),
+                turn=turn,
+                reply_to_bot=reply_to_bot,
+                dialogue_state=dialogue_state,
+                record_incoming_event=record_incoming_event,
+                started_at=started_at,
+            )
+            return result
+
         direct_address = self._direct_character_address(message) is not None
         directly_engaged = (
             parsed.enforced
@@ -798,6 +916,13 @@ class LocalAgent:
                 message=message,
                 web_needed=web_needed,
             )
+            if self._gate_repair_failed(decision):
+                return self._invalid_gate_fail_closed(
+                    parsed=parsed,
+                    decision=decision,
+                    model_reply=model_reply,
+                    thinking_plan=thinking_plan,
+                )
         action = str(decision.get("action", "no_reply")).strip().lower()
         if action not in {"reply", "no_reply"}:
             action = "no_reply"
@@ -857,6 +982,218 @@ class LocalAgent:
                 "model_used": True,
             },
         )
+
+    def _gate_repair_failed(self, decision: dict[str, Any]) -> bool:
+        if decision.get("reason") in {"gate_invalid_decision", "gate_decision_repair_unavailable"}:
+            return True
+        return decision.get("decision_parse_status") in {"repair_failed", "repair_unavailable"}
+
+    def _invalid_gate_fail_closed(
+        self,
+        *,
+        parsed,
+        decision: dict[str, Any],
+        model_reply: Any,
+        thinking_plan: dict[str, Any],
+    ) -> GateDecision:
+        return GateDecision(
+            action="no_reply",
+            reason="gate_invalid_fail_closed",
+            attention="unclear",
+            attention_score=0.0,
+            web_needed=False,
+            tool_needed=False,
+            tool_name="",
+            expected_latency_class="none",
+            predicted_latency_seconds=0.0,
+            placeholder_needed=False,
+            thinking_level=0,
+            max_thinking_level=0,
+            requested_thinking_level=parsed.thinking_level,
+            raw_decision={
+                **decision,
+                "reason": "gate_invalid_fail_closed",
+                "original_reason": decision.get("reason", "gate_invalid_decision"),
+                "engagement_decision": {
+                    "action": "no_reply",
+                    "reason": "gate_invalid_fail_closed",
+                    "directness": "ambient",
+                    "reply_probability": 0.0,
+                },
+                "thinking_plan": thinking_plan,
+                "token_usage": self._token_usage_for_reply(
+                    self.gate_model_client,
+                    model_reply,
+                    operation="gate",
+                ),
+                "model_used": True,
+            },
+        )
+
+    async def _generate_raw_local_reply(
+        self,
+        *,
+        user_name: str,
+        message: str,
+        parsed,
+        turn: CleanTurn,
+        record_incoming_event: bool,
+        started_at: float,
+        raw_route: dict[str, Any] | None = None,
+        dialogue_state: DialogueState | None = None,
+    ) -> AgentResult:
+        options = self._raw_local_generation_options()
+        raw_messages = [{"role": "user", "content": message}]
+        reply = await self.model_client.chat(
+            raw_messages,
+            max_tokens=options["max_tokens"],
+            temperature=options["temperature"],
+            top_p=options["top_p"],
+            stop=options["stop"],
+            extra_payload=options["extra_payload"],
+            operation="raw_local",
+        )
+        cleaned = str(reply.content).strip()
+        truncated = self._raw_local_reply_truncated(reply, options["max_tokens"])
+        if record_incoming_event:
+            self._record_incoming_event(
+                user_name=user_name,
+                message=message,
+                parsed=parsed,
+                external_context="",
+                agent_action="no_reply" if truncated else "reply",
+                agent_reason="raw_local_output_truncated" if truncated else "raw_local_model",
+            )
+        metadata = {
+            **self._command_metadata(parsed),
+            "turn_cleaning": turn.to_metadata(),
+            "raw_local": True,
+            "raw_local_options": options,
+            "raw_local_messages": raw_messages,
+            "raw_local_route": raw_route or {},
+            "dialogue_state": dialogue_state.to_metadata() if dialogue_state else {},
+            "model": reply.model,
+            "latency_seconds": round(reply.latency_seconds, 3),
+            "usage": reply.usage,
+            "tokens_per_second": reply.tokens_per_second,
+            "finish_reason": reply.metadata.get("finish_reason"),
+            "prompt_tokens": reply.usage.get("prompt_tokens"),
+            "completion_tokens": reply.usage.get("completion_tokens"),
+            "total_tokens": reply.usage.get("total_tokens"),
+            "raw_model_content": reply.content,
+            "cleaned_reply": cleaned,
+            "truncated_reply_preview": cleaned[:500] if truncated else "",
+            "raw_local_truncated": truncated,
+            "used_final_model": True,
+            "final_generation_seconds": round(reply.latency_seconds, 3),
+            "provider_decision": False,
+            "persona_boundary_hit": False,
+            "gate_decision": None,
+            "memory_context": {"lines": [], "count": 0},
+            "interaction_plan": None,
+            "web_used": False,
+            "search_used": False,
+            "browser_used": False,
+            "web_query": "",
+            "web_sources": [],
+            "tool_latency_seconds": 0,
+            "web_reason": "disabled_in_raw_local",
+            "math_used": False,
+            "math_query": "",
+            "math_result": "",
+            "math_latency_seconds": 0,
+            "math_reason": "disabled_in_raw_local",
+            "settings": self.settings.to_dict(),
+            "social_state": self.social_state.snapshot(user_name).to_dict(),
+            "token_usage": self._token_usage_for_reply(self.model_client, reply, operation="raw_local"),
+            "stage_timings": self._stage_timings(started_at),
+        }
+        if truncated:
+            return self._record_reply(
+                reply="",
+                action="no_reply",
+                reason="raw_local_output_truncated",
+                used_model=True,
+                blocked=True,
+                metadata=metadata,
+            )
+        return self._record_reply(
+            reply=cleaned,
+            action="reply",
+            reason="raw_local_model",
+            used_model=True,
+            blocked=False,
+            metadata=metadata,
+        )
+
+    def _raw_local_reply_truncated(self, reply: ModelReply, max_tokens: int) -> bool:
+        finish_reason = str(reply.metadata.get("finish_reason") or "").casefold()
+        if finish_reason in {"length", "max_tokens", "token_limit"}:
+            return True
+
+        completion_tokens = self._positive_int(reply.usage.get("completion_tokens"), 0)
+        return completion_tokens >= max_tokens
+
+    def _raw_local_route(
+        self,
+        *,
+        message: str,
+        parsed,
+        turn: CleanTurn,
+        reply_to_bot: bool,
+        dialogue_state: DialogueState,
+    ) -> dict[str, Any]:
+        direct_address = self._direct_character_address(message)
+        obligation = dialogue_state.obligation
+        if parsed.enforced:
+            return {"action": "reply", "reason": "enforced", "directness": "enforced"}
+        if reply_to_bot or turn.references_bot:
+            return {"action": "reply", "reason": "direct_quote_reply", "directness": "reply_to_bot"}
+        if direct_address is not None:
+            return {
+                "action": "reply",
+                "reason": "direct_name_address",
+                "directness": "direct_address",
+                "matched_alias": direct_address.alias,
+                "address_kind": direct_address.kind,
+            }
+        if obligation in {"answer_required", "repair_required"}:
+            return {"action": "reply", "reason": obligation, "directness": obligation}
+        return {"action": "no_reply", "reason": "raw_local_not_addressed", "directness": "ambient"}
+
+    def _raw_local_generation_options(self) -> dict[str, Any]:
+        max_tokens = self._positive_int(self.raw_local_options.get("max_tokens"), 512)
+        temperature = self._bounded_float(self.raw_local_options.get("temperature"), default=0.7, minimum=0.0, maximum=2.0)
+        top_p = self._bounded_float(self.raw_local_options.get("top_p"), default=0.9, minimum=0.0, maximum=1.0)
+        stop = self.raw_local_options.get("stop", [])
+        if not isinstance(stop, list):
+            stop = []
+        extra_payload = self.raw_local_options.get("extra_payload", {})
+        if not isinstance(extra_payload, dict):
+            extra_payload = {}
+        return {
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "stop": [str(item) for item in stop if str(item)],
+            "extra_payload": dict(extra_payload),
+            "instructions": "none",
+            "context": "single user message only",
+        }
+
+    def _positive_int(self, value: Any, default: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else default
+
+    def _bounded_float(self, value: Any, *, default: float, minimum: float, maximum: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        return min(max(parsed, minimum), maximum)
 
     async def _maybe_send_placeholder(
         self,
@@ -992,6 +1329,729 @@ class LocalAgent:
         return bool(getattr(self.final_model_client, "supports_decision_call", False)) and callable(
             getattr(self.final_model_client, "chat_decision", None)
         )
+
+    async def _generate_qwen_first_decision(
+        self,
+        *,
+        user_name: str,
+        message: str,
+        external_context: str,
+        parsed,
+        persona_boundary_hit: bool,
+        social_snapshot: dict[str, Any],
+        turn: CleanTurn,
+        reply_to_bot: bool,
+        dialogue_state: DialogueState,
+        record_incoming_event: bool,
+        started_at: float,
+    ) -> AgentResult:
+        stage_started_at = time.perf_counter()
+        command_metadata = {
+            **self._command_metadata(parsed),
+            "persona_boundary_hit": persona_boundary_hit,
+            "reply_to_bot": bool(reply_to_bot or turn.references_bot),
+        }
+        interaction_plan = self._interaction_plan_for(
+            message=message,
+            social_snapshot=social_snapshot,
+            gate=None,
+            dialogue_state=dialogue_state,
+            turn=turn,
+            reply_to_bot=bool(reply_to_bot or turn.references_bot),
+        )
+        pre_model_result = self._qwen_first_pre_model_no_reply(
+            user_name=user_name,
+            message=message,
+            parsed=parsed,
+            external_context=external_context,
+            record_incoming_event=record_incoming_event,
+            persona_boundary_hit=persona_boundary_hit,
+            social_snapshot=social_snapshot,
+            turn=turn,
+            dialogue_state=dialogue_state,
+            interaction_plan=interaction_plan,
+            started_at=started_at,
+        )
+        if pre_model_result is not None:
+            return pre_model_result
+
+        built_context = self.context_builder.build(
+            user_name,
+            message,
+            external_context,
+            fast_reply=False,
+            thinking_directive="Qwen-first structured decision mode.",
+            dialogue_state=dialogue_state,
+            interaction_plan=interaction_plan,
+        )
+        prompt = build_qwen_decision_prompt(
+            persona_guard=self.persona_guard,
+            context=built_context,
+            user_name=user_name,
+            message=message,
+            command_metadata=command_metadata,
+            turn=turn,
+            dialogue_state=dialogue_state,
+            social_snapshot=social_snapshot,
+            external_context=external_context,
+            activity=self.settings.activity,
+            max_tokens=self._qwen_first_max_tokens(parsed),
+        )
+
+        try:
+            first_reply = await self.final_model_client.chat(
+                prompt.messages,
+                max_tokens=prompt.max_tokens,
+                operation=prompt.operation,
+            )
+        except Exception as error:
+            return self._qwen_first_error_result(
+                user_name=user_name,
+                message=message,
+                parsed=parsed,
+                external_context=external_context,
+                record_incoming_event=record_incoming_event,
+                reason="qwen_first_unavailable",
+                error=str(error),
+                metadata={
+                    "qwen_first": True,
+                    "stage_timings": self._stage_timings(started_at),
+                    "final_generation_seconds": round(time.perf_counter() - stage_started_at, 3),
+                },
+            )
+
+        decision = self._qwen_decision_from_reply(first_reply)
+        tool_context = self._empty_tool_context()
+        token_usage = self._token_usage_for_reply(self.final_model_client, first_reply, operation="final")
+        final_reply = first_reply
+        final_decision = decision
+
+        if decision["action"] == "tool_request":
+            tool_context = await self._qwen_tool_context(decision, fallback_message=message)
+            second_prompt = build_qwen_decision_prompt(
+                persona_guard=self.persona_guard,
+                context=built_context,
+                user_name=user_name,
+                message=message,
+                command_metadata={**command_metadata, "tool_result_available": True},
+                turn=turn,
+                dialogue_state=dialogue_state,
+                social_snapshot=social_snapshot,
+                external_context=external_context,
+                activity=self.settings.activity,
+                max_tokens=max(prompt.max_tokens, 768),
+                tool_result=tool_context["context"],
+            )
+            try:
+                final_reply = await self.final_model_client.chat(
+                    second_prompt.messages,
+                    max_tokens=second_prompt.max_tokens,
+                    operation=second_prompt.operation,
+                )
+                token_usage = merge_token_usage(
+                    token_usage,
+                    self._token_usage_for_reply(self.final_model_client, final_reply, operation="final"),
+                )
+                final_decision = self._qwen_decision_from_reply(final_reply)
+            except Exception as error:
+                return self._qwen_first_error_result(
+                    user_name=user_name,
+                    message=message,
+                    parsed=parsed,
+                    external_context=external_context,
+                    record_incoming_event=record_incoming_event,
+                    reason="qwen_first_tool_followup_failed",
+                    error=str(error),
+                    metadata={
+                        "qwen_first": True,
+                        "qwen_first_initial_decision": decision,
+                        "tool_context": tool_context,
+                        "token_usage": token_usage,
+                        "stage_timings": self._stage_timings(started_at),
+                        "final_generation_seconds": round(time.perf_counter() - stage_started_at, 3),
+                    },
+                )
+
+        action = "reply" if final_decision["action"] == "reply" and final_decision["reply"] else "no_reply"
+        reply = self.persona_guard.clean_reply(final_decision["reply"]) if action == "reply" else ""
+        if action == "reply" and not reply:
+            action = "no_reply"
+        reason = final_decision["reason"] if action == "reply" else final_decision["reason"] or "qwen_first_no_reply"
+        quality_metadata: dict[str, Any] = {}
+        if action == "reply":
+            reply, quality_metadata, repair_decision, repair_reply = await self._quality_checked_qwen_first_reply(
+                user_name=user_name,
+                message=message,
+                reply=reply,
+                prompt=prompt,
+                built_context=built_context,
+                command_metadata=command_metadata,
+                turn=turn,
+                interaction_plan=interaction_plan,
+                dialogue_state=dialogue_state,
+                social_snapshot=social_snapshot,
+                external_context=external_context,
+                activity=self.settings.activity,
+                tool_result=tool_context["context"],
+            )
+            if quality_metadata.get("quality_chain_error"):
+                reason = str(quality_metadata.get("quality_chain_error_reason", "quality_chain_error"))
+            elif repair_decision is not None and repair_reply is not None:
+                final_decision = repair_decision
+                final_reply = repair_reply
+                token_usage = merge_token_usage(
+                    token_usage,
+                    quality_metadata.get("token_usage"),
+                )
+                reason = final_decision["reason"] if reply else "quality_blocked"
+            if not reply:
+                action = "no_reply"
+                reason = "quality_blocked"
+        if final_decision.get("memory_to_save"):
+            self.store.add_memory(
+                kind="fact",
+                summary=str(final_decision["memory_to_save"]),
+                confidence=0.65,
+                metadata={"source": "qwen_first_decision", "sender_name": user_name},
+            )
+
+        tool_metadata = dict(tool_context["metadata"])
+        if tool_context["tool_name"] != "web":
+            tool_metadata = {**self._empty_web_context("not_requested_by_qwen").to_metadata(), **tool_metadata}
+        if tool_context["tool_name"] != "math":
+            tool_metadata = {**self._empty_math_context("not_requested_by_qwen").to_metadata(), **tool_metadata}
+
+        metadata = {
+            **command_metadata,
+            "qwen_first": True,
+            "qwen_first_initial_decision": decision,
+            "qwen_first_decision": final_decision,
+            "qwen_first_prompt": {
+                "message_count": len(prompt.messages),
+                "max_tokens": prompt.max_tokens,
+                "operation": prompt.operation,
+            },
+            "model": final_reply.model,
+            "latency_seconds": round(final_reply.latency_seconds, 3),
+            "raw_model_content": final_reply.content,
+            "cleaned_reply": reply,
+            "usage": final_reply.usage,
+            "tokens_per_second": getattr(final_reply, "tokens_per_second", {}),
+            "prompt_tokens": final_reply.usage.get("prompt_tokens"),
+            "completion_tokens": final_reply.usage.get("completion_tokens"),
+            "total_tokens": final_reply.usage.get("total_tokens"),
+            "provider_operation": "qwen_first",
+            "used_final_model": True,
+            "final_generation_seconds": round(time.perf_counter() - stage_started_at, 3),
+            "memory_context": {"lines": built_context.memory_lines, "count": len(built_context.memory_lines)},
+            "recent_context": built_context.recent_lines,
+            "dialogue_state": dialogue_state.to_metadata(),
+            "interaction_plan": interaction_plan.to_metadata(),
+            "turn_cleaning": turn.to_metadata(),
+            "persona_boundary_hit": persona_boundary_hit,
+            "social_state": social_snapshot,
+            "settings": self.settings.to_dict(),
+            "stage_timings": self._stage_timings(started_at),
+            **quality_metadata,
+            **tool_metadata,
+        }
+        metadata["token_usage"] = token_usage
+        self._record_incoming_after_reply(
+            user_name,
+            message,
+            parsed,
+            external_context,
+            action,
+            reason,
+            record_event=record_incoming_event,
+        )
+        return self._record_reply(
+            reply=reply,
+            action=action,
+            reason=reason,
+            used_model=True,
+            blocked=False,
+            metadata=metadata,
+        )
+
+    async def _quality_checked_qwen_first_reply(
+        self,
+        *,
+        user_name: str,
+        message: str,
+        reply: str,
+        prompt,
+        built_context,
+        command_metadata: dict[str, Any],
+        turn: CleanTurn,
+        interaction_plan: InteractionPlan,
+        dialogue_state: DialogueState | None,
+        social_snapshot: dict[str, Any],
+        external_context: str,
+        activity: float,
+        tool_result: str,
+    ) -> tuple[str, dict[str, Any], dict[str, Any] | None, ModelReply | None]:
+        recent_agent_replies = tuple(dialogue_state.recent_agent_replies) if dialogue_state else ()
+        review = self.quality_gate.review_rules(
+            message=message,
+            reply=reply,
+            interaction_plan=interaction_plan,
+            recent_agent_replies=recent_agent_replies,
+            dialogue_state=dialogue_state,
+        )
+        metadata: dict[str, Any] = {
+            "quality_review": review.to_metadata(),
+            "quality_rewrite_used": False,
+            "qwen_first_quality_repair_used": False,
+        }
+        if not review.send_allowed:
+            return "", metadata, None, None
+        if not review.rewrite_needed:
+            return reply, metadata, None, None
+
+        metadata["pre_quality_reply"] = reply
+        feedback = self._qwen_quality_feedback(review=review, bad_reply=reply)
+        repair_prompt = build_qwen_decision_prompt(
+            persona_guard=self.persona_guard,
+            context=built_context,
+            user_name=user_name,
+            message=message,
+            command_metadata={**command_metadata, "quality_repair": True},
+            turn=turn,
+            dialogue_state=dialogue_state,
+            social_snapshot=social_snapshot,
+            external_context=external_context,
+            activity=activity,
+            max_tokens=max(prompt.max_tokens, 768),
+            tool_result=tool_result,
+            quality_feedback=feedback,
+        )
+        try:
+            repair_reply = await self.final_model_client.chat(
+                repair_prompt.messages,
+                max_tokens=repair_prompt.max_tokens,
+                operation=repair_prompt.operation,
+            )
+        except Exception as error:
+            metadata["qwen_first_quality_repair_error"] = str(error)
+            if not self._must_rewrite(review):
+                return reply, metadata, None, None
+            return await self._api_quality_fallback_reply(
+                user_name=user_name,
+                message=message,
+                built_context=built_context,
+                command_metadata=command_metadata,
+                turn=turn,
+                interaction_plan=interaction_plan,
+                dialogue_state=dialogue_state,
+                social_snapshot=social_snapshot,
+                external_context=external_context,
+                activity=activity,
+                tool_result=tool_result,
+                first_review=review,
+                local_repair_review=review,
+                local_repair_decision={
+                    "action": "no_reply",
+                    "reply": "",
+                    "reason": "local_quality_repair_error",
+                    "tool_name": "none",
+                    "tool_query": "",
+                    "memory_to_save": "",
+                },
+                local_repair_reply="",
+                metadata=metadata,
+            )
+
+        repaired_decision = self._qwen_decision_from_reply(repair_reply)
+        repaired_text = ""
+        if repaired_decision["action"] == "reply" and repaired_decision["reply"]:
+            repaired_text = self.persona_guard.clean_reply(repaired_decision["reply"])
+
+        second_review = self.quality_gate.review_rules(
+            message=message,
+            reply=repaired_text,
+            interaction_plan=interaction_plan,
+            recent_agent_replies=recent_agent_replies,
+            dialogue_state=dialogue_state,
+        )
+        metadata.update(
+            {
+                "qwen_first_quality_repair_used": True,
+                "qwen_first_quality_repair_decision": repaired_decision,
+                "qwen_first_quality_repair_prompt": {
+                    "message_count": len(repair_prompt.messages),
+                    "max_tokens": repair_prompt.max_tokens,
+                    "operation": repair_prompt.operation,
+                },
+                "quality_repair_raw": repair_reply.content,
+                "quality_repair_reply": repaired_text,
+                "quality_second_review": second_review.to_metadata(),
+                "token_usage": self._token_usage_for_reply(
+                    self.final_model_client,
+                    repair_reply,
+                    operation="final",
+                ),
+            }
+        )
+        if repaired_text and second_review.send_allowed and not second_review.rewrite_needed:
+            return repaired_text, metadata, repaired_decision, repair_reply
+        return await self._api_quality_fallback_reply(
+            user_name=user_name,
+            message=message,
+            built_context=built_context,
+            command_metadata=command_metadata,
+            turn=turn,
+            interaction_plan=interaction_plan,
+            dialogue_state=dialogue_state,
+            social_snapshot=social_snapshot,
+            external_context=external_context,
+            activity=activity,
+            tool_result=tool_result,
+            first_review=review,
+            local_repair_review=second_review,
+            local_repair_decision=repaired_decision,
+            local_repair_reply=repaired_text,
+            metadata=metadata,
+        )
+
+    async def _api_quality_fallback_reply(
+        self,
+        *,
+        user_name: str,
+        message: str,
+        built_context,
+        command_metadata: dict[str, Any],
+        turn: CleanTurn,
+        interaction_plan: InteractionPlan,
+        dialogue_state: DialogueState | None,
+        social_snapshot: dict[str, Any],
+        external_context: str,
+        activity: float,
+        tool_result: str,
+        first_review: QualityReview,
+        local_repair_review: QualityReview,
+        local_repair_decision: dict[str, Any],
+        local_repair_reply: str,
+        metadata: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], dict[str, Any] | None, ModelReply | None]:
+        if not self._allows_api_quality_fallback(
+            interaction_plan=interaction_plan,
+            command_metadata=command_metadata,
+            external_context=external_context,
+            tool_result=tool_result,
+        ):
+            metadata["api_quality_fallback_used"] = False
+            metadata["api_quality_fallback_reason"] = "simple_turn_suppressed"
+            metadata["quality_reviewer_uncertain"] = True
+            return "", metadata, local_repair_decision, None
+
+        client = self._quality_fallback_client()
+        if client is None:
+            metadata["api_quality_fallback_used"] = False
+            metadata["api_quality_fallback_reason"] = "not_available"
+            metadata["quality_reviewer_uncertain"] = True
+            if metadata.get("qwen_first_quality_repair_error"):
+                return self._chain_error_reply(
+                    message=message,
+                    metadata=metadata,
+                    stage="local_quality_repair",
+                    reason="local_quality_repair_error",
+                    error=str(metadata["qwen_first_quality_repair_error"]),
+                    decision=local_repair_decision,
+                )
+            return "", metadata, local_repair_decision, None
+
+        feedback = self._api_quality_fallback_feedback(
+            first_review=first_review,
+            local_repair_review=local_repair_review,
+            local_repair_decision=local_repair_decision,
+            local_repair_reply=local_repair_reply,
+        )
+        fallback_prompt = build_qwen_decision_prompt(
+            persona_guard=self.persona_guard,
+            context=built_context,
+            user_name=user_name,
+            message=message,
+            command_metadata={**command_metadata, "api_quality_fallback": True},
+            turn=turn,
+            dialogue_state=dialogue_state,
+            social_snapshot=social_snapshot,
+            external_context=external_context,
+            activity=activity,
+            max_tokens=768,
+            tool_result=tool_result,
+            quality_feedback=feedback,
+        )
+        try:
+            api_reply = await client.chat(
+                fallback_prompt.messages,
+                max_tokens=fallback_prompt.max_tokens,
+                operation="quality_rewrite",
+            )
+        except Exception as error:
+            metadata["api_quality_fallback_used"] = False
+            metadata["api_quality_fallback_reason"] = "provider_error"
+            metadata["api_quality_fallback_error"] = str(error)
+            metadata["quality_reviewer_uncertain"] = True
+            return self._chain_error_reply(
+                message=message,
+                metadata=metadata,
+                stage="api_quality_fallback",
+                reason="api_quality_fallback_error",
+                error=str(error),
+                decision=local_repair_decision,
+            )
+
+        decision = self._qwen_decision_from_reply(api_reply)
+        fallback_text = ""
+        if decision["action"] == "reply" and decision["reply"]:
+            fallback_text = self.persona_guard.clean_reply(decision["reply"])
+        review = self.quality_gate.review_rules(
+            message=message,
+            reply=fallback_text,
+            interaction_plan=None,
+            recent_agent_replies=tuple(dialogue_state.recent_agent_replies) if dialogue_state else (),
+            dialogue_state=dialogue_state,
+        )
+        metadata.update(
+            {
+                "api_quality_fallback_used": True,
+                "api_quality_fallback_reason": "local_quality_repair_failed",
+                "api_quality_fallback_decision": decision,
+                "api_quality_fallback_raw": api_reply.content,
+                "api_quality_fallback_reply": fallback_text,
+                "api_quality_fallback_review": review.to_metadata(),
+                "quality_reviewer_uncertain": True,
+                "token_usage": merge_token_usage(
+                    metadata.get("token_usage"),
+                    self._token_usage_for_reply(client, api_reply, operation="rewrite"),
+                ),
+            }
+        )
+        if not fallback_text or not review.send_allowed:
+            return "", metadata, decision, api_reply
+        return fallback_text, metadata, decision, api_reply
+
+    def _chain_error_reply(
+        self,
+        *,
+        message: str,
+        metadata: dict[str, Any],
+        stage: str,
+        reason: str,
+        error: str,
+        decision: dict[str, Any] | None,
+    ) -> tuple[str, dict[str, Any], dict[str, Any] | None, ModelReply | None]:
+        short_reply = self._short_error_reply(message)
+        metadata.update(
+            {
+                "quality_chain_error": True,
+                "quality_chain_error_stage": stage,
+                "quality_chain_error_reason": reason,
+                "quality_chain_error_short_reply": short_reply,
+                "quality_chain_error_full": error,
+            }
+        )
+        return short_reply, metadata, decision, None
+
+    def _short_error_reply(self, message: str) -> str:
+        if self._mostly_ascii(message):
+            return "This turn errored; the debug log has the details."
+        return "这条处理出错了，后台有详情。"
+
+    def _quality_fallback_client(self):
+        client = self.api_fallback_model_client
+        if client is None or client is self.final_model_client:
+            return None
+        if str(getattr(client, "provider_name", "")).casefold() != "grok":
+            return None
+        return client
+
+    def _allows_api_quality_fallback(
+        self,
+        *,
+        interaction_plan: InteractionPlan,
+        command_metadata: dict[str, Any],
+        external_context: str,
+        tool_result: str,
+    ) -> bool:
+        if command_metadata.get("enforced"):
+            return True
+        if external_context.strip() or tool_result.strip():
+            return True
+        if interaction_plan.message_kind in {"question", "complaint", "correction", "life_status"}:
+            return True
+        return interaction_plan.reply_shape in {"answer_with_context_hook", "repair_with_context"}
+
+    def _qwen_quality_feedback(self, *, review: QualityReview, bad_reply: str) -> str:
+        return (
+            f"bad reply: {bad_reply}\n"
+            f"quality reasons: {'; '.join(review.reasons)}\n"
+            f"rule hits: {', '.join(review.rule_hits) or 'none'}\n"
+            "Repair requirement: preserve the user's actual meaning, use recent QQ context if needed, "
+            "and avoid adding any background that is not in context."
+        )
+
+    def _api_quality_fallback_feedback(
+        self,
+        *,
+        first_review: QualityReview,
+        local_repair_review: QualityReview,
+        local_repair_decision: dict[str, Any],
+        local_repair_reply: str,
+    ) -> str:
+        return (
+            "Local model quality repair failed. Use API only for this fallback.\n"
+            "The quality review is a diagnostic signal, not guaranteed truth; verify it against runtime context.\n"
+            f"first review reasons: {'; '.join(first_review.reasons)}\n"
+            f"first review rule hits: {', '.join(first_review.rule_hits) or 'none'}\n"
+            f"local repair reply: {local_repair_reply or 'none'}\n"
+            f"local repair decision: {json.dumps(local_repair_decision, ensure_ascii=False, sort_keys=True)}\n"
+            f"local repair review reasons: {'; '.join(local_repair_review.reasons)}\n"
+            f"local repair rule hits: {', '.join(local_repair_review.rule_hits) or 'none'}\n"
+            "Return the final grounded JSON decision. If the review was wrong, produce the natural reply anyway; "
+            "if the context is insufficient, ask a small clarifying question."
+        )
+
+    def _qwen_first_pre_model_no_reply(
+        self,
+        *,
+        user_name: str,
+        message: str,
+        parsed,
+        external_context: str,
+        record_incoming_event: bool,
+        persona_boundary_hit: bool,
+        social_snapshot: dict[str, Any],
+        turn: CleanTurn,
+        dialogue_state: DialogueState,
+        interaction_plan: InteractionPlan,
+        started_at: float,
+    ) -> AgentResult | None:
+        if parsed.enforced or persona_boundary_hit:
+            return None
+        if interaction_plan.directness not in {"ambient", "ambient_candidate"}:
+            return None
+        if interaction_plan.message_kind != "short_ping":
+            return None
+        if interaction_plan.affinity >= 0.75:
+            return None
+
+        reason = "ambient_short_ping_context_only"
+        self._record_incoming_after_reply(
+            user_name,
+            message,
+            parsed,
+            external_context,
+            "no_reply",
+            reason,
+            record_event=record_incoming_event,
+        )
+        return self._record_reply(
+            reply="",
+            action="no_reply",
+            reason=reason,
+            used_model=False,
+            blocked=False,
+            metadata={
+                **self._command_metadata(parsed),
+                "qwen_first": True,
+                "qwen_first_pre_model_skip": True,
+                "turn_cleaning": turn.to_metadata(),
+                "dialogue_state": dialogue_state.to_metadata(),
+                "interaction_plan": interaction_plan.to_metadata(),
+                "persona_boundary_hit": persona_boundary_hit,
+                "social_state": social_snapshot,
+                "settings": self.settings.to_dict(),
+                "token_usage": empty_token_usage(),
+                "stage_timings": self._stage_timings(started_at),
+                **self._empty_web_context(reason).to_metadata(),
+                **self._empty_math_context(reason).to_metadata(),
+            },
+        )
+
+    def _qwen_decision_from_reply(self, reply: ModelReply) -> dict[str, Any]:
+        parsed = self._parse_model_decision(reply.content)
+        if parsed.get("reason") == "invalid_model_decision":
+            return {
+                "action": "no_reply",
+                "reply": "",
+                "reason": "invalid_qwen_first_decision",
+                "thinking_summary": "",
+                "target_message_ids": [],
+                "tool_name": "none",
+                "tool_query": "",
+                "memory_to_save": "",
+                "decision_parse_status": parsed.get("decision_parse_status", "invalid_json"),
+                "raw_reply": parsed.get("raw_reply", ""),
+            }
+        return normalize_qwen_decision(parsed)
+
+    async def _qwen_tool_context(self, decision: dict[str, Any], *, fallback_message: str) -> dict[str, Any]:
+        tool_name = str(decision.get("tool_name", "none")).strip().casefold()
+        query = str(decision.get("tool_query", "")).strip() or fallback_message
+        if tool_name == "web":
+            context = await self._web_context_for(query)
+            return {"tool_name": "web", "context": context.context, "metadata": context.to_metadata()}
+        if tool_name == "math":
+            context = await self._math_context_for(query)
+            if context.used:
+                self.store.append_event(
+                    source="tool",
+                    kind="math_result",
+                    content=context.result_text or context.error,
+                    metadata={**context.to_metadata(), "ephemeral": True},
+                )
+            return {"tool_name": "math", "context": context.context, "metadata": context.to_metadata()}
+        return self._empty_tool_context()
+
+    def _empty_tool_context(self) -> dict[str, Any]:
+        return {
+            "tool_name": "none",
+            "context": "",
+            "metadata": {
+                **self._empty_web_context("not_requested_by_qwen").to_metadata(),
+                **self._empty_math_context("not_requested_by_qwen").to_metadata(),
+            },
+        }
+
+    def _qwen_first_error_result(
+        self,
+        *,
+        user_name: str,
+        message: str,
+        parsed,
+        external_context: str,
+        record_incoming_event: bool,
+        reason: str,
+        error: str,
+        metadata: dict[str, Any],
+    ) -> AgentResult:
+        self._record_incoming_after_reply(
+            user_name,
+            message,
+            parsed,
+            external_context,
+            "no_reply",
+            reason,
+            record_event=record_incoming_event,
+        )
+        return self._record_reply(
+            reply="",
+            action="no_reply",
+            reason=reason,
+            used_model=True,
+            blocked=True,
+            metadata={**metadata, "error": error, "token_usage": metadata.get("token_usage") or empty_token_usage()},
+        )
+
+    def _qwen_first_max_tokens(self, parsed) -> int:
+        requested = getattr(parsed, "thinking_level", None)
+        if requested == 3:
+            return 1024
+        if requested == 2:
+            return 768
+        return 512
 
     async def _generate_provider_decision(
         self,
@@ -1482,6 +2542,7 @@ class LocalAgent:
             reply=reply,
             interaction_plan=interaction_plan,
             recent_agent_replies=recent_agent_replies,
+            dialogue_state=dialogue_state,
         )
         metadata: dict[str, Any] = {
             "quality_review": review.to_metadata(),
@@ -1501,6 +2562,7 @@ class LocalAgent:
                     reasons=review.reasons,
                     interaction_plan=interaction_plan,
                     recent_agent_replies=recent_agent_replies,
+                    dialogue_state=dialogue_state,
                 ),
                 max_tokens=96,
                 operation="rewrite",
@@ -1515,6 +2577,7 @@ class LocalAgent:
             reply=rewritten,
             interaction_plan=interaction_plan,
             recent_agent_replies=recent_agent_replies,
+            dialogue_state=dialogue_state,
         )
         metadata.update(
             {
@@ -1534,7 +2597,16 @@ class LocalAgent:
         return ("", metadata) if self._must_rewrite(review) else (reply, metadata)
 
     def _must_rewrite(self, review: QualityReview) -> bool:
-        return bool({"dead_end_echo", "empty_ack_without_hook", "recent_self_repeat"} & set(review.rule_hits))
+        return bool(
+            {
+                "dead_end_echo",
+                "empty_ack_without_hook",
+                "recent_self_repeat",
+                "contentless_marker",
+                "unanswered_followup",
+            }
+            & set(review.rule_hits)
+        )
 
     def _base_metadata(
         self,
@@ -2101,12 +3173,14 @@ class LocalAgent:
             "If dialogue_state says answer_required or repair_required, answer the concrete pending question directly. "
             "If the user asks what/which/kind about what the character said, use recent_agent_replies and recent messages to resolve it. "
             "If the previous answer was unclear or contradictory, repair it naturally; do not dodge, deny the topic, or reinterpret an ordinary object question as abstract without clear evidence. "
+            "If the user asks what a previous reply meant, explain the previous wording first; do not answer with another confused marker like '……？'. "
             "Follow interaction_plan.reply_shape: answer_only means answer the concrete question without extra topic; "
             "answer_with_reaction means answer first, then add one small natural reaction; "
             "answer_with_context_hook means answer first, then add one light context hook or low-pressure follow-up if it fits; "
             "ack_with_light_hook means acknowledge and add one small information gain instead of only repeating the user's words; "
             "minimal_ack means stay minimal and do not stretch the conversation. "
             "Do not end a direct high-affinity turn with only a repeated status plus a particle. "
+            "Do not send a contentless acknowledgement such as '嗯……是啊' or '……？' when the user is actively talking to the character. "
             "Do not ask a question every time; a reaction, concrete detail, tiny tease, or context connection is often better. "
             "先读语气和上下文：判断最新消息是认真请求、讽刺、反问、抱怨、玩笑还是试探。"
             "如果一句话表面像技术问题，但上下文已经说明它是在讽刺或表达不满，不要写教程式回答。"
@@ -2422,14 +3496,15 @@ class LocalAgent:
         return (
             "Commands: .help lists commands. .status shows current runtime parameters. "
             ".reboot restarts the agent service and reloads personality files. "
-            ".enforce forces a reply. .detail adds short debug metrics. .debug adds a diagnostic summary. .ignore skips the message. "
+            ".enforce forces a reply. .detail adds short debug metrics. .debug adds a diagnostic summary. .ignore/.i skips the message. "
             ".think sets explicit level 1; .think 0 means automatic, .think 1|2|3 forces this message's thinking level. "
             ".set .think 0|1|2|3 changes the default thinking level; 0 is automatic. "
             ".set .activity 0..1 changes reply willingness. "
-            ".loop start/.loop stop start or stop QQ listening and confirm in QQ. "
+            ".set .dm 0|1 or .dm/.dmode 0|1 changes debug mode. "
+            ".loop on/.loop off or .l on/.l off start or stop QQ listening and confirm in QQ. "
             ".spon/.spontaneous/.s forces one spontaneous topic. "
             ".score 0..1 [reason] records behavior feedback without changing personality. "
-            "Aliases: .force/.f/.e mean .enforce; .log/.logs/.dbg/.d/.l mean .debug; .details means .detail. "
+            "Aliases: .force/.f/.e mean .enforce; .log/.logs/.dbg/.d/.l mean .debug; .details means .detail; .i means .ignore. "
             "Say '清除关于 X 的记忆' or 'forget memory about X' to delete matching memories. "
             "Old #e/#d/#i commands are retired. Put suffix commands at the end."
         )
@@ -2439,11 +3514,16 @@ class LocalAgent:
         social = status["social_state"]
         persona = status["persona"]
         model = status.get("model", {})
+        provider = (model.get("provider") or {}) if isinstance(model.get("provider"), dict) else {}
+        raw_local = provider.get("raw_local") if isinstance(provider.get("raw_local"), dict) else {}
         return (
             "Status:\n"
             f"- model: {model.get('model', 'unknown')} ({model.get('active_profile', 'unknown')})\n"
+            f"- provider: {provider.get('active_provider', 'unknown')}\n"
+            f"- raw local: {bool(raw_local.get('enabled'))}\n"
             f"- default think: {self.settings.default_thinking_level}\n"
             f"- activity: {self.settings.activity:.2f}\n"
+            f"- debug mode: {self.settings.debug_mode}\n"
             f"- affinity for {social['user_name']}: {social['affinity']:.2f}\n"
             f"- mood: {social['global_mood']} ({social['mood_intensity']:.2f})\n"
             f"- persona loaded: {persona['loaded_at']} digest {persona['profile_digest']}\n"
@@ -2514,6 +3594,7 @@ class LocalAgent:
         *,
         default_thinking_level: int | None = None,
         activity: float | None = None,
+        debug_mode: int | None = None,
         source: str = "api",
     ) -> dict[str, Any]:
         updates: dict[str, Any] = {}
@@ -2521,6 +3602,8 @@ class LocalAgent:
             updates["default_thinking_level"] = default_thinking_level
         if activity is not None:
             updates["activity"] = activity
+        if debug_mode is not None:
+            updates["debug_mode"] = debug_mode
 
         if not updates:
             return self.settings.to_dict()
@@ -2537,8 +3620,13 @@ class LocalAgent:
     def _settings_reply(self) -> str:
         return (
             f"Settings updated: default think={self.settings.default_thinking_level}, "
-            f"activity={self.settings.activity:.2f}"
+            f"activity={self.settings.activity:.2f}, debug mode={self.settings.debug_mode}"
         )
+
+    def _debug_mode_reply(self) -> str:
+        if self.settings.debug_mode == 1:
+            return "Debug mode 1: only target-user replies are sent; no-reply reasons are visible."
+        return "Debug mode 0: default group-chat reply policy."
 
     async def _record_score_feedback(self, parsed) -> AgentResult:
         if parsed.setting_errors:

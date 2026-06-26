@@ -234,11 +234,11 @@ function Start-DebugServer {
     if (Wait-HttpOk "http://127.0.0.1:$DebugPort/debug" 45) {
         Write-DeployLog "Debug server is ready."
         try {
-            Invoke-RestMethod -Uri "http://127.0.0.1:$DebugPort/api/qq/disarm" -Method Post | Out-Null
-            Write-DeployLog "QQ adapter disarmed after startup."
+            $qqStatus = Invoke-RestMethod -Uri "http://127.0.0.1:$DebugPort/api/qq/status" -Method Get
+            Write-DeployLog "QQ status after startup: available=$($qqStatus.available), armed=$($qqStatus.armed), group=$($qqStatus.group_matched)."
         }
         catch {
-            Write-DeployLog "QQ disarm after startup failed: $($_.Exception.Message)"
+            Write-DeployLog "QQ status after startup failed: $($_.Exception.Message)"
         }
         return
     }

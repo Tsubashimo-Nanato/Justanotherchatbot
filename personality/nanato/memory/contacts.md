@@ -19,3 +19,14 @@ Planned contact fields:
 
 Contact files may be used later as reviewed exports or seed data. Runtime writes
 should go through SQLite first so they remain auditable and can be overridden.
+
+## Reviewed Contact IDs
+
+- `P001`: `Tsubashimo Nanato`
+  - aliases: `椿霜楠灯 Tsubashimo Nanato`
+  - affinity: `1.0`
+  - note: target user for current style fitting and Nanato's persona-specific
+    original/owner relationship, with clear romantic / lover-like attachment.
+
+Use these PIDs in handoffs and distillation notes so future agents can refer to
+users without confusing display-name variants.

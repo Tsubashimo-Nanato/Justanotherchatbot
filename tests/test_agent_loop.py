@@ -39,6 +39,25 @@ def test_agent_loop_hydrates_seen_messages_from_recent_loop_decisions(tmp_path):
     assert loop._message_seen("target user", "roast chicken good", "fp-new-coordinate")
 
 
+def test_agent_loop_hydrates_assistant_reply_texts_for_quote_cleaning(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    store.append_event(
+        source="agent",
+        kind="assistant_reply",
+        content="因为你在问，所以@你。",
+        metadata={"reason": "test"},
+    )
+
+    loop = build_loop(store=store)
+    quoted = message("因为你在问，所以@你。\n你刚才@错了", "fp-quote", top=100)
+
+    cleaned = loop._clean_visible_message(quoted)
+
+    assert cleaned.text == "你刚才@错了"
+    assert cleaned.references_bot
+    assert "因为你在问，所以@你。" in cleaned.turn.removed_lines
+
+
 def test_agent_loop_persists_decision_index_fields(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
     loop = build_loop(store=store)
@@ -278,7 +297,7 @@ def test_tick_does_not_read_or_consume_messages_when_not_armed():
 
     result = asyncio.run(loop.tick())
 
-    assert result["reason"] == "qq_not_armed"
+    assert result["reason"] == "qq_window_unavailable"
     assert reads == []
     assert loop.status()["ledger"]["record_count"] == 0
 
@@ -416,6 +435,56 @@ def test_tick_buffers_visible_target_messages_before_processing():
     assert [event["metadata"]["agent_action"] for event in message_events] == ["aggregating", "aggregating"]
 
 
+def test_agent_loop_does_not_record_same_turn_when_buffer_flushes_to_queue():
+    loop = build_loop()
+    events = []
+
+    class Store:
+        def append_event(self, **kwargs):
+            events.append(kwargs)
+
+    loop.store = Store()
+
+    incoming = message("you ok", "fp-visible", top=100)
+
+    assert loop._enqueue_visible_targets([incoming], respect_quiet_period=True, now=1000.0) == []
+    enqueued = loop._enqueue_visible_targets([], respect_quiet_period=True, now=1008.0)
+
+    assert [item.text for item in enqueued] == ["you ok"]
+    message_events = [event for event in events if event.get("kind") == "group_message"]
+    assert len(message_events) == 1
+    assert message_events[0]["metadata"]["agent_action"] == "aggregating"
+    assert message_events[0]["metadata"]["clean_identity"] == "target user|you ok"
+
+
+def test_agent_loop_hydrates_context_identity_from_recent_group_messages(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    store.append_event(
+        source="target user",
+        kind="group_message",
+        content="you ok",
+        metadata={
+            "sender_name": "target user",
+            "clean_text": "you ok",
+            "clean_identity": "target user|you ok",
+            "fingerprint": "fp-old",
+            "raw_message_text": "you ok",
+        },
+    )
+
+    loop = build_loop(store=store)
+    event_count = len(store.recent_events(limit=20))
+
+    loop._record_context_message(
+        message("you ok", "fp-new-coordinate", top=150),
+        agent_reason="queued_for_decision",
+        agent_action="queued",
+    )
+
+    assert len(store.recent_events(limit=20)) == event_count
+    assert loop._message_seen("target user", "you ok", "fp-new-coordinate")
+
+
 def test_tick_buffers_non_target_visible_messages_for_gate_decision():
     import asyncio
 
@@ -456,6 +525,50 @@ def test_tick_buffers_non_target_visible_messages_for_gate_decision():
     assert result["aggregating_message_count"] == 1
     assert result["new_observation_count"] == 1
     assert result["enqueued"] == []
+
+
+def test_startup_baseline_collects_scrollback_as_context_only(tmp_path):
+    import asyncio
+
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    loop = build_loop(store=store)
+    old = message("old target context", "fp-old-target", top=100, sender_name="target user")
+    other = message("other context", "fp-other", top=150, sender_name="other user")
+    bot = message("bot context", "fp-bot", top=200, sender_name="bot user")
+
+    class SocialState:
+        def ensure_contact(self, **kwargs):
+            pass
+
+    class Agent:
+        social_state = SocialState()
+
+    class QQ:
+        def read_scrollback_context(self, *, pages=3):
+            return QQReadResult(
+                active_group_name="target group",
+                expected_group_name="target group",
+                target_sender_name="target user",
+                bot_sender_name="bot user",
+                group_matched=True,
+                visible_items=[],
+                chat_messages=[old, other, bot],
+                target_messages=[old],
+            )
+
+    loop.agent = Agent()
+    loop.qq = QQ()
+
+    result = asyncio.run(loop._mark_startup_baseline())
+
+    assert result["reason"] == "startup_scrollback_marked"
+    assert result["marked_count"] == 2
+    assert loop._message_seen("target user", "old target context", "fp-old-target")
+    assert loop._message_seen("other user", "other context", "fp-other")
+    assert len(loop._pending_messages) == 0
+    events = [event for event in store.recent_events() if event.kind == "group_message"]
+    assert [event.content for event in events] == ["old target context", "other context"]
+    assert {event.metadata["agent_reason"] for event in events} == {"startup_scrollback_context"}
 
 
 def test_processor_handles_queued_messages_in_fifo_order():
@@ -825,6 +938,56 @@ def test_final_reply_can_fallback_to_unquoted_when_quote_target_is_missing():
     assert result["verification"]["quote_fallback"] == "unquoted_after_missing_quote_target"
 
 
+def test_final_reply_can_fallback_to_unquoted_when_quote_send_fails():
+    import asyncio
+
+    loop = build_loop()
+    calls = []
+    target = message("please check", "fp-target", top=140, sender_name="target user")
+
+    class QuoteFailure:
+        def to_dict(self):
+            return {"sent": False, "reason": "quote_failed", "verification": {"reason": "quote_menu_item_not_found"}}
+
+    class Success:
+        def to_dict(self):
+            return {"sent": True, "reason": "sent", "verification": {}}
+
+    class QQ:
+        def read_visible_context(self, *, passive=False):
+            return QQReadResult(
+                active_group_name="target group",
+                expected_group_name="target group",
+                target_sender_name="target user",
+                bot_sender_name="bot user",
+                group_matched=True,
+                visible_items=[],
+                chat_messages=[target],
+                target_messages=[target],
+            )
+
+        def send_text(self, text, *, reply_to=None):
+            calls.append({"text": text, "reply_to": reply_to})
+            return QuoteFailure() if reply_to is not None else Success()
+
+    loop.qq = QQ()
+
+    result = asyncio.run(
+        loop._send_quoted_text(
+            message=target,
+            text="reply",
+            stage="final_reply",
+            allow_unquoted_fallback=True,
+        )
+    )
+
+    assert result["sent"]
+    assert calls == [{"text": "reply", "reply_to": target}, {"text": "reply", "reply_to": None}]
+    assert result["verification"]["mode"] == "quote_fallback_unquoted"
+    assert result["verification"]["quote_fallback"] == "unquoted_after_quote_send_failed"
+    assert result["verification"]["quote_send_result"]["reason"] == "quote_failed"
+
+
 def test_quote_refresh_matches_clean_identity_when_raw_block_changes():
     import asyncio
 
@@ -928,6 +1091,98 @@ def test_agent_loop_filters_visible_messages_from_configured_bot_alias():
 
     assert enqueued == []
     assert loop._message_seen("楠bot", "嗯……在看雨。", "fp-own")
+
+
+def test_agent_loop_blocks_low_value_spontaneous_topics():
+    loop = build_loop()
+
+    low_value = loop._spontaneous_topic_check("今天挺安静的……")
+    useful_question = loop._spontaneous_topic_check("今天有人吃饭了吗？")
+
+    assert not low_value["ok"]
+    assert low_value["reason"] == "low_value_idle_observation"
+    assert useful_question["ok"]
+
+
+def test_agent_loop_merges_plain_quick_messages_from_same_sender():
+    loop = build_loop()
+
+    loop._enqueue_visible_targets([message("A", "fp-a", top=100)], respect_quiet_period=True, now=1000.0)
+    loop._enqueue_visible_targets([message("B", "fp-b", top=140)], respect_quiet_period=True, now=1001.0)
+    ready = loop._flush_ready_turn_groups(now=1008.0)
+
+    assert [item.text for item in ready] == ["A\nB"]
+
+
+def test_agent_loop_does_not_merge_ignore_segment_with_following_message():
+    loop = build_loop()
+
+    enqueued = loop._enqueue_visible_targets([message("A.i", "fp-a", top=100)], respect_quiet_period=True, now=1000.0)
+    loop._enqueue_visible_targets([message("B", "fp-b", top=140)], respect_quiet_period=True, now=1001.0)
+    ready = loop._flush_ready_turn_groups(now=1008.0)
+
+    assert [item.text for item in enqueued] == ["A.i"]
+    assert [item.text for item in ready] == ["B"]
+
+
+def test_agent_loop_cleans_quote_block_before_queueing():
+    loop = build_loop()
+    loop.agent = agent_with_aliases("Tsubashimo Nanato")
+    raw = message(
+        "陳丷\n@Tsubashimo Nanato\n真得掐你脖子了\n哦对了你叫我也会激活她，因为是蒸馏的我自己 .i",
+        "fp-quote-block",
+        top=100,
+    )
+
+    cleaned = loop._clean_visible_message(raw)
+
+    assert cleaned.text == "哦对了你叫我也会激活她，因为是蒸馏的我自己 .i"
+    assert cleaned.references_bot
+    assert cleaned.turn.reason in {"quote_prefix_removed", "noise_removed_latest_line"}
+
+
+def test_manual_force_duplicate_does_not_call_agent_twice(tmp_path):
+    import asyncio
+
+    class AgentResult:
+        action = "reply"
+        reply = "reply"
+        reason = "model"
+        metadata = {}
+
+    class Agent:
+        def __init__(self):
+            self.calls = 0
+
+        async def respond_to_incoming(self, **kwargs):
+            self.calls += 1
+            return AgentResult()
+
+    loop = build_loop(store=SQLiteMemoryStore(tmp_path / "memory.sqlite3"))
+    agent = Agent()
+    loop.agent = agent
+
+    first = asyncio.run(
+        loop.force_reply(
+            sender_name="target user",
+            message_text="hello",
+            event_id=123,
+            send_to_qq=False,
+        )
+    )
+    second = asyncio.run(
+        loop.force_reply(
+            sender_name="target user",
+            message_text="hello",
+            event_id=123,
+            send_to_qq=False,
+        )
+    )
+
+    assert first["action"] == "reply"
+    assert second["reason"] == "manual_force_recent_duplicate"
+    assert second["sent"] is False
+    assert agent.calls == 1
 
 
 def build_loop(

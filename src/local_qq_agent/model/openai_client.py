@@ -55,6 +55,10 @@ class OpenAICompatibleClient:
         *,
         max_tokens: int | None = None,
         operation: str | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        stop: list[str] | None = None,
+        extra_payload: dict[str, Any] | None = None,
     ) -> ModelReply:
         if not messages:
             raise ValueError("messages must not be empty")
@@ -62,11 +66,15 @@ class OpenAICompatibleClient:
         payload = {
             "model": self.config.model,
             "messages": messages,
-            "temperature": self.config.temperature,
-            "top_p": self.config.top_p,
+            "temperature": self.config.temperature if temperature is None else temperature,
+            "top_p": self.config.top_p if top_p is None else top_p,
             "max_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
             "stream": False,
         }
+        if stop:
+            payload["stop"] = stop
+        if extra_payload:
+            payload.update(extra_payload)
 
         started_at = time.perf_counter()
         async with httpx.AsyncClient(timeout=self.config.timeout_seconds) as client:
@@ -83,7 +91,8 @@ class OpenAICompatibleClient:
         if not choices:
             raise RuntimeError("model response did not include choices")
 
-        message = choices[0].get("message", {})
+        choice = choices[0]
+        message = choice.get("message", {})
         content = str(message.get("content", "")).strip()
         if not content:
             raise RuntimeError("model response content was empty")
@@ -99,6 +108,10 @@ class OpenAICompatibleClient:
             latency_seconds=latency,
             usage=usage,
             tokens_per_second=tokens_per_second(usage, latency),
+            metadata={
+                "finish_reason": choice.get("finish_reason"),
+                "response_id": body.get("id"),
+            },
         )
 
     def _headers(self) -> dict[str, str]:
