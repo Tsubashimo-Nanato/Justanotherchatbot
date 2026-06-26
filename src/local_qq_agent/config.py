@@ -289,6 +289,9 @@ class QQConfig:
     turn_quiet_period_seconds: float = 6.0
     scrollback_on_new_messages: bool = True
     scrollback_pages_on_new_messages: int = 2
+    startup_scrollback_on_start: bool = True
+    startup_scrollback_readable_messages: int = 30
+    startup_scrollback_pages_on_start: int = 6
     bot_sender_aliases: tuple[str, ...] = ()
 
     @classmethod
@@ -317,6 +320,9 @@ class QQConfig:
             turn_quiet_period_seconds=optional_float(raw, "turn_quiet_period_seconds", 6.0),
             scrollback_on_new_messages=optional_bool(raw, "scrollback_on_new_messages", True),
             scrollback_pages_on_new_messages=optional_int(raw, "scrollback_pages_on_new_messages", 2),
+            startup_scrollback_on_start=optional_bool(raw, "startup_scrollback_on_start", True),
+            startup_scrollback_readable_messages=optional_int(raw, "startup_scrollback_readable_messages", 30),
+            startup_scrollback_pages_on_start=optional_int(raw, "startup_scrollback_pages_on_start", 6),
             bot_sender_aliases=optional_string_tuple(raw, "bot_sender_aliases"),
         )
 
@@ -408,6 +414,11 @@ class ProviderConfig:
     degrade_at_ratio: float
     per_message_input_token_budget: int
     enforce_input_budget: bool
+    raw_local_max_tokens: int
+    raw_local_temperature: float
+    raw_local_top_p: float
+    raw_local_stop: tuple[str, ...]
+    raw_local_extra_payload: dict[str, Any]
     require_duplicate_soak_for_cloud_loop: bool
     duplicate_soak_passed: bool
 
@@ -435,12 +446,27 @@ class ProviderConfig:
             runtime = {}
         if not isinstance(runtime, dict):
             raise ConfigError("runtime must be a mapping")
+        raw_local = raw.get("raw_local", {})
+        if raw_local is None:
+            raw_local = {}
+        if not isinstance(raw_local, dict):
+            raise ConfigError("raw_local must be a mapping")
+        raw_local_stop = raw_local.get("stop", [])
+        if raw_local_stop is None:
+            raw_local_stop = []
+        if not isinstance(raw_local_stop, list) or not all(isinstance(item, str) for item in raw_local_stop):
+            raise ConfigError("raw_local.stop must be a list of strings")
+        raw_local_extra = raw_local.get("extra_payload", {})
+        if raw_local_extra is None:
+            raw_local_extra = {}
+        if not isinstance(raw_local_extra, dict):
+            raise ConfigError("raw_local.extra_payload must be a mapping")
         safety = raw.get("safety", {})
         if not isinstance(safety, dict):
             raise ConfigError("safety must be a mapping")
 
         provider = str(raw.get("active_provider", "unloaded")).strip().casefold()
-        if provider not in {"unloaded", "local", "grok", "hybrid", "grok_responses", "hybrid_responses"}:
+        if provider not in {"unloaded", "local", "local_raw", "qwen", "grok", "hybrid", "grok_responses", "hybrid_responses"}:
             raise ConfigError(f"unsupported provider: {provider}")
         reasoning_choices = {"none", "low", "medium", "high"}
 
@@ -472,6 +498,11 @@ class ProviderConfig:
             degrade_at_ratio=min(max(optional_float(budget, "degrade_at_ratio", 0.8), 0.0), 1.0),
             per_message_input_token_budget=optional_int(runtime, "per_message_input_token_budget", 12000),
             enforce_input_budget=optional_bool(runtime, "enforce_input_budget", True),
+            raw_local_max_tokens=optional_int(raw_local, "max_tokens", 512),
+            raw_local_temperature=float(raw_local.get("temperature", 0.7)),
+            raw_local_top_p=float(raw_local.get("top_p", 0.9)),
+            raw_local_stop=tuple(item for item in raw_local_stop if item),
+            raw_local_extra_payload=dict(raw_local_extra),
             require_duplicate_soak_for_cloud_loop=optional_bool(
                 safety,
                 "require_duplicate_soak_for_cloud_loop",

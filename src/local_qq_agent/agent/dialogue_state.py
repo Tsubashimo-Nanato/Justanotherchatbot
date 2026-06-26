@@ -25,7 +25,7 @@ class DialogueState:
 
 
 class DialogueStateTracker:
-    def __init__(self, store: SQLiteMemoryStore, *, recent_event_limit: int = 80) -> None:
+    def __init__(self, store: SQLiteMemoryStore, *, recent_event_limit: int = 300) -> None:
         self.store = store
         self.recent_event_limit = max(8, recent_event_limit)
 
@@ -71,13 +71,35 @@ class DialogueStateTracker:
     def _recent_agent_replies(self, events: list[EventRecord]) -> list[str]:
         replies: list[str] = []
         for event in events:
-            if event.kind not in {"assistant_reply", "assistant_blocked"}:
-                continue
-            text = event.content.strip()
+            text = self._agent_reply_text(event)
             if not text or text.startswith("Command resolved:"):
+                continue
+            if replies and replies[-1] == text:
                 continue
             replies.append(text)
         return replies[-4:]
+
+    def _agent_reply_text(self, event: EventRecord) -> str:
+        if event.kind in {"assistant_reply", "assistant_blocked"}:
+            return event.content.strip()
+        if event.kind != "loop_decision":
+            return ""
+
+        reply = event.metadata.get("agent_reply")
+        if isinstance(reply, str) and reply.strip():
+            return reply.strip()
+
+        result = event.metadata.get("result")
+        if isinstance(result, dict):
+            reply = result.get("reply")
+            if isinstance(reply, str) and reply.strip():
+                return reply.strip()
+            metadata = result.get("metadata")
+            if isinstance(metadata, dict):
+                cleaned = metadata.get("cleaned_reply")
+                if isinstance(cleaned, str) and cleaned.strip():
+                    return cleaned.strip()
+        return ""
 
     def _recent_user_turns(self, events: list[EventRecord], *, user_name: str) -> list[str]:
         turns: list[str] = []
@@ -121,6 +143,10 @@ class DialogueStateTracker:
             "回答",
             "说清楚",
             "解释",
+            "啥",
+            "啥意思",
+            "什么意思",
+            "懂啥",
         )
         return any(marker in text for marker in interrogatives)
 

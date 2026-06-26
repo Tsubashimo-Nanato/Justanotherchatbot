@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from local_qq_agent.agent.interaction import InteractionPolicy
 from local_qq_agent.agent.quality import QualityGate
 
@@ -101,6 +103,54 @@ def test_quality_gate_rewrites_empty_ack_when_hook_is_expected():
     assert review.send_allowed
     assert review.rewrite_needed
     assert "dead_end_without_hook" in review.rule_hits
+
+
+def test_quality_gate_rewrites_contentless_agreement_when_hook_is_expected():
+    plan = InteractionPolicy().plan(
+        message="是啊是啊",
+        social_snapshot={"affinity": 1.0},
+        gate_metadata={"attention": "followup"},
+        dialogue_state=None,
+        direct_address=False,
+        reply_to_bot=True,
+    )
+
+    review = QualityGate().review_rules(
+        message="是啊是啊",
+        reply="嗯……是啊。",
+        interaction_plan=plan,
+    )
+
+    assert review.send_allowed
+    assert review.rewrite_needed
+    assert "contentless_marker" in review.rule_hits or "dead_end_without_hook" in review.rule_hits
+
+
+def test_quality_gate_rewrites_followup_that_ignores_previous_bot_reply():
+    plan = InteractionPolicy().plan(
+        message="懂啥",
+        social_snapshot={"affinity": 1.0},
+        gate_metadata={"attention": "followup"},
+        dialogue_state=None,
+        direct_address=False,
+        reply_to_bot=True,
+    )
+    dialogue_state = SimpleNamespace(
+        obligation="repair_required",
+        metadata={"question_or_clarification": True},
+    )
+
+    review = QualityGate().review_rules(
+        message="懂啥",
+        reply="……？怎么突然打人",
+        interaction_plan=plan,
+        recent_agent_replies=("……？那你现在懂了没",),
+        dialogue_state=dialogue_state,
+    )
+
+    assert review.send_allowed
+    assert review.rewrite_needed
+    assert "unanswered_followup" in review.rule_hits
 
 
 def test_quality_gate_keeps_concrete_short_answer():

@@ -79,13 +79,13 @@ class ProviderRuntime:
             traces=self.traces,
             usage=self.usage,
         )
-        if self.config.active_provider == "local":
+        if self.config.active_provider in {"local", "local_raw", "qwen"}:
             return ProviderClientBundle(
                 primary=local_client,
                 gate=local_client,
                 final=local_client,
                 utility=local_client,
-                mode="local",
+                mode=self.config.active_provider,
             )
         if self.config.active_provider in {"grok", "grok_responses"}:
             return ProviderClientBundle(
@@ -132,7 +132,7 @@ class ProviderRuntime:
 
     def switch_provider(self, provider: str) -> dict[str, Any]:
         provider = provider.strip().casefold()
-        if provider not in {"unloaded", "local", "grok", "hybrid", "grok_responses", "hybrid_responses"}:
+        if provider not in {"unloaded", "local", "local_raw", "qwen", "grok", "hybrid", "grok_responses", "hybrid_responses"}:
             raise ValueError(f"unsupported provider: {provider}")
         data = _read_provider_yaml()
         data["active_provider"] = provider
@@ -234,7 +234,7 @@ class ProviderRuntime:
         usage = self.usage.snapshot()
         return {
             "active_provider": self.config.active_provider,
-            "providers": ["unloaded", "local", "grok", "hybrid", "grok_responses", "hybrid_responses"],
+            "providers": ["unloaded", "local_raw", "qwen", "hybrid", "local", "grok", "grok_responses", "hybrid_responses"],
             "routing": self._routing_status(),
             "grok": {
                 "model": self.config.grok_model,
@@ -261,6 +261,7 @@ class ProviderRuntime:
                 "enforce_input_budget": self.config.enforce_input_budget,
                 "daily_usage_is_telemetry_only": True,
             },
+            "raw_local": self.raw_local_options(),
             "safety": {
                 "require_duplicate_soak_for_cloud_loop": self.config.require_duplicate_soak_for_cloud_loop,
                 "duplicate_soak_passed": self.config.duplicate_soak_passed,
@@ -270,13 +271,35 @@ class ProviderRuntime:
             "config": asdict(self.config),
         }
 
+    def raw_local_enabled(self) -> bool:
+        return self.config.active_provider == "local_raw"
+
+    def qwen_first_enabled(self) -> bool:
+        return self.config.active_provider == "qwen"
+
+    def raw_local_options(self) -> dict[str, Any]:
+        return {
+            "enabled": self.raw_local_enabled(),
+            "max_tokens": self.config.raw_local_max_tokens,
+            "temperature": self.config.raw_local_temperature,
+            "top_p": self.config.raw_local_top_p,
+            "stop": list(self.config.raw_local_stop),
+            "extra_payload": dict(self.config.raw_local_extra_payload),
+            "instructions": "none",
+            "context": "single user message only",
+        }
+
     def _routing_status(self) -> dict[str, str]:
         if self.config.active_provider in {"hybrid", "hybrid_responses"}:
             return {"gate": "local", "final": "grok", "utility": "local"}
         if self.config.active_provider in {"grok", "grok_responses"}:
             return {"gate": "grok", "final": "grok", "utility": "grok"}
+        if self.config.active_provider == "local_raw":
+            return {"gate": "disabled", "final": "legacy_raw_qwen", "utility": "qwen"}
+        if self.config.active_provider == "qwen":
+            return {"gate": "qwen_first", "final": "qwen", "utility": "qwen"}
         if self.config.active_provider == "local":
-            return {"gate": "local", "final": "local", "utility": "local"}
+            return {"gate": "legacy_local", "final": "legacy_local", "utility": "local"}
         return {"gate": "unloaded", "final": "unloaded", "utility": "unloaded"}
 
 

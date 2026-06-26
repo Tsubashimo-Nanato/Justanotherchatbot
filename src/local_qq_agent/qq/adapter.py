@@ -69,13 +69,12 @@ class QQReadResult:
 class QQWindowAdapter:
     def __init__(self, config: QQConfig) -> None:
         self.config = config
-        self.armed = False
 
     def status(self) -> QQStatus:
         if platform.system() != "Windows":
             return QQStatus(
                 available=False,
-                armed=self.armed,
+                armed=False,
                 dry_run=self.config.dry_run,
                 window_title_regex=self.config.window_title_regex,
                 expected_group_name=self.config.expected_group_name,
@@ -91,7 +90,7 @@ class QQWindowAdapter:
         except Exception as error:
             return QQStatus(
                 available=False,
-                armed=self.armed,
+                armed=False,
                 dry_run=self.config.dry_run,
                 window_title_regex=self.config.window_title_regex,
                 expected_group_name=self.config.expected_group_name,
@@ -107,7 +106,7 @@ class QQWindowAdapter:
         group_matched = self._group_matches(active_group_name)
         return QQStatus(
             available=True,
-            armed=self.armed,
+            armed=True,
             dry_run=self.config.dry_run,
             window_title_regex=self.config.window_title_regex,
             expected_group_name=self.config.expected_group_name,
@@ -119,11 +118,9 @@ class QQWindowAdapter:
         )
 
     def arm(self) -> QQStatus:
-        self.armed = True
         return self.status()
 
     def disarm(self) -> QQStatus:
-        self.armed = False
         return self.status()
 
     def focus_window(self, *, maximize: bool = False) -> dict[str, Any]:
@@ -204,13 +201,14 @@ class QQWindowAdapter:
         if not text:
             raise ValueError("QQ message text must not be empty")
 
-        if self.config.send_requires_armed and not self.armed:
+        status = self.status()
+        if self.config.send_requires_armed and not status.armed:
             return QQSendResult(
                 sent=False,
                 dry_run=self.config.dry_run,
-                reason="not_armed",
+                reason="qq_window_unavailable",
                 text=text,
-                verification={},
+                verification={"qq": status.to_dict()},
                 duration_seconds=round(time.perf_counter() - started_at, 3),
             )
 
@@ -221,6 +219,26 @@ class QQWindowAdapter:
                 reason="dry_run",
                 text=text,
                 verification={"note": "QQ send was not executed because config/qq.yaml dry_run is true."},
+                duration_seconds=round(time.perf_counter() - started_at, 3),
+            )
+
+        if self.config.send_requires_armed and not self.config.expected_group_name.strip():
+            return QQSendResult(
+                sent=False,
+                dry_run=self.config.dry_run,
+                reason="expected_group_missing",
+                text=text,
+                verification=status.to_dict(),
+                duration_seconds=round(time.perf_counter() - started_at, 3),
+            )
+
+        if self.config.send_requires_armed and not status.group_matched:
+            return QQSendResult(
+                sent=False,
+                dry_run=self.config.dry_run,
+                reason="wrong_group",
+                text=text,
+                verification=status.to_dict(),
                 duration_seconds=round(time.perf_counter() - started_at, 3),
             )
 

@@ -97,7 +97,6 @@ class SocialStateTracker:
 
         existing = self.user_profile(user_name)
         if existing.affinity_source != "default":
-            self._record_seen(user_name, source=source, created=False)
             return self.snapshot(user_name)
 
         affinity = self._clamp(initial_affinity)

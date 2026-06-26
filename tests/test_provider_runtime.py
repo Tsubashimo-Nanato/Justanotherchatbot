@@ -33,11 +33,51 @@ def test_provider_config_runtime_input_budget_loaded():
 
     config = ProviderConfig.load()
 
-    assert config.active_provider in {"unloaded", "local", "grok", "hybrid", "grok_responses", "hybrid_responses"}
+    assert config.active_provider in {
+        "unloaded",
+        "local",
+        "local_raw",
+        "qwen",
+        "grok",
+        "hybrid",
+        "grok_responses",
+        "hybrid_responses",
+    }
     assert config.per_message_input_token_budget >= 4000
     assert config.enforce_input_budget is True
     assert config.grok_reasoning_simple_chat == "none"
     assert config.grok_reasoning_final_reply in {"low", "medium", "high"}
+
+
+def test_provider_config_loads_raw_local_options(tmp_path):
+    from local_qq_agent.config import ProviderConfig
+
+    path = tmp_path / "provider.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "active_provider: local_raw",
+                "raw_local:",
+                "  max_tokens: 777",
+                "  temperature: 0.55",
+                "  top_p: 0.88",
+                "  stop:",
+                "    - '<|end|>'",
+                "  extra_payload:",
+                "    repeat_penalty: 1.05",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = ProviderConfig.load(path)
+
+    assert config.active_provider == "local_raw"
+    assert config.raw_local_max_tokens == 777
+    assert config.raw_local_temperature == 0.55
+    assert config.raw_local_top_p == 0.88
+    assert config.raw_local_stop == ("<|end|>",)
+    assert config.raw_local_extra_payload == {"repeat_penalty": 1.05}
     assert config.grok_reasoning_web_fact in {"medium", "high"}
     assert config.grok_cache_enabled is True
 

@@ -60,6 +60,7 @@ def test_contact_initialization_sets_default_affinity_once(tmp_path):
     assert first.source == "target_contact_seed"
     assert second.affinity == 1.0
     assert second.source == "target_contact_seed"
+    assert [event.kind for event in store.recent_events()].count("user_profile_seen") == 1
 
 
 def test_context_builder_includes_social_state_lines(tmp_path):

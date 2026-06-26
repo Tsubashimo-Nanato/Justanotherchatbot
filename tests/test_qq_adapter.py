@@ -19,6 +19,11 @@ class GuardedQQWindowAdapter(QQWindowAdapter):
         return self._test_active_group_name
 
 
+class MissingWindowQQWindowAdapter(QQWindowAdapter):
+    def _find_window(self):
+        raise RuntimeError("QQ window not found")
+
+
 class TitleWindow:
     def __init__(self, title, *, visible=True, minimized=False):
         self._title = title
@@ -78,7 +83,7 @@ class PassiveReadAdapter(QQWindowAdapter):
 
 
 def test_qq_send_is_blocked_when_not_armed():
-    adapter = QQWindowAdapter(
+    adapter = MissingWindowQQWindowAdapter(
         QQConfig(
             window_title_regex="QQ",
             expected_group_name="",
@@ -98,7 +103,7 @@ def test_qq_send_is_blocked_when_not_armed():
     result = adapter.send_text("hello")
 
     assert not result.sent
-    assert result.reason == "not_armed"
+    assert result.reason == "qq_window_unavailable"
 
 
 def test_qq_send_dry_run_after_arm():

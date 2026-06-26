@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 import hashlib
 import re
@@ -11,6 +11,7 @@ from typing import Any, Callable
 import unicodedata
 
 from local_qq_agent.agent import LocalAgent
+from local_qq_agent.agent.commands import parse_message_commands
 from local_qq_agent.agent.engagement import stable_roll
 from local_qq_agent.agent.run_log import export_clean_run_log
 from local_qq_agent.agent.turns import CleanTurn, clean_turn_text
@@ -176,11 +177,15 @@ class AgentLoop:
         self._processor_wakeup = asyncio.Event()
         self._stop_requested = False
         self._context_fingerprints: set[str] = set()
+        self._context_turn_ids: set[str] = set()
         self._pending_messages: deque[CleanedQQMessage] = deque()
         self._pending_turn_groups: dict[str, PendingTurnGroup] = {}
         self._turn_ledger = TurnLedger(ttl_seconds=config.duplicate_suppression_seconds)
         self._active_message: dict[str, Any] | None = None
         self._sent_texts: list[str] = []
+        self._manual_force_lock = asyncio.Lock()
+        self._manual_force_inflight: set[str] = set()
+        self._manual_force_recent: dict[str, tuple[float, dict[str, Any]]] = {}
         self._decisions: list[LoopDecision] = []
         self._next_read_allowed_at = 0.0
         self._idle_read_ticks = 0
@@ -196,6 +201,13 @@ class AgentLoop:
         self._session_start_event_id: int | None = None
         self._inactive_instance_recorded = False
         self._hydrate_processed_messages()
+
+    def remember_sent_text(self, text: str) -> None:
+        outgoing = text.strip()
+        if not outgoing:
+            return
+        self._sent_texts.append(outgoing)
+        self._sent_texts = self._sent_texts[-20:]
 
     def status(self) -> dict[str, Any]:
         task_done = self._task.done() if self._task else True
@@ -216,6 +228,9 @@ class AgentLoop:
             "turn_quiet_period_seconds": self.config.turn_quiet_period_seconds,
             "scrollback_on_new_messages": self.config.scrollback_on_new_messages,
             "scrollback_pages_on_new_messages": self.config.scrollback_pages_on_new_messages,
+            "startup_scrollback_on_start": self.config.startup_scrollback_on_start,
+            "startup_scrollback_readable_messages": self.config.startup_scrollback_readable_messages,
+            "startup_scrollback_pages_on_start": self.config.startup_scrollback_pages_on_start,
             "max_messages_per_tick": self.config.max_messages_per_tick,
             "ignore_existing_on_start": self.config.ignore_existing_on_start,
             "target_sender_name": self.config.target_sender_name,
@@ -304,8 +319,8 @@ class AgentLoop:
         self._record_read_activity(True)
         baseline: dict[str, Any] | None = None
         if self.config.ignore_existing_on_start:
-            self._set_activity(stage="baseline_reading", detail="Marking visible target messages as history.")
-            baseline = await self._mark_visible_baseline()
+            self._set_activity(stage="baseline_reading", detail="Collecting startup scrollback context.")
+            baseline = await self._mark_startup_baseline()
             self._set_activity(
                 stage="baseline_marked",
                 detail="Startup baseline finished.",
@@ -665,7 +680,8 @@ class AgentLoop:
         sent = False
         send_reason = "not_sent"
         send_result: dict[str, Any] | None = None
-        if result.action == "reply" and result.reply:
+        topic_check = self._spontaneous_topic_check(result.reply)
+        if result.action == "reply" and result.reply and topic_check["ok"]:
             async with self._qq_io_lock:
                 send_result = await self._send_unquoted_text_unlocked(
                     text=result.reply,
@@ -693,7 +709,12 @@ class AgentLoop:
             sent=sent,
             send_reason=send_reason,
             elapsed_seconds=round(time.perf_counter() - started_at, 3),
-            metadata={**result.metadata, "send_result": send_result, "spontaneous": self._spontaneous_status},
+            metadata={
+                **result.metadata,
+                "send_result": send_result,
+                "spontaneous": self._spontaneous_status,
+                "spontaneous_topic_check": topic_check,
+            },
         )
         self._remember_decision(decision)
         self._set_activity(
@@ -933,6 +954,7 @@ class AgentLoop:
             record_incoming_event=False,
             turn_identity=message.identity,
         )
+        result = self._with_loop_command_feedback(result)
         elapsed = time.perf_counter() - started_at
         self._set_activity(
             stage="model_done" if result.used_model else "agent_decided",
@@ -1074,6 +1096,21 @@ class AgentLoop:
                 self._stop_requested = True
                 self._processor_wakeup.set()
                 result.metadata["loop_stop_requested_after_feedback"] = True
+        elif self._should_send_debug_no_reply_notice(message, result):
+            notice = self._debug_no_reply_notice(result)
+            send_result = await self._send_quoted_text(
+                message=message,
+                text=notice,
+                stage="debug_no_reply_reason",
+                allow_unquoted_fallback=True,
+            )
+            sent = bool(send_result.get("sent"))
+            send_reason = str(send_result.get("reason", "unknown"))
+            if sent:
+                self._sent_texts.append(notice)
+                self._sent_texts = self._sent_texts[-20:]
+                self._last_bot_message_at = time.time()
+            result.metadata["debug_no_reply_notice"] = notice
 
         decision = LoopDecision(
             created_at=time.time(),
@@ -1141,7 +1178,8 @@ class AgentLoop:
         sent = False
         send_reason = "not_sent"
         send_result: dict[str, Any] | None = None
-        if topic_result.action == "reply" and topic_result.reply:
+        topic_check = self._spontaneous_topic_check(topic_result.reply)
+        if topic_result.action == "reply" and topic_result.reply and topic_check["ok"]:
             async with self._qq_io_lock:
                 send_result = await self._send_unquoted_text_unlocked(
                     text=topic_result.reply,
@@ -1159,6 +1197,7 @@ class AgentLoop:
             **result.metadata,
             "command_result": result.to_dict(),
             "spontaneous_result": topic_result.to_dict(),
+            "spontaneous_topic_check": topic_check,
             "send_result": send_result,
             "message_identity": message.identity,
             "source_fingerprint": message.fingerprint,
@@ -1187,6 +1226,45 @@ class AgentLoop:
         )
         return decision
 
+    def _spontaneous_topic_check(self, reply: str) -> dict[str, Any]:
+        text = reply.strip()
+        key = self._spontaneous_semantic_key(text)
+        has_question = "?" in text or "？" in text
+        has_clause = bool(re.search(r"[,，、。]\s*\S", text))
+
+        if not text:
+            return {"ok": False, "reason": "empty_spontaneous_reply"}
+        if self._looks_like_idle_weather_report(key, text) and not has_question and not has_clause:
+            return {"ok": False, "reason": "low_value_idle_observation", "semantic_length": len(key)}
+        if len(key) < 8 and not has_question:
+            return {"ok": False, "reason": "too_short_for_spontaneous_topic", "semantic_length": len(key)}
+        return {"ok": True, "reason": "topic_has_value", "semantic_length": len(key)}
+
+    def _spontaneous_semantic_key(self, text: str) -> str:
+        normalized = unicodedata.normalize("NFKC", text.casefold())
+        return "".join(char for char in normalized if char.isalnum() or "\u4e00" <= char <= "\u9fff")
+
+    def _looks_like_idle_weather_report(self, key: str, text: str) -> bool:
+        low_value_keys = {
+            "\u4eca\u5929\u633a\u5b89\u9759\u7684",
+            "\u4eca\u5929\u590f\u81f3\u554a",
+            "\u4eca\u5929\u7236\u4eb2\u8282\u554a",
+        }
+        if key in low_value_keys:
+            return True
+        if key.startswith("\u4eca\u5929") and len(key) <= 8:
+            return True
+        if re.fullmatch(
+            r"[\.\u3002\u2026\s]*(\u4eca\u5929|\u73b0\u5728|\u7fa4\u91cc).*(\u5b89\u9759|\u6ca1\u4eba|\u590f\u81f3|\u7236\u4eb2\u8282)[\.\u3002\u2026\s]*",
+            text,
+        ):
+            return True
+        if key in {"今天挺安静的", "今天夏至啊", "今天父亲节啊"}:
+            return True
+        if key.startswith("今天") and len(key) <= 8:
+            return True
+        return bool(re.fullmatch(r"[.。…\s]*(今天|现在|群里).*(安静|没人|夏至|父亲节)[.。…\s]*", text))
+
     async def force_reply(
         self,
         *,
@@ -1202,6 +1280,15 @@ class AgentLoop:
         if not message_text:
             raise ValueError("message_text must not be empty")
 
+        force_key = self._manual_force_key(
+            sender_name=sender_name,
+            message_text=message_text,
+            event_id=event_id,
+        )
+        duplicate = await self._begin_manual_force(force_key)
+        if duplicate is not None:
+            return duplicate
+
         self._set_activity(
             stage="manual_force_running",
             detail="Manual force reply is running.",
@@ -1209,73 +1296,119 @@ class AgentLoop:
             message_text=message_text,
             metadata={"event_id": event_id, "send_to_qq": send_to_qq},
         )
-        turn_identity = f"manual-force|{event_id or self._message_identity(sender_name, message_text)}"
-        result = await self.agent.respond_to_incoming(
-            user_name=sender_name,
-            message=f"{message_text} .enforce .think 3",
-            external_context=extra_instruction.strip(),
-            reply_to_bot=True,
-            record_incoming_event=False,
-            turn_identity=turn_identity,
-        )
+        try:
+            turn_identity = f"manual-force|{event_id or self._message_identity(sender_name, message_text)}"
+            result = await self.agent.respond_to_incoming(
+                user_name=sender_name,
+                message=f"{message_text} .enforce .think 3",
+                external_context=extra_instruction.strip(),
+                reply_to_bot=True,
+                record_incoming_event=False,
+                turn_identity=turn_identity,
+            )
 
-        sent = False
-        send_reason = "not_requested" if not send_to_qq else "not_sent"
-        send_result: dict[str, Any] | None = None
-        if send_to_qq and result.action == "reply" and result.reply:
-            send_preflight = self._send_preflight()
-            if not send_preflight["ok"]:
-                send_reason = str(send_preflight.get("reason", "send_blocked"))
-                send_result = send_preflight
-            else:
-                target = await self._visible_quote_target_for(sender_name=sender_name, message_text=message_text)
-                if target is not None:
-                    send_result = await self._send_quoted_text(
-                        message=target,
-                        text=result.reply,
-                        stage="manual_force_reply",
-                        allow_unquoted_fallback=True,
-                    )
+            sent = False
+            send_reason = "not_requested" if not send_to_qq else "not_sent"
+            send_result: dict[str, Any] | None = None
+            if send_to_qq and result.action == "reply" and result.reply:
+                send_preflight = self._send_preflight()
+                if not send_preflight["ok"]:
+                    send_reason = str(send_preflight.get("reason", "send_blocked"))
+                    send_result = send_preflight
                 else:
-                    async with self._qq_io_lock:
-                        send_result = await self._send_unquoted_text_unlocked(
+                    target = await self._visible_quote_target_for(sender_name=sender_name, message_text=message_text)
+                    if target is not None:
+                        send_result = await self._send_quoted_text(
+                            message=target,
                             text=result.reply,
                             stage="manual_force_reply",
-                            mode="manual_unquoted_no_visible_quote",
+                            allow_unquoted_fallback=True,
                         )
-                sent = bool(send_result.get("sent"))
-                send_reason = str(send_result.get("reason", "unknown"))
-                if sent:
-                    self._sent_texts.append(result.reply)
-                    self._sent_texts = self._sent_texts[-20:]
-                    self._last_bot_message_at = time.time()
+                    else:
+                        async with self._qq_io_lock:
+                            send_result = await self._send_unquoted_text_unlocked(
+                                text=result.reply,
+                                stage="manual_force_reply",
+                                mode="manual_unquoted_no_visible_quote",
+                            )
+                    sent = bool(send_result.get("sent"))
+                    send_reason = str(send_result.get("reason", "unknown"))
+                    if sent:
+                        self.remember_sent_text(result.reply)
+                        self._last_bot_message_at = time.time()
 
-        decision = LoopDecision(
-            created_at=time.time(),
-            message_text=message_text,
-            sender_name=sender_name,
-            action=result.action,
-            reason=f"manual_force_{result.reason}",
-            sent=sent,
-            send_reason=send_reason,
-            elapsed_seconds=round(time.perf_counter() - started_at, 3),
-            metadata={
-                **result.metadata,
-                "agent_reply": result.reply,
-                "manual_force": True,
-                "manual_event_id": event_id,
-                "send_result": send_result,
-            },
-        )
-        self._remember_decision(decision)
-        self._set_activity(
-            stage="manual_force_sent" if sent else "manual_force_done",
-            detail="Manual force reply finished.",
-            sender_name=sender_name,
-            message_text=message_text,
-            metadata=asdict(decision),
-        )
-        return self._decision_status(decision)
+            decision = LoopDecision(
+                created_at=time.time(),
+                message_text=message_text,
+                sender_name=sender_name,
+                action=result.action,
+                reason=f"manual_force_{result.reason}",
+                sent=sent,
+                send_reason=send_reason,
+                elapsed_seconds=round(time.perf_counter() - started_at, 3),
+                metadata={
+                    **result.metadata,
+                    "agent_reply": result.reply,
+                    "manual_force": True,
+                    "manual_event_id": event_id,
+                    "manual_force_key": force_key,
+                    "send_result": send_result,
+                },
+            )
+            self._remember_decision(decision)
+            self._set_activity(
+                stage="manual_force_sent" if sent else "manual_force_done",
+                detail="Manual force reply finished.",
+                sender_name=sender_name,
+                message_text=message_text,
+                metadata=asdict(decision),
+            )
+            status = self._decision_status(decision)
+            await self._finish_manual_force(force_key, status)
+            return status
+        except Exception:
+            await self._finish_manual_force(force_key, None)
+            raise
+
+    def _manual_force_key(self, *, sender_name: str, message_text: str, event_id: int | None) -> str:
+        if event_id is not None:
+            return f"event:{event_id}"
+        return self._message_identity(sender_name, message_text)
+
+    async def _begin_manual_force(self, force_key: str) -> dict[str, Any] | None:
+        async with self._manual_force_lock:
+            self._prune_manual_force_recent()
+            if force_key in self._manual_force_inflight:
+                return {
+                    "state": "ignored",
+                    "operation": "manual_force_reply",
+                    "reason": "manual_force_already_inflight",
+                    "manual_force_key": force_key,
+                    "sent": False,
+                }
+            recent = self._manual_force_recent.get(force_key)
+            if recent is not None:
+                cached = dict(recent[1])
+                cached["duplicate"] = True
+                cached["reason"] = "manual_force_recent_duplicate"
+                cached["sent"] = False
+                cached["send_reason"] = "duplicate_suppressed"
+                return cached
+            self._manual_force_inflight.add(force_key)
+            return None
+
+    async def _finish_manual_force(self, force_key: str, status: dict[str, Any] | None) -> None:
+        async with self._manual_force_lock:
+            self._manual_force_inflight.discard(force_key)
+            if status is not None:
+                self._manual_force_recent[force_key] = (time.time(), dict(status))
+            self._prune_manual_force_recent()
+
+    def _prune_manual_force_recent(self) -> None:
+        cutoff = time.time() - min(max(self.config.duplicate_suppression_seconds, 30.0), 300.0)
+        stale = [key for key, (created_at, _) in self._manual_force_recent.items() if created_at < cutoff]
+        for key in stale:
+            self._manual_force_recent.pop(key, None)
 
     async def _visible_quote_target_for(self, *, sender_name: str, message_text: str) -> CleanedQQMessage | None:
         expected_identity = self._message_identity(sender_name, message_text)
@@ -1454,6 +1587,90 @@ class AgentLoop:
         )
         return schedule
 
+    async def _mark_startup_baseline(self) -> dict[str, Any]:
+        if not self.config.startup_scrollback_on_start:
+            return await self._mark_visible_baseline()
+
+        started_at = time.perf_counter()
+        pages = max(1, min(self.config.startup_scrollback_pages_on_start, 8))
+        limit = max(1, self.config.startup_scrollback_readable_messages)
+        try:
+            async with self._qq_io_lock:
+                read_result = await asyncio.wait_for(
+                    asyncio.to_thread(self.qq.read_scrollback_context, pages=pages),
+                    timeout=max(self.config.read_timeout_seconds, 1.0) * pages,
+                )
+        except Exception as error:
+            fallback = await self._mark_visible_baseline()
+            return {
+                **fallback,
+                "startup_scrollback": {
+                    "ok": False,
+                    "reason": "scrollback_failed",
+                    "error": str(error),
+                    "fallback": fallback.get("reason"),
+                },
+            }
+
+        if not read_result.group_matched:
+            return {
+                "ok": False,
+                "reason": "wrong_group",
+                "active_group_name": read_result.active_group_name,
+                "expected_group_name": read_result.expected_group_name,
+            }
+
+        readable = self._startup_readable_context(read_result.chat_messages, limit=limit)
+        self._initialize_visible_contacts(read_result.chat_messages)
+
+        marked = 0
+        stopped_at_seen = False
+        for message in readable:
+            cleaned = self._clean_visible_message(message)
+            if self._message_seen(cleaned.sender_name, cleaned.text, cleaned.fingerprint):
+                stopped_at_seen = True
+                break
+            self._turn_ledger.observe(
+                turn_id=cleaned.identity,
+                sender=cleaned.sender_name,
+                clean_text=cleaned.text,
+                raw_text=cleaned.raw_text,
+                fingerprint=cleaned.fingerprint,
+                references_bot=cleaned.references_bot,
+                metadata={"source": "startup_scrollback_context"},
+            )
+            self._record_context_message(cleaned, agent_reason="startup_scrollback_context")
+            self._remember_seen_message(cleaned.sender_name, cleaned.text, cleaned.fingerprint)
+            marked += 1
+
+        return {
+            "ok": True,
+            "reason": "startup_scrollback_marked",
+            "marked_count": marked,
+            "readable_context_count": len(readable),
+            "visible_message_count": len(read_result.chat_messages),
+            "pages": pages,
+            "stopped_at_seen": stopped_at_seen,
+            "elapsed_seconds": round(time.perf_counter() - started_at, 3),
+            "active_group_name": read_result.active_group_name,
+        }
+
+    def _startup_readable_context(self, messages: list[QQChatMessage], *, limit: int) -> list[QQChatMessage]:
+        readable: list[QQChatMessage] = []
+        for cleaned in reversed(self._cleaned_visible_messages(messages)):
+            if not cleaned.text:
+                continue
+            if self._is_bot_sender(cleaned.sender_name):
+                continue
+            if self._looks_like_own_visible_message(cleaned):
+                continue
+            if self._message_seen(cleaned.sender_name, cleaned.text, cleaned.fingerprint):
+                break
+            readable.append(cleaned.raw)
+            if len(readable) >= limit:
+                break
+        return list(reversed(readable))
+
     async def _mark_visible_baseline(self) -> dict[str, Any]:
         started_at = time.perf_counter()
         try:
@@ -1582,6 +1799,13 @@ class AgentLoop:
             if self._looks_like_own_visible_message(cleaned):
                 self._remember_seen_message(cleaned.sender_name, cleaned.text, cleaned.fingerprint)
                 continue
+            if not self._debug_mode_allows_sender(cleaned.sender_name):
+                self._record_context_message(
+                    cleaned,
+                    agent_reason="debug_mode_target_only",
+                    agent_action="context_only",
+                )
+                continue
 
             if respect_quiet_period and not self._should_enqueue_immediately(cleaned):
                 if self._buffer_visible_target(cleaned, now=current_time):
@@ -1661,6 +1885,9 @@ class AgentLoop:
 
     def _should_enqueue_immediately(self, message: CleanedQQMessage) -> bool:
         text = message.text.strip()
+        parsed = parse_message_commands(text)
+        if parsed.command_suffixes:
+            return True
         if not text.startswith("."):
             return False
         lowered = text.casefold()
@@ -1751,13 +1978,20 @@ class AgentLoop:
 
         status = self.qq.status()
         status_dict = status.to_dict()
-        if status.armed:
+        if status.armed and status.group_matched:
             return {"ok": True, "reason": "send_allowed", "qq": status_dict}
+        if status.armed and not status.group_matched:
+            return {
+                "ok": False,
+                "reason": "wrong_group",
+                "detail": "QQ window is available, but the active group does not match config.",
+                "qq": status_dict,
+            }
 
         return {
             "ok": False,
-            "reason": "qq_not_armed",
-            "detail": "QQ adapter is not armed. No messages were read or consumed.",
+            "reason": "qq_window_unavailable",
+            "detail": "QQ window is not available. No messages were read or consumed.",
             "qq": status_dict,
         }
 
@@ -1798,9 +2032,13 @@ class AgentLoop:
             return
         if self.store is None:
             return
-        if cleaned.fingerprint in self._context_fingerprints:
+        if cleaned.fingerprint in self._context_fingerprints or cleaned.identity in self._context_turn_ids:
+            self._context_fingerprints.add(cleaned.fingerprint)
+            self._context_turn_ids.add(cleaned.identity)
+            self._turn_ledger.add_alias(cleaned.identity, cleaned.fingerprint)
             return
         self._context_fingerprints.add(cleaned.fingerprint)
+        self._context_turn_ids.add(cleaned.identity)
         self._last_non_bot_message_at = time.time()
         if agent_action == "context_only":
             self._turn_ledger.mark_context_only(
@@ -1874,6 +2112,51 @@ class AgentLoop:
         if not additions:
             return reply
         return "\n".join([reply, *additions])
+
+    def _with_loop_command_feedback(self, result):
+        if result.reason != "status_requested":
+            return result
+
+        loop_state = "on" if self.running else "off"
+        processor_state = "on" if self._processor_task is not None and not self._processor_task.done() else "off"
+        status_line = f"- loop: {loop_state} (processor {processor_state}, pending {len(self._pending_messages)})"
+        metadata = {**result.metadata, "loop_runtime_status": self._loop_runtime_status()}
+        return replace(result, reply=f"{result.reply}\n{status_line}", metadata=metadata)
+
+    def _loop_runtime_status(self) -> dict[str, Any]:
+        return {
+            "running": self.running,
+            "processor_running": self._processor_task is not None and not self._processor_task.done(),
+            "pending_message_count": len(self._pending_messages),
+            "aggregating_message_count": len(self._pending_turn_groups),
+            "debug_mode": self._debug_mode(),
+        }
+
+    def _debug_mode(self) -> int:
+        settings = getattr(self.agent, "settings", None)
+        try:
+            return int(getattr(settings, "debug_mode", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _debug_mode_allows_sender(self, sender_name: str) -> bool:
+        if self._debug_mode() != 1:
+            return True
+        return self._same_sender(sender_name, self.config.target_sender_name)
+
+    def _should_send_debug_no_reply_notice(self, message: CleanedQQMessage, result) -> bool:
+        if self._debug_mode() != 1:
+            return False
+        if not self._same_sender(message.sender_name, self.config.target_sender_name):
+            return False
+        if result.action != "no_reply":
+            return False
+        if result.reason in {"ignored_by_command", "empty_message", "empty_or_punctuation_only"}:
+            return False
+        return bool(result.reason)
+
+    def _debug_no_reply_notice(self, result) -> str:
+        return f"不输出：{result.reason}"
 
     def _format_debug_metrics(self, metadata: dict[str, Any], elapsed_seconds: float) -> str:
         tps = metadata.get("tokens_per_second") or {}
@@ -2053,6 +2336,8 @@ class AgentLoop:
             "provider_decision_json",
             "command_resolution_notice",
             "command_resolution",
+            "loop_runtime_status",
+            "debug_no_reply_notice",
         )
         result: dict[str, Any] = {}
         for key in allowed:
@@ -2135,13 +2420,18 @@ class AgentLoop:
             return
 
         for event in events:
-            if event.kind != "loop_decision":
-                continue
             seen_at = self._event_timestamp(event.created_at)
             if seen_at < cutoff:
                 continue
 
             metadata = event.metadata or {}
+            if event.kind == "group_message":
+                self._hydrate_context_event(event, metadata)
+                continue
+
+            if event.kind != "loop_decision":
+                continue
+
             decision_metadata = metadata.get("metadata") if isinstance(metadata.get("metadata"), dict) else {}
             sender_name = str(metadata.get("sender_name", ""))
             message_text = str(metadata.get("message_text", ""))
@@ -2163,6 +2453,31 @@ class AgentLoop:
                 metadata={"source": "recent_loop_decision"},
             )
             self._turn_ledger.mark_completed(identity, metadata={"source": "recent_loop_decision"})
+
+    def _hydrate_context_event(self, event: Any, metadata: dict[str, Any]) -> None:
+        sender_name = str(metadata.get("sender_name") or event.source)
+        message_text = str(metadata.get("clean_text") or event.content)
+        if not sender_name or not message_text:
+            return
+
+        identity = str(metadata.get("clean_identity") or self._message_identity(sender_name, message_text))
+        fingerprint = str(metadata.get("fingerprint") or "")
+        already_closed = self._turn_ledger.is_closed(identity, fingerprint)
+        self._context_turn_ids.add(identity)
+        if fingerprint:
+            self._context_fingerprints.add(fingerprint)
+
+        self._turn_ledger.observe(
+            turn_id=identity,
+            sender=sender_name,
+            clean_text=message_text,
+            raw_text=str(metadata.get("raw_message_text") or event.content),
+            fingerprint=fingerprint,
+            references_bot=bool((metadata.get("turn_cleaning") or {}).get("references_bot")),
+            metadata={"source": "recent_group_message"},
+        )
+        if not already_closed:
+            self._turn_ledger.mark_context_only(identity, metadata={"source": "recent_group_message"})
 
     def _event_timestamp(self, created_at: str) -> float:
         try:
