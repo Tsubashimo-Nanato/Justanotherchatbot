@@ -49,6 +49,7 @@ class ProviderClientBundle:
     gate: Any
     final: Any
     utility: Any
+    fallback: Any | None
     mode: str
 
 
@@ -85,6 +86,7 @@ class ProviderRuntime:
                 gate=local_client,
                 final=local_client,
                 utility=local_client,
+                fallback=grok_client,
                 mode=self.config.active_provider,
             )
         if self.config.active_provider in {"grok", "grok_responses"}:
@@ -93,6 +95,7 @@ class ProviderRuntime:
                 gate=grok_client,
                 final=grok_client,
                 utility=grok_client,
+                fallback=None,
                 mode="grok",
             )
         if self.config.active_provider in {"hybrid", "hybrid_responses"}:
@@ -101,6 +104,7 @@ class ProviderRuntime:
                 gate=local_client,
                 final=grok_client,
                 utility=local_client,
+                fallback=None,
                 mode="hybrid",
             )
         return ProviderClientBundle(
@@ -108,6 +112,7 @@ class ProviderRuntime:
             gate=unloaded,
             final=unloaded,
             utility=unloaded,
+            fallback=None,
             mode="unloaded",
         )
 

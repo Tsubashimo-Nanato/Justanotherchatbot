@@ -145,6 +145,7 @@ class LocalAgent:
         gate_model_client: Any | None = None,
         final_model_client: Any | None = None,
         utility_model_client: Any | None = None,
+        api_fallback_model_client: Any | None = None,
         web_researcher: WebResearcher | None = None,
         math_tool: MathTool | None = None,
         social_state: SocialStateTracker | None = None,
@@ -163,6 +164,7 @@ class LocalAgent:
         self.gate_model_client = gate_model_client or model_client
         self.final_model_client = final_model_client or model_client
         self.utility_model_client = utility_model_client or self.gate_model_client
+        self.api_fallback_model_client = api_fallback_model_client
         self.web_researcher = web_researcher
         self.math_tool = math_tool or MathTool()
         self.social_state = social_state or SocialStateTracker(store)
@@ -1477,12 +1479,31 @@ class LocalAgent:
         reason = final_decision["reason"] if action == "reply" else final_decision["reason"] or "qwen_first_no_reply"
         quality_metadata: dict[str, Any] = {}
         if action == "reply":
-            reply, quality_metadata = await self._quality_checked_reply(
+            reply, quality_metadata, repair_decision, repair_reply = await self._quality_checked_qwen_first_reply(
+                user_name=user_name,
                 message=message,
                 reply=reply,
+                prompt=prompt,
+                built_context=built_context,
+                command_metadata=command_metadata,
+                turn=turn,
                 interaction_plan=interaction_plan,
                 dialogue_state=dialogue_state,
+                social_snapshot=social_snapshot,
+                external_context=external_context,
+                activity=self.settings.activity,
+                tool_result=tool_context["context"],
             )
+            if quality_metadata.get("quality_chain_error"):
+                reason = str(quality_metadata.get("quality_chain_error_reason", "quality_chain_error"))
+            elif repair_decision is not None and repair_reply is not None:
+                final_decision = repair_decision
+                final_reply = repair_reply
+                token_usage = merge_token_usage(
+                    token_usage,
+                    quality_metadata.get("token_usage"),
+                )
+                reason = final_decision["reason"] if reply else "quality_blocked"
             if not reply:
                 action = "no_reply"
                 reason = "quality_blocked"
@@ -1530,15 +1551,11 @@ class LocalAgent:
             "persona_boundary_hit": persona_boundary_hit,
             "social_state": social_snapshot,
             "settings": self.settings.to_dict(),
-            "token_usage": token_usage,
             "stage_timings": self._stage_timings(started_at),
             **quality_metadata,
             **tool_metadata,
         }
-        metadata["token_usage"] = merge_token_usage(
-            metadata.get("token_usage"),
-            quality_metadata.get("token_usage"),
-        )
+        metadata["token_usage"] = token_usage
         self._record_incoming_after_reply(
             user_name,
             message,
@@ -1555,6 +1572,315 @@ class LocalAgent:
             used_model=True,
             blocked=False,
             metadata=metadata,
+        )
+
+    async def _quality_checked_qwen_first_reply(
+        self,
+        *,
+        user_name: str,
+        message: str,
+        reply: str,
+        prompt,
+        built_context,
+        command_metadata: dict[str, Any],
+        turn: CleanTurn,
+        interaction_plan: InteractionPlan,
+        dialogue_state: DialogueState | None,
+        social_snapshot: dict[str, Any],
+        external_context: str,
+        activity: float,
+        tool_result: str,
+    ) -> tuple[str, dict[str, Any], dict[str, Any] | None, ModelReply | None]:
+        recent_agent_replies = tuple(dialogue_state.recent_agent_replies) if dialogue_state else ()
+        review = self.quality_gate.review_rules(
+            message=message,
+            reply=reply,
+            interaction_plan=interaction_plan,
+            recent_agent_replies=recent_agent_replies,
+            dialogue_state=dialogue_state,
+        )
+        metadata: dict[str, Any] = {
+            "quality_review": review.to_metadata(),
+            "quality_rewrite_used": False,
+            "qwen_first_quality_repair_used": False,
+        }
+        if not review.send_allowed:
+            return "", metadata, None, None
+        if not review.rewrite_needed:
+            return reply, metadata, None, None
+
+        metadata["pre_quality_reply"] = reply
+        feedback = self._qwen_quality_feedback(review=review, bad_reply=reply)
+        repair_prompt = build_qwen_decision_prompt(
+            persona_guard=self.persona_guard,
+            context=built_context,
+            user_name=user_name,
+            message=message,
+            command_metadata={**command_metadata, "quality_repair": True},
+            turn=turn,
+            dialogue_state=dialogue_state,
+            social_snapshot=social_snapshot,
+            external_context=external_context,
+            activity=activity,
+            max_tokens=max(prompt.max_tokens, 768),
+            tool_result=tool_result,
+            quality_feedback=feedback,
+        )
+        try:
+            repair_reply = await self.final_model_client.chat(
+                repair_prompt.messages,
+                max_tokens=repair_prompt.max_tokens,
+                operation=repair_prompt.operation,
+            )
+        except Exception as error:
+            metadata["qwen_first_quality_repair_error"] = str(error)
+            if not self._must_rewrite(review):
+                return reply, metadata, None, None
+            return await self._api_quality_fallback_reply(
+                user_name=user_name,
+                message=message,
+                built_context=built_context,
+                command_metadata=command_metadata,
+                turn=turn,
+                dialogue_state=dialogue_state,
+                social_snapshot=social_snapshot,
+                external_context=external_context,
+                activity=activity,
+                tool_result=tool_result,
+                first_review=review,
+                local_repair_review=review,
+                local_repair_decision={
+                    "action": "no_reply",
+                    "reply": "",
+                    "reason": "local_quality_repair_error",
+                    "tool_name": "none",
+                    "tool_query": "",
+                    "memory_to_save": "",
+                },
+                local_repair_reply="",
+                metadata=metadata,
+            )
+
+        repaired_decision = self._qwen_decision_from_reply(repair_reply)
+        repaired_text = ""
+        if repaired_decision["action"] == "reply" and repaired_decision["reply"]:
+            repaired_text = self.persona_guard.clean_reply(repaired_decision["reply"])
+
+        second_review = self.quality_gate.review_rules(
+            message=message,
+            reply=repaired_text,
+            interaction_plan=interaction_plan,
+            recent_agent_replies=recent_agent_replies,
+            dialogue_state=dialogue_state,
+        )
+        metadata.update(
+            {
+                "qwen_first_quality_repair_used": True,
+                "qwen_first_quality_repair_decision": repaired_decision,
+                "qwen_first_quality_repair_prompt": {
+                    "message_count": len(repair_prompt.messages),
+                    "max_tokens": repair_prompt.max_tokens,
+                    "operation": repair_prompt.operation,
+                },
+                "quality_repair_raw": repair_reply.content,
+                "quality_repair_reply": repaired_text,
+                "quality_second_review": second_review.to_metadata(),
+                "token_usage": self._token_usage_for_reply(
+                    self.final_model_client,
+                    repair_reply,
+                    operation="final",
+                ),
+            }
+        )
+        if repaired_text and second_review.send_allowed and not second_review.rewrite_needed:
+            return repaired_text, metadata, repaired_decision, repair_reply
+        return await self._api_quality_fallback_reply(
+            user_name=user_name,
+            message=message,
+            built_context=built_context,
+            command_metadata=command_metadata,
+            turn=turn,
+            dialogue_state=dialogue_state,
+            social_snapshot=social_snapshot,
+            external_context=external_context,
+            activity=activity,
+            tool_result=tool_result,
+            first_review=review,
+            local_repair_review=second_review,
+            local_repair_decision=repaired_decision,
+            local_repair_reply=repaired_text,
+            metadata=metadata,
+        )
+
+    async def _api_quality_fallback_reply(
+        self,
+        *,
+        user_name: str,
+        message: str,
+        built_context,
+        command_metadata: dict[str, Any],
+        turn: CleanTurn,
+        dialogue_state: DialogueState | None,
+        social_snapshot: dict[str, Any],
+        external_context: str,
+        activity: float,
+        tool_result: str,
+        first_review: QualityReview,
+        local_repair_review: QualityReview,
+        local_repair_decision: dict[str, Any],
+        local_repair_reply: str,
+        metadata: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], dict[str, Any] | None, ModelReply | None]:
+        client = self._quality_fallback_client()
+        if client is None:
+            metadata["api_quality_fallback_used"] = False
+            metadata["api_quality_fallback_reason"] = "not_available"
+            metadata["quality_reviewer_uncertain"] = True
+            if metadata.get("qwen_first_quality_repair_error"):
+                return self._chain_error_reply(
+                    message=message,
+                    metadata=metadata,
+                    stage="local_quality_repair",
+                    reason="local_quality_repair_error",
+                    error=str(metadata["qwen_first_quality_repair_error"]),
+                    decision=local_repair_decision,
+                )
+            return "", metadata, local_repair_decision, None
+
+        feedback = self._api_quality_fallback_feedback(
+            first_review=first_review,
+            local_repair_review=local_repair_review,
+            local_repair_decision=local_repair_decision,
+            local_repair_reply=local_repair_reply,
+        )
+        fallback_prompt = build_qwen_decision_prompt(
+            persona_guard=self.persona_guard,
+            context=built_context,
+            user_name=user_name,
+            message=message,
+            command_metadata={**command_metadata, "api_quality_fallback": True},
+            turn=turn,
+            dialogue_state=dialogue_state,
+            social_snapshot=social_snapshot,
+            external_context=external_context,
+            activity=activity,
+            max_tokens=768,
+            tool_result=tool_result,
+            quality_feedback=feedback,
+        )
+        try:
+            api_reply = await client.chat(
+                fallback_prompt.messages,
+                max_tokens=fallback_prompt.max_tokens,
+                operation="quality_rewrite",
+            )
+        except Exception as error:
+            metadata["api_quality_fallback_used"] = False
+            metadata["api_quality_fallback_reason"] = "provider_error"
+            metadata["api_quality_fallback_error"] = str(error)
+            metadata["quality_reviewer_uncertain"] = True
+            return self._chain_error_reply(
+                message=message,
+                metadata=metadata,
+                stage="api_quality_fallback",
+                reason="api_quality_fallback_error",
+                error=str(error),
+                decision=local_repair_decision,
+            )
+
+        decision = self._qwen_decision_from_reply(api_reply)
+        fallback_text = ""
+        if decision["action"] == "reply" and decision["reply"]:
+            fallback_text = self.persona_guard.clean_reply(decision["reply"])
+        review = self.quality_gate.review_rules(
+            message=message,
+            reply=fallback_text,
+            interaction_plan=None,
+            recent_agent_replies=tuple(dialogue_state.recent_agent_replies) if dialogue_state else (),
+            dialogue_state=dialogue_state,
+        )
+        metadata.update(
+            {
+                "api_quality_fallback_used": True,
+                "api_quality_fallback_reason": "local_quality_repair_failed",
+                "api_quality_fallback_decision": decision,
+                "api_quality_fallback_raw": api_reply.content,
+                "api_quality_fallback_reply": fallback_text,
+                "api_quality_fallback_review": review.to_metadata(),
+                "quality_reviewer_uncertain": True,
+                "token_usage": merge_token_usage(
+                    metadata.get("token_usage"),
+                    self._token_usage_for_reply(client, api_reply, operation="rewrite"),
+                ),
+            }
+        )
+        if not fallback_text or not review.send_allowed:
+            return "", metadata, decision, api_reply
+        return fallback_text, metadata, decision, api_reply
+
+    def _chain_error_reply(
+        self,
+        *,
+        message: str,
+        metadata: dict[str, Any],
+        stage: str,
+        reason: str,
+        error: str,
+        decision: dict[str, Any] | None,
+    ) -> tuple[str, dict[str, Any], dict[str, Any] | None, ModelReply | None]:
+        short_reply = self._short_error_reply(message)
+        metadata.update(
+            {
+                "quality_chain_error": True,
+                "quality_chain_error_stage": stage,
+                "quality_chain_error_reason": reason,
+                "quality_chain_error_short_reply": short_reply,
+                "quality_chain_error_full": error,
+            }
+        )
+        return short_reply, metadata, decision, None
+
+    def _short_error_reply(self, message: str) -> str:
+        if self._mostly_ascii(message):
+            return "This turn errored; the debug log has the details."
+        return "这条处理出错了，后台有详情。"
+
+    def _quality_fallback_client(self):
+        client = self.api_fallback_model_client
+        if client is None or client is self.final_model_client:
+            return None
+        if str(getattr(client, "provider_name", "")).casefold() != "grok":
+            return None
+        return client
+
+    def _qwen_quality_feedback(self, *, review: QualityReview, bad_reply: str) -> str:
+        return (
+            f"bad reply: {bad_reply}\n"
+            f"quality reasons: {'; '.join(review.reasons)}\n"
+            f"rule hits: {', '.join(review.rule_hits) or 'none'}\n"
+            "Repair requirement: preserve the user's actual meaning, use recent QQ context if needed, "
+            "and avoid adding any background that is not in context."
+        )
+
+    def _api_quality_fallback_feedback(
+        self,
+        *,
+        first_review: QualityReview,
+        local_repair_review: QualityReview,
+        local_repair_decision: dict[str, Any],
+        local_repair_reply: str,
+    ) -> str:
+        return (
+            "Local model quality repair failed. Use API only for this fallback.\n"
+            "The quality review is a diagnostic signal, not guaranteed truth; verify it against runtime context.\n"
+            f"first review reasons: {'; '.join(first_review.reasons)}\n"
+            f"first review rule hits: {', '.join(first_review.rule_hits) or 'none'}\n"
+            f"local repair reply: {local_repair_reply or 'none'}\n"
+            f"local repair decision: {json.dumps(local_repair_decision, ensure_ascii=False, sort_keys=True)}\n"
+            f"local repair review reasons: {'; '.join(local_repair_review.reasons)}\n"
+            f"local repair rule hits: {', '.join(local_repair_review.rule_hits) or 'none'}\n"
+            "Return the final grounded JSON decision. If the review was wrong, produce the natural reply anyway; "
+            "if the context is insufficient, ask a small clarifying question."
         )
 
     def _qwen_first_pre_model_no_reply(

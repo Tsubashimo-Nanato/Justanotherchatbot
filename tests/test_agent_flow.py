@@ -137,6 +137,13 @@ class FailingModelClient:
         raise AssertionError("model should not be called")
 
 
+class FailingGrokModelClient:
+    provider_name = "grok"
+
+    async def chat(self, messages, **kwargs):
+        raise RuntimeError("provider exploded with a long internal error body")
+
+
 class FakeWebResearcher:
     def should_search(self, message):
         return True
@@ -394,7 +401,11 @@ def test_agent_qwen_first_rewrites_recent_self_repeat(tmp_path):
                 '"thinking_summary":"bad repeat","target_message_ids":["current"],'
                 '"tool_name":"none","tool_query":"","memory_to_save":""}'
             ),
-            "fresh answer with context",
+            (
+                '{"action":"reply","reply":"fresh answer with context","reason":"quality_repair",'
+                '"thinking_summary":"repaired repeat","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
         ]
     )
     store.append_event(
@@ -412,8 +423,12 @@ def test_agent_qwen_first_rewrites_recent_self_repeat(tmp_path):
     assert result.action == "reply"
     assert result.reply == "fresh answer with context"
     assert "recent_self_repeat" in result.metadata["quality_review"]["rule_hits"]
-    assert result.metadata["quality_rewrite_used"] is True
+    assert result.metadata["quality_rewrite_used"] is False
+    assert result.metadata["qwen_first_quality_repair_used"] is True
     assert len(model.messages) == 2
+    assert "Quality repair required" in model.messages[1][1]["content"]
+    assert "Do not invent facts" in model.messages[1][1]["content"]
+    assert "recent QQ messages:" in model.messages[1][2]["content"]
 
 
 def test_agent_qwen_first_skips_low_affinity_ambient_short_ping(tmp_path):
@@ -501,6 +516,135 @@ def test_agent_qwen_first_mode_runs_requested_web_tool(tmp_path):
     assert result.metadata["web_used"] is True
     assert web.answer_calls == 1
     assert len(model.messages) == 2
+
+
+def test_agent_qwen_first_quality_repair_keeps_context_grounded(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    model = SequenceModelClient(
+        [
+            (
+                '{"action":"reply","reply":"我草跑的我想吐","reason":"minimal_ack",'
+                '"thinking_summary":"echoed user","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+            (
+                '{"action":"reply","reply":"跑哪去了，跑到想吐？先别硬撑。","reason":"quality_repair",'
+                '"thinking_summary":"ask missing context without inventing","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+        ]
+    )
+    agent.model_client = model
+    agent.final_model_client = model
+    agent.qwen_first_mode = True
+
+    result = asyncio.run(
+        agent.respond_to_incoming(
+            user_name="Tsubashimo Nanato",
+            message="我草跑的我想吐",
+            reply_to_bot=True,
+        )
+    )
+
+    assert result.action == "reply"
+    assert result.reply == "跑哪去了，跑到想吐？先别硬撑。"
+    assert result.metadata["qwen_first_quality_repair_used"] is True
+    assert result.metadata["quality_rewrite_used"] is False
+    assert "dead_end_echo" in result.metadata["quality_review"]["rule_hits"]
+    assert "games, jobs" in model.messages[1][1]["content"]
+    assert "quality repair feedback:" in model.messages[1][2]["content"]
+
+
+def test_agent_qwen_first_uses_api_only_after_local_quality_repair_fails(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    local_model = SequenceModelClient(
+        [
+            (
+                '{"action":"reply","reply":"我草跑的我想吐","reason":"minimal_ack",'
+                '"thinking_summary":"echoed user","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+            (
+                '{"action":"reply","reply":"我草跑的我想吐","reason":"still_echo",'
+                '"thinking_summary":"failed repair","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+        ]
+    )
+    api_model = SequenceModelClient(
+        [
+            (
+                '{"action":"reply","reply":"跑哪去了，跑到想吐？先别硬撑。","reason":"api_quality_fallback",'
+                '"thinking_summary":"grounded fallback","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            )
+        ]
+    )
+    api_model.provider_name = "grok"
+    agent.model_client = local_model
+    agent.final_model_client = local_model
+    agent.api_fallback_model_client = api_model
+    agent.qwen_first_mode = True
+
+    result = asyncio.run(
+        agent.respond_to_incoming(
+            user_name="Tsubashimo Nanato",
+            message="我草跑的我想吐",
+            reply_to_bot=True,
+        )
+    )
+
+    assert result.action == "reply"
+    assert result.reply == "跑哪去了，跑到想吐？先别硬撑。"
+    assert result.metadata["qwen_first_quality_repair_used"] is True
+    assert result.metadata["api_quality_fallback_used"] is True
+    assert result.metadata["quality_reviewer_uncertain"] is True
+    assert result.metadata["api_quality_fallback_reason"] == "local_quality_repair_failed"
+    assert result.metadata["token_usage"]["api"]["rewrite"]["total"] == 13
+    assert len(local_model.messages) == 2
+    assert len(api_model.messages) == 1
+    api_prompt = "\n".join(message["content"] for message in api_model.messages[0])
+    assert "quality review is a diagnostic signal, not guaranteed truth" in api_prompt
+    assert "Do not invent facts" in api_prompt
+
+
+def test_agent_qwen_first_outputs_short_error_when_full_quality_chain_errors(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    local_model = SequenceModelClient(
+        [
+            (
+                '{"action":"reply","reply":"我草跑的我想吐","reason":"minimal_ack",'
+                '"thinking_summary":"echoed user","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+            (
+                '{"action":"reply","reply":"我草跑的我想吐","reason":"still_echo",'
+                '"thinking_summary":"failed repair","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+        ]
+    )
+    agent.model_client = local_model
+    agent.final_model_client = local_model
+    agent.api_fallback_model_client = FailingGrokModelClient()
+    agent.qwen_first_mode = True
+
+    result = asyncio.run(
+        agent.respond_to_incoming(
+            user_name="Tsubashimo Nanato",
+            message="我草跑的我想吐",
+            reply_to_bot=True,
+        )
+    )
+
+    assert result.action == "reply"
+    assert result.reason == "api_quality_fallback_error"
+    assert result.reply == "这条处理出错了，后台有详情。"
+    assert result.metadata["quality_chain_error"] is True
+    assert result.metadata["quality_chain_error_stage"] == "api_quality_fallback"
+    assert result.metadata["quality_chain_error_short_reply"] == result.reply
+    assert "provider exploded" in result.metadata["quality_chain_error_full"]
+    assert result.metadata["api_quality_fallback_error"] == result.metadata["quality_chain_error_full"]
 
 
 def test_agent_flags_ooc_before_model_reply(tmp_path):

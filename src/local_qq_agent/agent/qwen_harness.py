@@ -30,6 +30,7 @@ def build_qwen_decision_prompt(
     activity: float,
     max_tokens: int = 768,
     tool_result: str = "",
+    quality_feedback: str = "",
 ) -> QwenPrompt:
     memory_text = _lines_or_none(context.memory_lines, max_lines=18, max_line_chars=320, max_total_chars=3500)
     recent_text = _lines_or_none(context.recent_lines, max_lines=36, max_line_chars=260, max_total_chars=6000)
@@ -37,6 +38,7 @@ def build_qwen_decision_prompt(
     interaction_text = _lines_or_none(context.interaction_lines, max_lines=10, max_line_chars=260, max_total_chars=2200)
     external_text = _clip_text(external_context.strip(), 5000) or "none"
     tool_text = _clip_text(tool_result.strip(), 5000) or "none"
+    quality_text = _clip_text(quality_feedback.strip(), 2400)
     turn_text = _turn_text(
         user_name=user_name,
         message=message,
@@ -82,6 +84,14 @@ def build_qwen_decision_prompt(
         "- Match the latest user's language unless recent context strongly suggests otherwise.\n"
         "- Short is fine; dead-end echo is not. A direct high-affinity turn can be 1-3 short clauses if that fits the interaction policy.\n"
     )
+    if quality_text:
+        runtime_prompt += (
+            "\nQuality repair required:\n"
+            "- A previous candidate reply failed quality review. Re-decide from the full runtime context below.\n"
+            "- Do not patch the old reply locally. Write a fresh JSON decision grounded in the visible context.\n"
+            "- Do not invent facts, causes, places, games, jobs, diagnoses, motives, or relationships that are not present in context.\n"
+            "- If the missing detail matters, ask a low-pressure question instead of filling it in.\n"
+        )
     user_prompt = (
         "Runtime context:\n"
         f"recent QQ messages:\n{recent_text}\n\n"
@@ -91,6 +101,7 @@ def build_qwen_decision_prompt(
         f"external context:\n{external_text}\n\n"
         f"tool result:\n{tool_text}\n\n"
         f"current turn:\n{turn_text}\n\n"
+        f"quality repair feedback:\n{quality_text or 'none'}\n\n"
         "Return the JSON decision now."
     )
     operation = "web_fact" if tool_result else "final_reply"

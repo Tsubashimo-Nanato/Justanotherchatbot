@@ -69,6 +69,7 @@ class QQReadResult:
 class QQWindowAdapter:
     def __init__(self, config: QQConfig) -> None:
         self.config = config
+        self._arm_requested = False
 
     def status(self) -> QQStatus:
         if platform.system() != "Windows":
@@ -118,9 +119,11 @@ class QQWindowAdapter:
         )
 
     def arm(self) -> QQStatus:
+        self._arm_requested = True
         return self.status()
 
     def disarm(self) -> QQStatus:
+        self._arm_requested = False
         return self.status()
 
     def focus_window(self, *, maximize: bool = False) -> dict[str, Any]:
@@ -201,6 +204,16 @@ class QQWindowAdapter:
         if not text:
             raise ValueError("QQ message text must not be empty")
 
+        if self.config.dry_run and (not self.config.send_requires_armed or self._arm_requested):
+            return QQSendResult(
+                sent=False,
+                dry_run=True,
+                reason="dry_run",
+                text=text,
+                verification={"note": "QQ send was not executed because config/qq.yaml dry_run is true."},
+                duration_seconds=round(time.perf_counter() - started_at, 3),
+            )
+
         status = self.status()
         if self.config.send_requires_armed and not status.armed:
             return QQSendResult(
@@ -209,16 +222,6 @@ class QQWindowAdapter:
                 reason="qq_window_unavailable",
                 text=text,
                 verification={"qq": status.to_dict()},
-                duration_seconds=round(time.perf_counter() - started_at, 3),
-            )
-
-        if self.config.dry_run:
-            return QQSendResult(
-                sent=False,
-                dry_run=True,
-                reason="dry_run",
-                text=text,
-                verification={"note": "QQ send was not executed because config/qq.yaml dry_run is true."},
                 duration_seconds=round(time.perf_counter() - started_at, 3),
             )
 
