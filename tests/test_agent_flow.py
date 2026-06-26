@@ -376,6 +376,10 @@ def test_agent_qwen_first_mode_uses_single_structured_decision(tmp_path):
     assert result.reason == "direct_address"
     assert result.metadata["qwen_first"] is True
     assert "Qwen-first QQ harness mode" in model.messages[0][1]["content"]
+    qwen_user_prompt = model.messages[0][2]["content"]
+    assert "interaction policy:" in qwen_user_prompt
+    assert "reply_shape:" in qwen_user_prompt
+    assert "hook_budget:" in qwen_user_prompt
     assert len(model.messages) == 1
     events = store.recent_events()
     assert [event.kind for event in events] == ["group_message", "assistant_reply"]

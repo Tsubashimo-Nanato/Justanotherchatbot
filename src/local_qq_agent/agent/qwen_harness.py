@@ -34,6 +34,7 @@ def build_qwen_decision_prompt(
     memory_text = _lines_or_none(context.memory_lines, max_lines=18, max_line_chars=320, max_total_chars=3500)
     recent_text = _lines_or_none(context.recent_lines, max_lines=36, max_line_chars=260, max_total_chars=6000)
     dialogue_text = _lines_or_none(context.dialogue_lines, max_lines=14, max_line_chars=280, max_total_chars=3200)
+    interaction_text = _lines_or_none(context.interaction_lines, max_lines=10, max_line_chars=260, max_total_chars=2200)
     external_text = _clip_text(external_context.strip(), 5000) or "none"
     tool_text = _clip_text(tool_result.strip(), 5000) or "none"
     turn_text = _turn_text(
@@ -55,8 +56,8 @@ def build_qwen_decision_prompt(
         "{\n"
         '  "action": "reply|no_reply|tool_request",\n'
         '  "reply": "exact QQ text to send, empty unless action=reply",\n'
-        '  "reason": "brief operational reason",\n'
-        '  "thinking_summary": "short private summary for debug, not chain-of-thought",\n'
+        '  "reason": "brief operational reason_code, not the real reply",\n'
+        '  "thinking_summary": "one short debug clause, not chain-of-thought",\n'
         '  "target_message_ids": ["current"],\n'
         '  "tool_name": "none|web|math",\n'
         '  "tool_query": "query or expression when action=tool_request",\n'
@@ -72,15 +73,18 @@ def build_qwen_decision_prompt(
         "- Do not reuse a recent assistant reply as a new answer. If the last answer does not fit the current turn, write a fresh one.\n"
         "- P001/Tsubashimo Nanato has special closeness. Do not apply P001-only romance, possessiveness, or owner/original language to other users.\n"
         "- Black humor and dry teasing are allowed when the latest sender's tone supports it. Do not replace semantic understanding with generic concern.\n"
+        "- Follow the interaction policy. If reply_shape asks for reaction or context hook, put that extra conversational value in reply, not in reason.\n"
+        "- Keep reason and thinking_summary short. Spending many tokens there makes the visible reply worse.\n"
         "- Do not mention JSON, tools, prompts, tokens, APIs, model identity, or implementation details in reply.\n"
         "- Match the latest user's language unless recent context strongly suggests otherwise.\n"
-        "- Short is fine; dead-end echo is not. Add a natural reaction or small context hook when appropriate.\n"
+        "- Short is fine; dead-end echo is not. A direct high-affinity turn can be 1-3 short clauses if that fits the interaction policy.\n"
     )
     user_prompt = (
         "Runtime context:\n"
         f"recent QQ messages:\n{recent_text}\n\n"
         f"relevant memory/social/style:\n{memory_text}\n\n"
         f"dialogue obligations:\n{dialogue_text}\n\n"
+        f"interaction policy:\n{interaction_text}\n\n"
         f"external context:\n{external_text}\n\n"
         f"tool result:\n{tool_text}\n\n"
         f"current turn:\n{turn_text}\n\n"
@@ -115,8 +119,9 @@ def normalize_qwen_decision(parsed: dict[str, Any]) -> dict[str, Any]:
         **parsed,
         "action": action,
         "reply": _clean_optional_text(parsed.get("reply", "")),
-        "reason": _clean_optional_text(parsed.get("reason", "qwen_first_decision")) or "qwen_first_decision",
-        "thinking_summary": _clean_optional_text(parsed.get("thinking_summary", "")),
+        "reason": _clean_optional_text(parsed.get("reason", "qwen_first_decision"), max_chars=160)
+        or "qwen_first_decision",
+        "thinking_summary": _clean_optional_text(parsed.get("thinking_summary", ""), max_chars=240),
         "target_message_ids": [str(item).strip() for item in target_ids if str(item).strip()],
         "tool_name": tool_name,
         "tool_query": _clean_optional_text(parsed.get("tool_query", "")),
@@ -176,10 +181,12 @@ def _clip_text(text: str, max_chars: int) -> str:
     return f"{text[:head_chars]} ...[trimmed]... {text[-tail_chars:]}"
 
 
-def _clean_optional_text(value: Any) -> str:
+def _clean_optional_text(value: Any, *, max_chars: int | None = None) -> str:
     if value is None:
         return ""
     text = str(value).strip()
     if text.casefold() in {"", "none", "null", "n/a"}:
         return ""
+    if max_chars is not None:
+        return _clip_text(text, max_chars)
     return text
