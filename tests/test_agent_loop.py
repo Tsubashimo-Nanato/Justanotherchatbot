@@ -39,6 +39,25 @@ def test_agent_loop_hydrates_seen_messages_from_recent_loop_decisions(tmp_path):
     assert loop._message_seen("target user", "roast chicken good", "fp-new-coordinate")
 
 
+def test_agent_loop_hydrates_assistant_reply_texts_for_quote_cleaning(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    store.append_event(
+        source="agent",
+        kind="assistant_reply",
+        content="因为你在问，所以@你。",
+        metadata={"reason": "test"},
+    )
+
+    loop = build_loop(store=store)
+    quoted = message("因为你在问，所以@你。\n你刚才@错了", "fp-quote", top=100)
+
+    cleaned = loop._clean_visible_message(quoted)
+
+    assert cleaned.text == "你刚才@错了"
+    assert cleaned.references_bot
+    assert "因为你在问，所以@你。" in cleaned.turn.removed_lines
+
+
 def test_agent_loop_persists_decision_index_fields(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
     loop = build_loop(store=store)

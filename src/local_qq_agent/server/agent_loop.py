@@ -2447,6 +2447,10 @@ class AgentLoop:
                 continue
 
             metadata = event.metadata or {}
+            if event.kind == "assistant_reply":
+                self.remember_sent_text(str(event.content or ""))
+                continue
+
             if event.kind == "group_message":
                 self._hydrate_context_event(event, metadata)
                 continue
@@ -2455,6 +2459,12 @@ class AgentLoop:
                 continue
 
             decision_metadata = metadata.get("metadata") if isinstance(metadata.get("metadata"), dict) else {}
+            if bool(metadata.get("sent")):
+                send_result = decision_metadata.get("send_result")
+                sent_text = decision_metadata.get("cleaned_reply")
+                if not sent_text and isinstance(send_result, dict):
+                    sent_text = send_result.get("text")
+                self.remember_sent_text(str(sent_text or ""))
             sender_name = str(metadata.get("sender_name", ""))
             message_text = str(metadata.get("message_text", ""))
             if not sender_name or not message_text:
