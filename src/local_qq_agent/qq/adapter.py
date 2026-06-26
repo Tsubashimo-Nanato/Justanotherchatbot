@@ -284,12 +284,12 @@ class QQWindowAdapter:
                 self._clear_quote_mention_prefix()
                 timings["quote_cleanup_seconds"] = round(time.perf_counter() - step_started, 3)
 
-            step_started = time.perf_counter()
-            import pyperclip
-            from pywinauto import keyboard
+            before_keys: set[tuple[str, str, int, int, int, int]] = set()
+            if self.config.verify_after_send:
+                before_keys = self._visible_item_keys(self._read_context_snapshot(window).visible_items)
 
-            pyperclip.copy(text)
-            keyboard.send_keys("^v{ENTER}")
+            step_started = time.perf_counter()
+            self._paste_and_submit(text)
             timings["input_seconds"] = round(time.perf_counter() - step_started, 3)
 
             verification = {
@@ -297,7 +297,22 @@ class QQWindowAdapter:
                 "quoted_message": reply_to.to_dict() if reply_to is not None else None,
             }
             if self.config.verify_after_send:
+                step_started = time.perf_counter()
+                send_check = self._verify_sent_text(window, text, before_keys=before_keys)
+                timings["verify_seconds"] = round(time.perf_counter() - step_started, 3)
+                verification.update(send_check)
                 verification["window_title"] = str(window.window_text())
+                verification["mode"] = "quote_reply" if reply_to is not None else "sent_verified"
+                if not send_check["ok"]:
+                    verification["timings"] = timings
+                    return QQSendResult(
+                        sent=False,
+                        dry_run=False,
+                        reason="send_verification_failed",
+                        text=text,
+                        verification=verification,
+                        duration_seconds=round(time.perf_counter() - started_at, 3),
+                    )
             if reply_to is not None:
                 verification["quote_cleanup"] = "backspace_twice"
             verification["timings"] = timings
@@ -312,6 +327,82 @@ class QQWindowAdapter:
             )
         finally:
             self._restore_minimized(window, was_minimized)
+
+    def _paste_and_submit(self, text: str) -> None:
+        import pyperclip
+        from pywinauto import keyboard
+
+        pyperclip.copy(text)
+        keyboard.send_keys("^v{ENTER}")
+
+    def _verify_sent_text(
+        self,
+        window: Any,
+        text: str,
+        *,
+        before_keys: set[tuple[str, str, int, int, int, int]],
+    ) -> dict[str, Any]:
+        expected = self._normalize_text(text)
+        if not expected:
+            return {"ok": False, "reason": "empty_expected_text"}
+
+        stale_match = False
+        last_visible_texts: list[str] = []
+        for attempt in range(1, 6):
+            time.sleep(0.25)
+            self._scroll_to_latest(window)
+            snapshot = self._read_context_snapshot(window)
+            last_visible_texts = [
+                self._normalize_text(str(item.get("text", "")))
+                for item in snapshot.visible_items[-20:]
+                if self._normalize_text(str(item.get("text", "")))
+            ]
+
+            for item in snapshot.visible_items:
+                item_text = self._normalize_text(str(item.get("text", "")))
+                if not self._text_matches_sent_message(expected, item_text):
+                    continue
+                if self._visible_item_key(item) not in before_keys:
+                    return {
+                        "ok": True,
+                        "reason": "sent_text_visible",
+                        "attempt": attempt,
+                        "matched_text": item_text,
+                    }
+                stale_match = True
+
+        return {
+            "ok": False,
+            "reason": "sent_text_not_observed" if not stale_match else "only_stale_sent_text_observed",
+            "attempts": 5,
+            "expected_text": expected,
+            "visible_text_tail": last_visible_texts[-8:],
+        }
+
+    def _text_matches_sent_message(self, expected: str, visible_text: str) -> bool:
+        if not expected or not visible_text:
+            return False
+        if visible_text == expected:
+            return True
+        if expected in visible_text:
+            return True
+        expected_lines = {line for line in expected.splitlines() if line.strip()}
+        visible_lines = {line for line in visible_text.splitlines() if line.strip()}
+        return bool(expected_lines and expected_lines <= visible_lines)
+
+    def _visible_item_keys(self, items: list[dict[str, Any]]) -> set[tuple[str, str, int, int, int, int]]:
+        return {self._visible_item_key(item) for item in items}
+
+    def _visible_item_key(self, item: dict[str, Any]) -> tuple[str, str, int, int, int, int]:
+        rect = item.get("rectangle") or {}
+        return (
+            self._normalize_text(str(item.get("text", ""))),
+            str(item.get("control_type", "")),
+            int(rect.get("left", 0)),
+            int(rect.get("top", 0)),
+            int(rect.get("right", 0)),
+            int(rect.get("bottom", 0)),
+        )
 
     def _open_quote_reply(self, window: Any, reply_to: QQChatMessage) -> dict[str, Any]:
         points = self._quote_click_points(reply_to.rectangle)
