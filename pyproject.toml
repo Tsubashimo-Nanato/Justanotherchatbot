@@ -18,9 +18,7 @@ dependencies = [
     "pydantic>=2.8",
     "PyYAML>=6.0",
     "huggingface-hub>=0.24",
-    "pywinauto>=0.6.8; platform_system == 'Windows'",
     "pillow>=10.4",
-    "pyperclip>=1.9",
 ]
 
 [project.optional-dependencies]

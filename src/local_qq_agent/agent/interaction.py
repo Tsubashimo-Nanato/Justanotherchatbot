@@ -34,8 +34,9 @@ class InteractionPlan:
             lines.append("interaction_rule: Answer first, then add a small reaction; do not turn it into an interview.")
         elif self.reply_shape == "repair_with_context":
             lines.append(
-                "interaction_rule: The user is correcting or criticizing the bot. Address the concrete problem first, "
-                "then add one small natural recovery line. Do not dodge with a generic joke or confused marker."
+                "interaction_rule: The user is correcting, criticizing, or giving a style/memory control instruction. "
+                "Address that latest instruction first, then add one small natural recovery line. "
+                "Do not keep answering the previous topic."
             )
         elif self.reply_shape == "answer_only":
             lines.append("interaction_rule: Answer the concrete question cleanly; no extra topic needed.")
@@ -124,12 +125,12 @@ class InteractionPolicy:
         if not text:
             return "empty"
         lowered = text.casefold()
+        if self._is_correction_or_debug_complaint(lowered):
+            return "correction"
         if self._is_question(lowered):
             return "question"
         if self._is_life_status(lowered):
             return "life_status"
-        if self._is_correction_or_debug_complaint(lowered):
-            return "correction"
         if self._is_complaint(lowered):
             return "complaint"
         if self._is_emoji_or_symbol_only(text) or len(text) <= 10:
@@ -191,6 +192,8 @@ class InteractionPolicy:
         return "minimal_ack"
 
     def _is_question(self, text: str) -> bool:
+        if self._is_plain_chinese_question(text):
+            return True
         if "?" in text or "？" in text:
             return True
         english = r"\b(what|which|who|where|when|why|how|can|could|should|would|do|does|did|is|are)\b"
@@ -202,6 +205,8 @@ class InteractionPolicy:
         return bool(re.search(english, text) or re.search(chinese, text))
 
     def _is_life_status(self, text: str) -> bool:
+        if self._is_plain_chinese_life_status(text):
+            return True
         if re.search(r"\b(i|we)\s+(am|was|were|had|ate|finished|got|went|go|going|will|plan)\b", text):
             return True
         return bool(
@@ -216,6 +221,8 @@ class InteractionPolicy:
         )
 
     def _is_complaint(self, text: str) -> bool:
+        if self._is_plain_chinese_complaint(text):
+            return True
         return bool(
             re.search(
                 r"(烦|累死|困死|崩溃|不想|难受|头疼|糟糕|讨厌|撑不住|"
@@ -225,6 +232,8 @@ class InteractionPolicy:
         )
 
     def _is_correction_or_debug_complaint(self, text: str) -> bool:
+        if self._is_plain_chinese_correction(text):
+            return True
         if re.search(
             r"(@错|at错|艾特错|引用错|回错|发错|看错|读错|漏读|没读到|没看到|"
             r"理解错|搞错|弄错|错了|不对|不是这个|不是这句|答非所问|接不上|"
@@ -245,6 +254,101 @@ class InteractionPolicy:
             "wrong context",
         )
         return any(term in text for term in english)
+
+    def _is_plain_chinese_question(self, text: str) -> bool:
+        markers = (
+            "\u4ec0\u4e48",
+            "\u54ea",
+            "\u54ea\u91cc",
+            "\u8c01",
+            "\u591a\u5c11",
+            "\u51e0",
+            "\u600e\u4e48",
+            "\u4e3a\u4ec0\u4e48",
+            "\u5e72\u4ec0\u4e48",
+            "\u505a\u4ec0\u4e48",
+            "\u5403\u4ec0\u4e48",
+            "\u8bb0\u5f97\u5417",
+            "\u5bf9\u5417",
+            "\u597d\u5417",
+            "\u884c\u5417",
+        )
+        if "\uFF1F" in text or any(marker in text for marker in markers):
+            return True
+        return bool(re.search(r"[\u4e00-\u9fff](\u5462|\u5417)$", text))
+
+    def _is_plain_chinese_life_status(self, text: str) -> bool:
+        markers = (
+            "\u6ca1\u5403\u996d",
+            "\u5403\u4e86",
+            "\u5403\u5b8c",
+            "\u65e9\u4e0a",
+            "\u4e0b\u5348",
+            "\u4e0a\u5348",
+            "\u665a\u4e0a",
+            "\u53bb\u5b66\u6821",
+            "\u4e0a\u73ed",
+            "\u4e0b\u73ed",
+            "\u53bb\u533b\u9662",
+            "\u60f3\u9003",
+            "\u6709\u70b9\u70e6",
+            "\u6709\u70b9\u56f0",
+            "\u80c3\u4e0d\u8212\u670d",
+            "\u4e0d\u8212\u670d",
+        )
+        return any(marker in text for marker in markers)
+
+    def _is_plain_chinese_complaint(self, text: str) -> bool:
+        markers = (
+            "\u70e6",
+            "\u56f0\u6b7b",
+            "\u7d2f\u6b7b",
+            "\u96be\u53d7",
+            "\u4e0d\u60f3",
+            "\u60f3\u9003",
+            "\u5d29\u6e83",
+            "\u5361\u4f4f",
+        )
+        return any(marker in text for marker in markers)
+
+    def _is_plain_chinese_correction(self, text: str) -> bool:
+        markers = (
+            "\u592a\u50cf\u5ba2\u670d",
+            "\u8bf4\u4eba\u8bdd",
+            "\u522b\u53ea\u56de",
+            "\u4e0d\u8981\u53ea\u56de",
+            "\u591a\u8bf4\u51e0\u4e2a\u5b57",
+            "\u4e0d\u4f1a\u804a\u5929",
+            "\u7b54\u975e\u6240\u95ee",
+            "\u522b\u626f",
+            "\u4e0d\u8981\u626f",
+            "\u4e71\u626f",
+            "\u522b\u5ffd\u7136",
+            "\u4e0d\u8981\u5ffd\u7136",
+            "\u522b\u50cf\u673a\u5668\u4eba",
+            "\u673a\u5668\u4eba\u90a3\u79cd\u8bed\u6c14",
+            "\u4e0d\u8981\u5b89\u6170\u673a\u5668\u4eba",
+            "\u522b\u5b89\u6170\u673a\u5668\u4eba",
+            "\u522b\u5ba2\u670d",
+            "\u56de\u590d\u6a21\u677f",
+            "\u5199\u56de\u590d\u6a21\u677f",
+            "\u50cfp1",
+            "\u7b80\u77ed\u4f46\u6709\u4fe1\u606f\u91cf",
+            "\u8fd9\u79cd\u98ce\u683c",
+            "\u8fd8\u7b97\u6ca1\u7b28",
+            "\u6ca1\u7b28",
+            "\u8bb0\u4f4f\u4e09\u5929",
+            "\u4e09\u5929\u5dee\u4e0d\u591a",
+            "\u903b\u8f91\u4e0d\u5bf9",
+            "\u6ca1\u903b\u8f91",
+            "\u4e0a\u4e0b\u6587\u4e0d\u5bf9",
+            "\u6ca1\u6709\u4e0a\u4e0b\u6587",
+            "\u6ca1\u770b\u4e0a\u4e0b\u6587",
+            "\u6ca1\u770b\u61c2",
+            "\u4e0d\u5bf9",
+            "\u9519\u4e86",
+        )
+        return any(marker in text for marker in markers)
 
     def _is_emoji_or_symbol_only(self, text: str) -> bool:
         visible = [char for char in text if not char.isspace()]

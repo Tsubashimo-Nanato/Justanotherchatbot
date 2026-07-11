@@ -97,8 +97,8 @@ profiles:
       model: Qwen3-30B-A3B-Instruct-2507-IQ2_M
       timeout_seconds: 150
     generation:
-      temperature: 0.75
-      top_p: 0.9
+      temperature: 0.12
+      top_p: 0.55
       max_tokens: 512
       context_tokens_target: 8192
       context_tokens_fallback: 4096

@@ -27,7 +27,7 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
     target: str = "http://127.0.0.1:8765"
     auth_header: str = ""
 
-    server_version = "LocalQQAgentRemoteDebug/1.0"
+    server_version = "LocalAgentRemoteDebug/1.0"
 
     def do_GET(self) -> None:
         self._proxy()
@@ -55,7 +55,7 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
 
     def _send_auth_required(self) -> None:
         self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="Local QQ Agent Debug"')
+        self.send_header("WWW-Authenticate", 'Basic realm="Local Agent Debug"')
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.end_headers()
         self.wfile.write(json.dumps({"error": "authentication_required"}).encode("utf-8"))

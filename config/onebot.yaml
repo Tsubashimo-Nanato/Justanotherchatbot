@@ -1,0 +1,15 @@
+reverse_ws_path: "/onebot/v11/ws"
+access_token: ""
+target_group_id: ""
+target_group_name: "CHANGE_ME_TEST_GROUP"
+target_sender_name: "CHANGE_ME_TARGET_USER"
+bot_sender_name: "CHANGE_ME_BOT_NAME"
+bot_sender_aliases: []
+action_timeout_seconds: 8.0
+send_timeout_seconds: 15.0
+max_messages_per_tick: 4
+ignore_existing_on_start: true
+duplicate_suppression_seconds: 86400.0
+turn_quiet_period_seconds: 6.0
+startup_scrollback_readable_messages: 30
+event_log_limit: 200

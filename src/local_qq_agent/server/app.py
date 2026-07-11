@@ -1,19 +1,30 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 import json
+import os
+import secrets
+import time
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from local_qq_agent.agent import LocalAgent, PersonaGuard, SocialStateTracker
 from local_qq_agent.agent.context import ContextBuilder
 from local_qq_agent.agent.style_learning import StyleAnchorDistiller, export_style_distillation_bundle
-from local_qq_agent.config import AutonomyConfig, MemoryConfig, ModelConfig, PersonaConfig, QQConfig, WebConfig
+from local_qq_agent.config import (
+    AutonomyConfig,
+    MemoryConfig,
+    ModelConfig,
+    OneBotConfig,
+    PersonaConfig,
+    WebConfig,
+    save_onebot_group_selection,
+)
 from local_qq_agent.memory import SQLiteMemoryStore
 from local_qq_agent.model import (
     download_model,
@@ -25,13 +36,16 @@ from local_qq_agent.model import (
 )
 from local_qq_agent.model.openai_client import OpenAICompatibleClient
 from local_qq_agent.model.runtime import collect_model_runtime
+from local_qq_agent.onebot import OneBotGateway
 from local_qq_agent.paths import ensure_parent, project_path
 from local_qq_agent.provider import ProviderRuntime
-from local_qq_agent.qq import QQWindowAdapter
+from local_qq_agent.provider.env_file import read_env_file, save_env_value
 from local_qq_agent.server.agent_loop import AgentLoop
+from local_qq_agent.server.debug_chat import DebugChatSession
 from local_qq_agent.server.debug_timeline import build_debug_timeline
 from local_qq_agent.server.debug_page import DEBUG_HTML
 from local_qq_agent.server.instance_guard import AgentInstanceGuard
+from local_qq_agent.server.remote_debug import RemoteDebugManager
 from local_qq_agent.server.reboot import AgentRebooter
 from local_qq_agent.web import BrowserReader, SearxngClient, WebResearcher
 
@@ -40,6 +54,12 @@ class ChatSimulateRequest(BaseModel):
     user_name: str = Field(default="tester", max_length=80)
     message: str = Field(min_length=1, max_length=4000)
     external_context: str = Field(default="", max_length=8000)
+
+
+class DebugChatMessageRequest(BaseModel):
+    user_name: str = Field(default="debugger", max_length=80)
+    message: str = Field(min_length=1, max_length=4000)
+    max_tokens: int = Field(default=700, ge=1, le=2048)
 
 
 class MemorySearchRequest(BaseModel):
@@ -79,6 +99,10 @@ class BrowserReadRequest(BaseModel):
 
 class QQSendRequest(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
+
+
+class OneBotGroupSelectRequest(BaseModel):
+    group_id: str = Field(min_length=1, max_length=40)
 
 
 class AgentSettingsRequest(BaseModel):
@@ -167,20 +191,39 @@ class Runtime:
         self.model_config = ModelConfig.load()
         self.persona_config = PersonaConfig.load()
         self.memory_config = MemoryConfig.load()
-        self.qq_config = QQConfig.load()
+        self.onebot_config = OneBotConfig.load()
+        onebot_token = os.environ.get("ONEBOT_ACCESS_TOKEN") or read_env_file().get("ONEBOT_ACCESS_TOKEN", "")
+        if not onebot_token:
+            onebot_token = secrets.token_urlsafe(32)
+            save_env_value("ONEBOT_ACCESS_TOKEN", onebot_token)
+        self.onebot_config = replace(self.onebot_config, access_token=onebot_token)
         self.autonomy_config = AutonomyConfig.load()
         self.web_config = WebConfig.load()
 
         self.store = SQLiteMemoryStore(self.memory_config.database_path)
         self.instance_guard = AgentInstanceGuard()
         self.instance_status = self.instance_guard.claim()
+        self.remote_debug = RemoteDebugManager(
+            project_root=project_path("."),
+            debug_port=int(os.environ.get("LOCAL_QQ_AGENT_PORT", "8765")),
+        )
         self.provider_runtime = ProviderRuntime(store=self.store)
         self.model_clients = self.provider_runtime.build_clients(self.model_config)
         self.model_client = self.model_clients.primary
+        self.debug_chat = DebugChatSession(
+            store=self.store,
+            log_dir=project_path("artifacts/runtime/debug_chat"),
+        )
+        self.session_start_event_id = self._latest_event_id()
         self._refresh_generated_style_anchor()
         self.persona_guard = PersonaGuard(self.persona_config)
         self.social_state = SocialStateTracker(self.store)
-        self.context_builder = ContextBuilder(self.store, self.persona_guard, self.social_state)
+        self.context_builder = ContextBuilder(
+            self.store,
+            self.persona_guard,
+            self.social_state,
+            min_event_id=self.session_start_event_id,
+        )
         self.search = SearxngClient(self.web_config)
         self.browser = BrowserReader(self.web_config)
         self.researcher = WebResearcher(self.search, self.browser)
@@ -198,15 +241,17 @@ class Runtime:
             model_status_provider=self.model_status,
             raw_local_mode=self.provider_runtime.raw_local_enabled(),
             raw_local_options=self.provider_runtime.raw_local_options(),
+            local_direct_mode=self.provider_runtime.qwen_direct_enabled(),
             qwen_first_mode=self.provider_runtime.qwen_first_enabled(),
+            recent_event_min_id=self.session_start_event_id,
         )
-        self.qq = QQWindowAdapter(self.qq_config)
+        self.onebot = OneBotGateway(self.onebot_config)
         self.rebooter = AgentRebooter()
         self.loop = AgentLoop(
             agent=self.agent,
-            qq=self.qq,
+            gateway=self.onebot,
             store=self.store,
-            config=self.qq_config,
+            config=self.onebot_config,
             autonomy_config=self.autonomy_config,
             reboot_scheduler=lambda reason: self.rebooter.schedule(reason=reason),
             is_active_instance=self.instance_guard.is_current,
@@ -221,7 +266,12 @@ class Runtime:
         if refresh_style_anchor:
             self._refresh_generated_style_anchor()
         self.persona_guard = PersonaGuard(self.persona_config)
-        self.context_builder = ContextBuilder(self.store, self.persona_guard, self.social_state)
+        self.context_builder = ContextBuilder(
+            self.store,
+            self.persona_guard,
+            self.social_state,
+            min_event_id=self.session_start_event_id,
+        )
         self.agent = LocalAgent(
             store=self.store,
             persona_guard=self.persona_guard,
@@ -236,17 +286,23 @@ class Runtime:
             model_status_provider=self.model_status,
             raw_local_mode=self.provider_runtime.raw_local_enabled(),
             raw_local_options=self.provider_runtime.raw_local_options(),
+            local_direct_mode=self.provider_runtime.qwen_direct_enabled(),
             qwen_first_mode=self.provider_runtime.qwen_first_enabled(),
+            recent_event_min_id=self.session_start_event_id,
         )
         self.loop = AgentLoop(
             agent=self.agent,
-            qq=self.qq,
+            gateway=self.onebot,
             store=self.store,
-            config=self.qq_config,
+            config=self.onebot_config,
             autonomy_config=self.autonomy_config,
             reboot_scheduler=lambda reason: self.rebooter.schedule(reason=reason),
             is_active_instance=self.instance_guard.is_current,
         )
+
+    def _latest_event_id(self) -> int:
+        events = self.store.recent_events(limit=1, newest_first=True)
+        return events[0].id if events else 0
 
     def refresh_generated_style_anchor(self) -> dict[str, Any] | None:
         return self._refresh_generated_style_anchor(force=True)
@@ -313,6 +369,9 @@ class Runtime:
                 "extra_args": list(self.model_config.server_extra_args),
             },
         }
+
+    async def onebot_status(self) -> dict[str, Any]:
+        return self.onebot.status().to_dict()
 
     async def switch_model(self, profile: str, *, restart_loop: bool) -> dict[str, Any]:
         loop_was_running = self.loop.running
@@ -385,15 +444,15 @@ class Runtime:
 
     async def _announce_provider_switch(self, previous_provider: str, provider: str) -> dict[str, Any]:
         text = self._provider_switch_notice(previous_provider, provider)
-        status = self.qq.status()
-        if not status.available or not status.armed or not status.group_matched:
+        status = await self.onebot_status()
+        if not status.get("ready"):
             return {
                 "sent": False,
-                "reason": "qq_not_ready",
+                "reason": "onebot_not_ready",
                 "text": text,
-                "qq": status.to_dict(),
+                "onebot": status,
             }
-        result = await asyncio.to_thread(self.qq.send_text, text, reply_to=None)
+        result = await self.onebot.send_text(text, reply_to=None)
         if result.sent:
             self.loop.remember_sent_text(text)
         return result.to_dict()
@@ -434,6 +493,7 @@ def create_app() -> FastAPI:
     @app.on_event("shutdown")
     async def shutdown_loop() -> None:
         await runtime.loop.stop()
+        runtime.remote_debug.stop()
 
     @app.get("/api/status")
     async def status() -> dict[str, Any]:
@@ -457,7 +517,7 @@ def create_app() -> FastAPI:
             },
             "memory": runtime.store.status(),
             "instance": runtime.instance_guard.status(),
-            "qq": runtime.qq.status().to_dict(),
+            "onebot": await runtime.onebot_status(),
             "agent_loop": runtime.loop.status(),
             "agent_settings": runtime.agent.settings.to_dict(),
             "persona": runtime.persona_guard.profile_status(),
@@ -467,7 +527,7 @@ def create_app() -> FastAPI:
     @app.get("/api/debug/compact-status")
     async def compact_status() -> dict[str, Any]:
         loop_status = runtime.loop.status()
-        qq_status = runtime.qq.status().to_dict()
+        onebot_status = await runtime.onebot_status()
         latest_decision = None
         recent_decisions = loop_status.get("recent_decisions") or []
         if recent_decisions:
@@ -478,14 +538,7 @@ def create_app() -> FastAPI:
                 "active_profile": runtime.model_config.active_profile,
                 "model": runtime.model_config.model,
             },
-            "qq": {
-                "available": qq_status.get("available"),
-                "armed": qq_status.get("armed"),
-                "dry_run": qq_status.get("dry_run"),
-                "active_group_name": qq_status.get("active_group_name"),
-                "expected_group_name": qq_status.get("expected_group_name"),
-                "group_matched": qq_status.get("group_matched"),
-            },
+            "onebot": onebot_status,
             "agent_loop": {
                 "running": loop_status.get("running"),
                 "pending_message_count": loop_status.get("pending_message_count"),
@@ -499,6 +552,12 @@ def create_app() -> FastAPI:
             },
             "instance": runtime.instance_guard.status(),
             "agent_settings": runtime.agent.settings.to_dict(),
+            "debug_chat": runtime.debug_chat.status()
+            | {
+                "transcript": [],
+                "latest_result": runtime.debug_chat.latest_result,
+            },
+            "remote_debug": runtime.remote_debug.status(),
         }
 
     @app.get("/api/debug/timeline")
@@ -510,6 +569,45 @@ def create_app() -> FastAPI:
             "source_event_count": len(source_events),
             "limit": safe_limit,
         }
+
+    @app.get("/api/debug-chat/status")
+    async def debug_chat_status() -> dict[str, Any]:
+        return runtime.debug_chat.status()
+
+    @app.post("/api/debug-chat/start")
+    async def debug_chat_start() -> dict[str, Any]:
+        return runtime.debug_chat.start()
+
+    @app.post("/api/debug-chat/stop")
+    async def debug_chat_stop() -> dict[str, Any]:
+        return runtime.debug_chat.stop()
+
+    @app.post("/api/debug-chat/message")
+    async def debug_chat_message(request: DebugChatMessageRequest) -> dict[str, Any]:
+        try:
+            return await runtime.debug_chat.send(
+                message=request.message,
+                user_name=request.user_name,
+                persona_guard=runtime.persona_guard,
+                model_client=runtime.model_clients.final,
+                max_tokens=request.max_tokens,
+            )
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.get("/api/remote-debug/status")
+    async def remote_debug_status() -> dict[str, Any]:
+        return runtime.remote_debug.status()
+
+    @app.post("/api/remote-debug/start")
+    async def remote_debug_start() -> dict[str, Any]:
+        return runtime.remote_debug.start()
+
+    @app.post("/api/remote-debug/stop")
+    async def remote_debug_stop() -> dict[str, Any]:
+        return runtime.remote_debug.stop()
 
     @app.get("/api/model/runtime")
     async def model_runtime() -> dict[str, Any]:
@@ -605,6 +703,7 @@ def create_app() -> FastAPI:
             extra_payload=dict(options["extra_payload"]),
             operation="raw_local",
         )
+
         runtime.store.append_event(
             source="model",
             kind="raw_local_chat_test",
@@ -655,9 +754,47 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="trace not found")
         return trace
 
-    @app.get("/api/qq/status")
-    async def qq_status() -> dict[str, Any]:
-        return runtime.qq.status().to_dict()
+    @app.websocket("/onebot/v11/ws")
+    async def onebot_reverse_websocket(websocket: WebSocket) -> None:
+        await runtime.onebot.serve(websocket)
+
+    @app.get("/api/onebot/status")
+    async def onebot_status() -> dict[str, Any]:
+        return await runtime.onebot_status()
+
+    @app.get("/api/onebot/groups")
+    async def onebot_groups() -> list[dict[str, Any]]:
+        try:
+            return [group.to_dict() for group in await runtime.onebot.groups()]
+        except Exception as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+
+    @app.get("/api/onebot/events/recent")
+    async def onebot_events_recent(limit: int = 50) -> list[dict[str, Any]]:
+        return runtime.onebot.recent_events(limit=limit)
+
+    @app.post("/api/onebot/group/select")
+    async def onebot_group_select(request: OneBotGroupSelectRequest) -> dict[str, Any]:
+        try:
+            status = await runtime.onebot.select_group(request.group_id)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        config_path = save_onebot_group_selection(
+            group_id=status.target_group_id,
+            group_name=status.target_group_name,
+        )
+        return {**status.to_dict(), "saved_to": str(config_path)}
+
+    @app.post("/api/onebot/send-test")
+    async def onebot_send_test(request: QQSendRequest) -> dict[str, Any]:
+        result = await runtime.onebot.send_text(request.text)
+        runtime.store.append_event(
+            source="onebot",
+            kind="send_test",
+            content=request.text,
+            metadata=result.to_dict(),
+        )
+        return result.to_dict()
 
     @app.get("/api/agent-loop/status")
     async def agent_loop_status() -> dict[str, Any]:
@@ -1004,95 +1141,6 @@ def create_app() -> FastAPI:
             kind="browser_read",
             content=request.url,
             metadata={"ok": result.ok, "reason": result.reason},
-        )
-        return result.to_dict()
-
-    @app.post("/api/qq/arm")
-    async def qq_arm() -> dict[str, Any]:
-        status = runtime.qq.arm().to_dict()
-        focus_result = await asyncio.to_thread(runtime.qq.focus_window, maximize=True)
-        payload = {
-            **status,
-            "arm_notice": {"sent": False, "reason": "arm_notice_disabled"},
-            "focus": focus_result,
-        }
-        runtime.store.append_event(
-            source="qq",
-            kind="armed",
-            content="QQ window checked",
-            metadata=payload,
-        )
-        return payload
-
-    @app.post("/api/qq/disarm")
-    async def qq_disarm() -> dict[str, Any]:
-        status = runtime.qq.disarm().to_dict()
-        return {**status, "disarm_allowed": False, "reason": "armed_is_window_availability"}
-
-    @app.post("/api/qq/probe")
-    async def qq_probe() -> dict[str, Any]:
-        try:
-            result = runtime.qq.probe()
-        except Exception as error:
-            runtime.store.append_event(
-                source="qq",
-                kind="probe_error",
-                content="QQ window probe failed",
-                metadata={"error": str(error)},
-            )
-            raise HTTPException(status_code=502, detail=str(error)) from error
-
-        artifact_path = project_path("artifacts/qq_uia_probe.json")
-        ensure_parent(artifact_path)
-        artifact_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        runtime.store.append_event(
-            source="qq",
-            kind="probe",
-            content="QQ window probed",
-            metadata={"artifact_path": str(artifact_path), "control_count": result.get("control_count")},
-        )
-        return result
-
-    @app.get("/api/qq/read")
-    async def qq_read() -> dict[str, Any]:
-        try:
-            result = runtime.qq.read_visible_context()
-        except Exception as error:
-            runtime.store.append_event(
-                source="qq",
-                kind="read_error",
-                content="QQ visible context read failed",
-                metadata={"error": str(error)},
-            )
-            raise HTTPException(status_code=502, detail=str(error)) from error
-        payload = result.to_dict()
-        payload["context_recording"] = runtime.loop.record_visible_read(result)
-        return payload
-
-    @app.get("/api/qq/read/scrollback")
-    async def qq_read_scrollback(pages: int = 3) -> dict[str, Any]:
-        try:
-            result = runtime.qq.read_scrollback_context(pages=pages)
-        except Exception as error:
-            runtime.store.append_event(
-                source="qq",
-                kind="scrollback_read_error",
-                content="QQ scrollback context read failed",
-                metadata={"error": str(error), "pages": pages},
-            )
-            raise HTTPException(status_code=502, detail=str(error)) from error
-        payload = result.to_dict()
-        payload["context_recording"] = runtime.loop.record_visible_read(result)
-        return payload
-
-    @app.post("/api/qq/send")
-    async def qq_send(request: QQSendRequest) -> dict[str, Any]:
-        result = runtime.qq.send_text(request.text)
-        runtime.store.append_event(
-            source="qq",
-            kind="send_attempt",
-            content=request.text,
-            metadata=result.to_dict(),
         )
         return result.to_dict()
 

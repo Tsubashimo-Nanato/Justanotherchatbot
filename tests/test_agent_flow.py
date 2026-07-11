@@ -361,6 +361,30 @@ def test_agent_raw_local_simulate_uses_live_routing(tmp_path):
     assert result.used_model is False
 
 
+def test_agent_local_direct_simulate_bypasses_attention_gate(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    model = SequenceModelClient(["蓝色是114514，刚才那串还没掉。"])
+    agent.model_client = model
+    agent.final_model_client = model
+    agent.gate_model_client = FailingModelClient()
+    agent.local_direct_mode = True
+
+    result = asyncio.run(
+        agent.simulate(
+            user_name="Tsubashimo Nanato",
+            message="刚刚说蓝色代表什么？",
+            external_context="Tsubashimo Nanato: 蓝色代表114514，红色代表1919810。",
+        )
+    )
+
+    assert result.action == "reply"
+    assert result.reply == "蓝色是114514，刚才那串还没掉。"
+    assert result.metadata["direct_chat"] is True
+    assert result.metadata["gate_decision"] is None
+    assert result.metadata["interaction_plan"]["directness"] == "direct_address"
+    assert len(model.messages) == 1
+
+
 def test_agent_qwen_first_mode_uses_single_structured_decision(tmp_path):
     agent, store = build_agent(tmp_path)
     model = SequenceModelClient(
@@ -880,7 +904,7 @@ def test_agent_loop_command_detail_is_metadata_not_message_text(tmp_path):
     assert result.metadata["prompt_tokens"] == 12
     assert "hello .detail" not in fake_model.messages[-1]["content"]
     assert "hello" in fake_model.messages[-1]["content"]
-    assert '"attention"' in fake_model.messages[-1]["content"]
+    assert "attention:" in fake_model.messages[-1]["content"]
     assert store.recent_events()[0].content == "hello"
     assert "memory_lines" not in result.metadata
     assert "memory_context" in result.metadata
@@ -1026,8 +1050,8 @@ def test_agent_loop_thinking_zero_uses_automatic_low_budget_for_simple_message(t
     assert result.metadata["max_thinking_level"] == 0
     assert result.metadata["thinking_level"] == 1
     assert result.metadata["thinking_complexity_level"] == 1
-    assert result.metadata["max_tokens"] == 96
-    assert fake_model.kwargs["max_tokens"] == 96
+    assert result.metadata["max_tokens"] == 180
+    assert fake_model.kwargs["max_tokens"] == 180
     assert "Thinking mode: lowest" in fake_model.messages[-1]["content"]
 
 
@@ -1041,7 +1065,7 @@ def test_explicit_high_think_forces_high_budget_for_current_message(tmp_path):
     assert result.metadata["requested_thinking_level"] == 3
     assert result.metadata["max_thinking_level"] == 3
     assert result.metadata["thinking_level"] == 3
-    assert result.metadata["max_tokens"] == 640
+    assert result.metadata["max_tokens"] == 768
     assert not result.metadata["placeholder_needed"]
 
 
@@ -1059,10 +1083,10 @@ def test_final_prompt_requires_pragmatic_reading_before_technical_answer(tmp_pat
     asyncio.run(agent.respond_to_incoming(user_name="tester", message="你问画师怎么用ai吗 .enforce"))
 
     final_prompt = fake_model.messages[-1]["content"]
-    assert "讽刺" in final_prompt
-    assert "不要只回答字面问题" in final_prompt
-    assert "do not write a tutorial-style answer" in final_prompt
-    assert "do not answer with only a confused marker" in final_prompt
+    assert "practical intent" in final_prompt
+    assert "Do not answer only the literal words" in final_prompt
+    assert "Do not write a tutorial-style answer" in final_prompt
+    assert "Do not answer with only a confused marker" in final_prompt
     assert "A single marker such as '诶？' is not enough" in final_prompt
 
 
@@ -1081,7 +1105,7 @@ def test_pragmatic_context_overrides_no_think_short_path(tmp_path):
 
     assert result.metadata["pragmatic_context_needed"]
     assert result.metadata["thinking_level"] == 2
-    assert result.metadata["max_tokens"] == 220
+    assert result.metadata["max_tokens"] == 320
 
 
 def test_context_builder_user_prompt_preserves_sarcasm_context(tmp_path):
@@ -1095,13 +1119,14 @@ def test_context_builder_user_prompt_preserves_sarcasm_context(tmp_path):
 
     built = agent.context_builder.build("tester", "你问画师怎么用ai吗")
     system_prompt = built.messages[0]["content"]
-    user_prompt = built.messages[1]["content"]
+    runtime_prompt = built.messages[1]["content"]
+    user_prompt = built.messages[2]["content"]
 
-    assert "语用判断" in system_prompt
-    assert "讽刺" in system_prompt
-    assert "真实矛盾" in system_prompt
-    assert "真实语气和意图" in user_prompt
-    assert "不要只回一个疑问词" in user_prompt
+    assert "Pragmatic reading" in system_prompt
+    assert "sarcasm" in system_prompt
+    assert "practical intent" in user_prompt
+    assert "Use recent chat only to resolve" in runtime_prompt
+    assert "Do not answer with only a confused word" in user_prompt
     assert any("画师教你怎么用 AI" in line for line in built.recent_lines)
 
 
@@ -1145,7 +1170,7 @@ def test_agent_set_updates_default_thinking_level(tmp_path):
     assert result.metadata["max_thinking_level"] == 0
     assert result.metadata["thinking_level"] == 1
     assert result.metadata["activity"] == 0.25
-    assert fake_model.kwargs["max_tokens"] == 96
+    assert fake_model.kwargs["max_tokens"] == 180
     assert any(event.kind == "agent_settings_update" for event in store.recent_events())
 
 
@@ -1327,7 +1352,7 @@ def test_agent_loop_web_context_enters_decision_prompt(tmp_path):
     assert result.metadata["web_query"] == "Qwen Wikipedia"
     assert result.metadata["thinking_level"] == 2
     assert "Qwen - Wikipedia" in fake_model.messages[-1]["content"]
-    assert "web_used: true" in fake_model.messages[-1]["content"]
+    assert "web_evidence: query=Qwen Wikipedia; sources=1" in fake_model.messages[-1]["content"]
 
 
 def test_agent_gate_no_reply_does_not_fetch_web(tmp_path):
@@ -1680,6 +1705,22 @@ def test_agent_gate_strips_thinking_before_json_parse(tmp_path):
     assert result.reason == "other_person"
 
 
+def test_agent_gate_tolerates_unescaped_quotes_in_reason(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    raw = (
+        '{"action":"reply","reason":"/no_think. The message "理我bb" is a direct call.",'
+        '"attention":"direct","attention_score":0.95}'
+    )
+
+    parsed = agent._parse_model_decision(raw)
+
+    assert parsed["action"] == "reply"
+    assert parsed["attention"] == "direct"
+    assert parsed["attention_score"] == 0.95
+    assert parsed["decision_parse_status"] == "loose_extracted_json"
+    assert "理我bb" in parsed["reason"]
+
+
 def test_context_excludes_qq_no_reply_turns(tmp_path):
     agent, store = build_agent(tmp_path)
     store.append_event(
@@ -1712,7 +1753,7 @@ def test_context_excludes_qq_no_reply_turns(tmp_path):
     assert any("ambient sentence" in line for line in built.recent_lines)
     assert all("assistant_no_reply" not in line for line in built.recent_lines)
     assert any("direct sentence" in line for line in built.recent_lines)
-    assert any("direct reply" in line for line in built.recent_lines)
+    assert all("direct reply" not in line for line in built.recent_lines)
 
 
 def test_context_includes_visible_context_only_messages(tmp_path):

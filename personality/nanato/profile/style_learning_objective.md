@@ -8,7 +8,7 @@ Nanato's local-first runtime goal is to let Qwen handle conversation decisions w
 
 - how P001 compresses meaning into short fragments;
 - when a short message is a follow-up rather than a new topic;
-- mixed Chinese/English/debug vocabulary;
+- mixed Chinese/English phrasing when it appears naturally in the current conversation;
 - punctuation habits and uneven rhythm;
 - bluntness, annoyance, teasing, and dry humor;
 - how P001 reacts when the bot misses context or becomes too soft;
@@ -17,7 +17,7 @@ Nanato's local-first runtime goal is to let Qwen handle conversation decisions w
 ## Do Not Learn As Style
 
 - one-off schedules, meals, health events, or weather plans;
-- raw debug logs, token traces, provider details, command output, screenshots, or QQ window artifacts;
+- raw debug logs, token traces, provider details, command output, screenshots, QQ window artifacts, or any debug vocabulary that is not part of the current user message;
 - fixed reply templates;
 - other users' style unless another task explicitly changes the target.
 

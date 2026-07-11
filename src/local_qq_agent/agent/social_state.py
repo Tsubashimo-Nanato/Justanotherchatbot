@@ -88,6 +88,8 @@ class SocialStateTracker:
         self,
         *,
         user_name: str,
+        user_id: str = "",
+        aliases: tuple[str, ...] = (),
         initial_affinity: float = DEFAULT_AFFINITY,
         source: str = "contact_seen",
     ) -> SocialSnapshot:
@@ -95,17 +97,39 @@ class SocialStateTracker:
         if not user_name:
             return self.snapshot("group member")
 
+        stable_name = self._profile_name_for_user_id(user_id, alias=user_name)
+        if stable_name:
+            self._record_seen(stable_name, source=source, created=False)
+            return self.snapshot(stable_name)
+
         existing = self.user_profile(user_name)
         if existing.affinity_source != "default":
+            if str(user_id).strip():
+                self.store.add_memory(
+                    kind="relationship",
+                    summary=f"{user_name}: affinity={existing.affinity:.2f}; bound to OneBot user ID.",
+                    confidence=0.9,
+                    metadata={
+                        "user_name": user_name,
+                        "external_user_id": str(user_id).strip(),
+                        "aliases": sorted({user_name, *(alias.strip() for alias in aliases if alias.strip())}),
+                        "affinity": existing.affinity,
+                        "source": "onebot_identity_binding",
+                        "overridable": True,
+                        "profile": True,
+                    },
+                )
             return self.snapshot(user_name)
 
         affinity = self._clamp(initial_affinity)
         self.store.add_memory(
             kind="relationship",
-            summary=f"{user_name}: affinity={affinity:.2f}; initialized from visible QQ context.",
+            summary=f"{user_name}: affinity={affinity:.2f}; initialized from OneBot contact context.",
             confidence=0.75,
             metadata={
                 "user_name": user_name,
+                "external_user_id": str(user_id).strip(),
+                "aliases": sorted({alias.strip() for alias in aliases if alias.strip()}),
                 "affinity": affinity,
                 "source": source,
                 "overridable": True,
@@ -114,6 +138,30 @@ class SocialStateTracker:
         )
         self._record_seen(user_name, source=source, created=True)
         return self.snapshot(user_name)
+
+    def _profile_name_for_user_id(self, user_id: str, *, alias: str = "") -> str:
+        stable_id = str(user_id).strip()
+        if not stable_id:
+            return ""
+        for memory in reversed(self.store.recent_memories(limit=500)):
+            if memory.kind != "relationship":
+                continue
+            if str(memory.metadata.get("external_user_id", "")) != stable_id:
+                continue
+            canonical_name = str(memory.metadata.get("user_name", "")).strip()
+            alias_value = alias.strip()
+            aliases = {str(item).strip() for item in memory.metadata.get("aliases", []) if str(item).strip()}
+            if alias_value and alias_value != canonical_name and alias_value not in aliases:
+                aliases.add(alias_value)
+                self.store.update_memory(
+                    memory_id=memory.id,
+                    kind=memory.kind,
+                    summary=memory.summary,
+                    confidence=memory.confidence,
+                    metadata={**memory.metadata, "aliases": sorted(aliases)},
+                )
+            return canonical_name
+        return ""
 
     def record_boundary_hit(self, *, user_name: str, reason: str) -> SocialSnapshot:
         current = self.snapshot(user_name)

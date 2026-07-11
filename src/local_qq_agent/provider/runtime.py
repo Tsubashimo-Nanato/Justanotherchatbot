@@ -80,13 +80,22 @@ class ProviderRuntime:
             traces=self.traces,
             usage=self.usage,
         )
-        if self.config.active_provider in {"local", "local_raw", "qwen"}:
+        if self.config.active_provider in {"local", "local_raw"}:
             return ProviderClientBundle(
                 primary=local_client,
                 gate=local_client,
                 final=local_client,
                 utility=local_client,
                 fallback=grok_client,
+                mode=self.config.active_provider,
+            )
+        if self.config.active_provider == "qwen":
+            return ProviderClientBundle(
+                primary=local_client,
+                gate=local_client,
+                final=local_client,
+                utility=local_client,
+                fallback=None,
                 mode=self.config.active_provider,
             )
         if self.config.active_provider in {"grok", "grok_responses"}:
@@ -280,6 +289,9 @@ class ProviderRuntime:
         return self.config.active_provider == "local_raw"
 
     def qwen_first_enabled(self) -> bool:
+        return False
+
+    def qwen_direct_enabled(self) -> bool:
         return self.config.active_provider == "qwen"
 
     def raw_local_options(self) -> dict[str, Any]:
@@ -302,7 +314,7 @@ class ProviderRuntime:
         if self.config.active_provider == "local_raw":
             return {"gate": "disabled", "final": "legacy_raw_qwen", "utility": "qwen"}
         if self.config.active_provider == "qwen":
-            return {"gate": "qwen_first", "final": "qwen", "utility": "qwen"}
+            return {"gate": "local_attention", "final": "qwen_direct", "utility": "qwen"}
         if self.config.active_provider == "local":
             return {"gate": "legacy_local", "final": "legacy_local", "utility": "local"}
         return {"gate": "unloaded", "final": "unloaded", "utility": "unloaded"}
