@@ -234,11 +234,11 @@ function Start-DebugServer {
     if (Wait-HttpOk "http://127.0.0.1:$DebugPort/debug" 45) {
         Write-DeployLog "Debug server is ready."
         try {
-            Invoke-RestMethod -Uri "http://127.0.0.1:$DebugPort/api/qq/disarm" -Method Post | Out-Null
-            Write-DeployLog "QQ adapter disarmed after startup."
+            $oneBotStatus = Invoke-RestMethod -Uri "http://127.0.0.1:$DebugPort/api/onebot/status" -Method Get
+            Write-DeployLog "OneBot status after startup: connected=$($oneBotStatus.connected), ready=$($oneBotStatus.ready), group=$($oneBotStatus.target_group_id)."
         }
         catch {
-            Write-DeployLog "QQ disarm after startup failed: $($_.Exception.Message)"
+            Write-DeployLog "OneBot status after startup failed: $($_.Exception.Message)"
         }
         return
     }
@@ -247,6 +247,12 @@ function Start-DebugServer {
 }
 
 Write-DeployLog "Deploy started."
+if (Get-Process -Name "NapCat*" -ErrorAction SilentlyContinue) {
+    Write-DeployLog "NapCat process detected. It must connect to ws://127.0.0.1:$DebugPort/onebot/v11/ws."
+}
+else {
+    Write-DeployLog "NapCat process was not detected. The debug UI will start disconnected; deploy does not install or launch NapCat."
+}
 Ensure-Venv
 if ($StartLocalModel) {
     Ensure-LlamaCudaRuntime

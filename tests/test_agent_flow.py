@@ -4,6 +4,7 @@ import asyncio
 from local_qq_agent.agent import LocalAgent, PersonaGuard
 from local_qq_agent.agent.context import ContextBuilder
 from local_qq_agent.agent.dialogue_state import DialogueStateTracker
+from local_qq_agent.agent.qwen_harness import normalize_qwen_decision
 from local_qq_agent.config import PersonaConfig
 from local_qq_agent.memory import SQLiteMemoryStore
 from local_qq_agent.tools import MathTool
@@ -17,12 +18,15 @@ class FakeReply:
     latency_seconds: float = 0.01
     usage: dict | None = None
     tokens_per_second: dict | None = None
+    metadata: dict | None = None
 
     def __post_init__(self):
         if self.usage is None:
             object.__setattr__(self, "usage", {})
         if self.tokens_per_second is None:
             object.__setattr__(self, "tokens_per_second", {})
+        if self.metadata is None:
+            object.__setattr__(self, "metadata", {})
 
 
 class FakeModelClient:
@@ -117,9 +121,27 @@ class PlainTextDecisionModelClient:
         return FakeReply(content="I would normally reply, but this is not JSON.")
 
 
+class PlainTextThenFailingRepairModelClient:
+    def __init__(self):
+        self.calls = 0
+
+    async def chat(self, messages, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return FakeReply(content="I would normally reply, but this is not JSON.")
+        raise RuntimeError("repair unavailable")
+
+
 class FailingModelClient:
     async def chat(self, messages, **kwargs):
         raise AssertionError("model should not be called")
+
+
+class FailingGrokModelClient:
+    provider_name = "grok"
+
+    async def chat(self, messages, **kwargs):
+        raise RuntimeError("provider exploded with a long internal error body")
 
 
 class FakeWebResearcher:
@@ -249,6 +271,455 @@ def test_agent_simulate_writes_user_and_reply_events(tmp_path):
     assert [event.kind for event in events] == ["group_message", "assistant_reply"]
 
 
+def test_agent_raw_local_mode_uses_single_user_message_without_context(tmp_path):
+    agent, store = build_agent(tmp_path)
+    model = SequenceModelClient(["raw reply"])
+    agent.model_client = model
+    agent.raw_local_mode = True
+    agent.raw_local_options = {
+        "max_tokens": 321,
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "stop": ["</s>"],
+        "extra_payload": {"repeat_penalty": 1.05},
+    }
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="tester", message="demo hello raw model"))
+
+    assert result.action == "reply"
+    assert result.reason == "raw_local_model"
+    assert result.metadata["raw_local"] is True
+    assert model.messages == [[{"role": "user", "content": "demo hello raw model"}]]
+    assert model.kwargs[0]["max_tokens"] == 321
+    assert model.kwargs[0]["temperature"] == 0.8
+    assert model.kwargs[0]["top_p"] == 0.95
+    assert model.kwargs[0]["stop"] == ["</s>"]
+    assert model.kwargs[0]["extra_payload"] == {"repeat_penalty": 1.05}
+    events = store.recent_events()
+    assert [event.kind for event in events] == ["group_message", "assistant_reply"]
+    assert events[-1].metadata["reason"] == "raw_local_model"
+
+
+def test_agent_raw_local_blocks_truncated_reply(tmp_path):
+    agent, store = build_agent(tmp_path)
+
+    class TruncatedModelClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def chat(self, messages, **kwargs):
+            self.calls += 1
+            return FakeReply(
+                content="unfinished answer",
+                usage={"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
+                metadata={"finish_reason": "length"},
+            )
+
+    model = TruncatedModelClient()
+    agent.model_client = model
+    agent.raw_local_mode = True
+    agent.raw_local_options = {"max_tokens": 4}
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="tester", message="demo hello raw model .enforce"))
+
+    assert result.action == "no_reply"
+    assert result.reason == "raw_local_output_truncated"
+    assert result.used_model is True
+    assert result.blocked is True
+    assert result.reply == ""
+    assert result.metadata["raw_local_truncated"] is True
+    assert result.metadata["truncated_reply_preview"] == "unfinished answer"
+    events = store.recent_events()
+    assert [event.kind for event in events] == ["group_message", "assistant_no_reply"]
+
+
+def test_agent_raw_local_mode_does_not_reply_to_ambient_message(tmp_path):
+    agent, store = build_agent(tmp_path)
+    agent.model_client = FailingModelClient()
+    agent.raw_local_mode = True
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="other", message="ambient side chat"))
+
+    assert result.action == "no_reply"
+    assert result.reason == "raw_local_not_addressed"
+    assert result.used_model is False
+    events = store.recent_events()
+    assert [event.kind for event in events] == ["group_message", "assistant_no_reply"]
+    assert events[0].metadata["agent_reason"] == "raw_local_not_addressed"
+    assert events[-1].metadata["reason"] == "raw_local_not_addressed"
+
+
+def test_agent_raw_local_simulate_uses_live_routing(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    agent.model_client = FailingModelClient()
+    agent.raw_local_mode = True
+
+    result = asyncio.run(agent.simulate(user_name="other", message="ambient simulate text"))
+
+    assert result.action == "no_reply"
+    assert result.reason == "raw_local_not_addressed"
+    assert result.used_model is False
+
+
+def test_agent_local_direct_simulate_bypasses_attention_gate(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    model = SequenceModelClient(["蓝色是114514，刚才那串还没掉。"])
+    agent.model_client = model
+    agent.final_model_client = model
+    agent.gate_model_client = FailingModelClient()
+    agent.local_direct_mode = True
+
+    result = asyncio.run(
+        agent.simulate(
+            user_name="Tsubashimo Nanato",
+            message="刚刚说蓝色代表什么？",
+            external_context="Tsubashimo Nanato: 蓝色代表114514，红色代表1919810。",
+        )
+    )
+
+    assert result.action == "reply"
+    assert result.reply == "蓝色是114514，刚才那串还没掉。"
+    assert result.metadata["direct_chat"] is True
+    assert result.metadata["gate_decision"] is None
+    assert result.metadata["interaction_plan"]["directness"] == "direct_address"
+    assert len(model.messages) == 1
+
+
+def test_agent_qwen_first_mode_uses_single_structured_decision(tmp_path):
+    agent, store = build_agent(tmp_path)
+    model = SequenceModelClient(
+        [
+            (
+                '{"action":"reply","reply":"还活着，怎么了","reason":"direct_address",'
+                '"thinking_summary":"name call","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            )
+        ]
+    )
+    agent.model_client = model
+    agent.final_model_client = model
+    agent.qwen_first_mode = True
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="tester", message="nanato 在吗"))
+
+    assert result.action == "reply"
+    assert result.reply == "还活着，怎么了"
+    assert result.reason == "direct_address"
+    assert result.metadata["qwen_first"] is True
+    assert "Qwen-first QQ harness mode" in model.messages[0][1]["content"]
+    qwen_user_prompt = model.messages[0][2]["content"]
+    assert "interaction policy:" in qwen_user_prompt
+    assert "reply_shape:" in qwen_user_prompt
+    assert "hook_budget:" in qwen_user_prompt
+    assert len(model.messages) == 1
+    events = store.recent_events()
+    assert [event.kind for event in events] == ["group_message", "assistant_reply"]
+
+
+def test_agent_qwen_first_rewrites_recent_self_repeat(tmp_path):
+    agent, store = build_agent(tmp_path)
+    model = SequenceModelClient(
+        [
+            (
+                '{"action":"reply","reply":"same stale line","reason":"direct_address",'
+                '"thinking_summary":"bad repeat","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+            (
+                '{"action":"reply","reply":"fresh answer with context","reason":"quality_repair",'
+                '"thinking_summary":"repaired repeat","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+        ]
+    )
+    store.append_event(
+        source="loop",
+        kind="loop_decision",
+        content="reply: previous",
+        metadata={"agent_reply": "same stale line"},
+    )
+    agent.model_client = model
+    agent.final_model_client = model
+    agent.qwen_first_mode = True
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="tester", message="nanato new thing"))
+
+    assert result.action == "reply"
+    assert result.reply == "fresh answer with context"
+    assert "recent_self_repeat" in result.metadata["quality_review"]["rule_hits"]
+    assert result.metadata["quality_rewrite_used"] is False
+    assert result.metadata["qwen_first_quality_repair_used"] is True
+    assert len(model.messages) == 2
+    assert "Quality repair required" in model.messages[1][1]["content"]
+    assert "Do not invent facts" in model.messages[1][1]["content"]
+    assert "recent QQ messages:" in model.messages[1][2]["content"]
+
+
+def test_agent_qwen_first_skips_low_affinity_ambient_short_ping(tmp_path):
+    agent, store = build_agent(tmp_path)
+    agent.model_client = FailingModelClient()
+    agent.final_model_client = FailingModelClient()
+    agent.qwen_first_mode = True
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="other user", message="😛"))
+
+    assert result.action == "no_reply"
+    assert result.reason == "ambient_short_ping_context_only"
+    assert result.used_model is False
+    assert result.metadata["qwen_first_pre_model_skip"] is True
+    assert result.metadata["interaction_plan"]["message_kind"] == "short_ping"
+    assert [event.kind for event in store.recent_events()] == ["group_message", "assistant_no_reply"]
+
+
+def test_qwen_decision_normalizes_null_memory_to_empty_text():
+    decision = normalize_qwen_decision(
+        {
+            "action": "reply",
+            "reply": "ok",
+            "reason": "direct",
+            "tool_name": "none",
+            "tool_query": None,
+            "memory_to_save": None,
+        }
+    )
+
+    assert decision["tool_query"] == ""
+    assert decision["memory_to_save"] == ""
+
+
+def test_agent_qwen_first_simulate_uses_live_routing(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    model = SequenceModelClient(
+        [
+            (
+                '{"action":"reply","reply":"在，怎么了","reason":"direct_address",'
+                '"thinking_summary":"simulate qwen first","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            )
+        ]
+    )
+    agent.model_client = model
+    agent.final_model_client = model
+    agent.qwen_first_mode = True
+
+    result = asyncio.run(agent.simulate(user_name="tester", message="nanato 在吗"))
+
+    assert result.action == "reply"
+    assert result.reply == "在，怎么了"
+    assert result.metadata["qwen_first"] is True
+    assert "Qwen-first QQ harness mode" in model.messages[0][1]["content"]
+
+
+def test_agent_qwen_first_mode_runs_requested_web_tool(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    model = SequenceModelClient(
+        [
+            (
+                '{"action":"tool_request","reply":"","reason":"needs_weather",'
+                '"thinking_summary":"needs current fact","target_message_ids":["current"],'
+                '"tool_name":"web","tool_query":"Tokyo Koto weather tomorrow","memory_to_save":""}'
+            ),
+            (
+                '{"action":"reply","reply":"明天大概会下雨，别硬跑。","reason":"answered_with_web",'
+                '"thinking_summary":"used tool result","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+        ]
+    )
+    web = TrackingWebResearcher()
+    agent.model_client = model
+    agent.final_model_client = model
+    agent.web_researcher = web
+    agent.qwen_first_mode = True
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="tester", message="nanato 明天江东区天气呢"))
+
+    assert result.action == "reply"
+    assert result.reply == "明天大概会下雨，别硬跑。"
+    assert result.metadata["qwen_first_initial_decision"]["action"] == "tool_request"
+    assert result.metadata["web_used"] is True
+    assert web.answer_calls == 1
+    assert len(model.messages) == 2
+
+
+def test_agent_qwen_first_quality_repair_keeps_context_grounded(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    model = SequenceModelClient(
+        [
+            (
+                '{"action":"reply","reply":"我草跑的我想吐","reason":"minimal_ack",'
+                '"thinking_summary":"echoed user","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+            (
+                '{"action":"reply","reply":"跑哪去了，跑到想吐？先别硬撑。","reason":"quality_repair",'
+                '"thinking_summary":"ask missing context without inventing","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+        ]
+    )
+    agent.model_client = model
+    agent.final_model_client = model
+    agent.qwen_first_mode = True
+
+    result = asyncio.run(
+        agent.respond_to_incoming(
+            user_name="Tsubashimo Nanato",
+            message="我草跑的我想吐",
+            reply_to_bot=True,
+        )
+    )
+
+    assert result.action == "reply"
+    assert result.reply == "跑哪去了，跑到想吐？先别硬撑。"
+    assert result.metadata["qwen_first_quality_repair_used"] is True
+    assert result.metadata["quality_rewrite_used"] is False
+    assert "dead_end_echo" in result.metadata["quality_review"]["rule_hits"]
+    assert "games, jobs" in model.messages[1][1]["content"]
+    assert "quality repair feedback:" in model.messages[1][2]["content"]
+
+
+def test_agent_qwen_first_uses_api_only_after_local_quality_repair_fails(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    local_model = SequenceModelClient(
+        [
+            (
+                '{"action":"reply","reply":"why do I feel sick after running?","reason":"minimal_ack",'
+                '"thinking_summary":"echoed user","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+            (
+                '{"action":"reply","reply":"why do I feel sick after running?","reason":"still_echo",'
+                '"thinking_summary":"failed repair","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+        ]
+    )
+    api_model = SequenceModelClient(
+        [
+            (
+                '{"action":"reply","reply":"Sounds like you pushed too hard; sit down first and drink a little water.","reason":"api_quality_fallback",'
+                '"thinking_summary":"grounded fallback","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            )
+        ]
+    )
+    api_model.provider_name = "grok"
+    agent.model_client = local_model
+    agent.final_model_client = local_model
+    agent.api_fallback_model_client = api_model
+    agent.qwen_first_mode = True
+
+    result = asyncio.run(
+        agent.respond_to_incoming(
+            user_name="Tsubashimo Nanato",
+            message="why do I feel sick after running?",
+            reply_to_bot=True,
+        )
+    )
+
+    assert result.action == "reply"
+    assert result.reply == "Sounds like you pushed too hard; sit down first and drink a little water."
+    assert result.metadata["qwen_first_quality_repair_used"] is True
+    assert result.metadata["api_quality_fallback_used"] is True
+    assert result.metadata["quality_reviewer_uncertain"] is True
+    assert result.metadata["api_quality_fallback_reason"] == "local_quality_repair_failed"
+    assert result.metadata["token_usage"]["api"]["rewrite"]["total"] == 13
+    assert len(local_model.messages) == 2
+    assert len(api_model.messages) == 1
+    api_prompt = "\n".join(message["content"] for message in api_model.messages[0])
+    assert "quality review is a diagnostic signal, not guaranteed truth" in api_prompt
+    assert "Do not invent facts" in api_prompt
+
+
+def test_agent_qwen_first_does_not_use_api_for_simple_short_ping(tmp_path):
+    agent, store = build_agent(tmp_path)
+    store.append_event(
+        source="loop",
+        kind="loop_decision",
+        content="reply: old",
+        metadata={"agent_reply": "same stale reply"},
+    )
+    local_model = SequenceModelClient(
+        [
+            (
+                '{"action":"reply","reply":"same stale reply","reason":"short_ping",'
+                '"thinking_summary":"bad repeat","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+            (
+                '{"action":"reply","reply":"same stale reply","reason":"still_repeat",'
+                '"thinking_summary":"failed local repair","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+        ]
+    )
+    api_model = SequenceModelClient(
+        [
+            (
+                '{"action":"reply","reply":"api should not be used","reason":"api_quality_fallback",'
+                '"thinking_summary":"","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            )
+        ]
+    )
+    api_model.provider_name = "grok"
+    agent.model_client = local_model
+    agent.final_model_client = local_model
+    agent.api_fallback_model_client = api_model
+    agent.qwen_first_mode = True
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="Tsubashimo Nanato", message="hi", reply_to_bot=True))
+
+    assert result.action == "no_reply"
+    assert result.reason == "quality_blocked"
+    assert result.metadata["interaction_plan"]["message_kind"] == "short_ping"
+    assert result.metadata["qwen_first_quality_repair_used"] is True
+    assert result.metadata["api_quality_fallback_used"] is False
+    assert result.metadata["api_quality_fallback_reason"] == "simple_turn_suppressed"
+    assert len(local_model.messages) == 2
+    assert len(api_model.messages) == 0
+
+
+def test_agent_qwen_first_outputs_short_error_when_full_quality_chain_errors(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    local_model = SequenceModelClient(
+        [
+            (
+                '{"action":"reply","reply":"why do I feel sick after running?","reason":"minimal_ack",'
+                '"thinking_summary":"echoed user","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+            (
+                '{"action":"reply","reply":"why do I feel sick after running?","reason":"still_echo",'
+                '"thinking_summary":"failed repair","target_message_ids":["current"],'
+                '"tool_name":"none","tool_query":"","memory_to_save":""}'
+            ),
+        ]
+    )
+    agent.model_client = local_model
+    agent.final_model_client = local_model
+    agent.api_fallback_model_client = FailingGrokModelClient()
+    agent.qwen_first_mode = True
+
+    result = asyncio.run(
+        agent.respond_to_incoming(
+            user_name="Tsubashimo Nanato",
+            message="why do I feel sick after running?",
+            reply_to_bot=True,
+        )
+    )
+
+    assert result.action == "reply"
+    assert result.reason == "api_quality_fallback_error"
+    assert result.reply == "This turn errored; the debug log has the details."
+    assert result.metadata["quality_chain_error"] is True
+    assert result.metadata["quality_chain_error_stage"] == "api_quality_fallback"
+    assert result.metadata["quality_chain_error_short_reply"] == result.reply
+    assert "provider exploded" in result.metadata["quality_chain_error_full"]
+    assert result.metadata["api_quality_fallback_error"] == result.metadata["quality_chain_error_full"]
+
+
 def test_agent_flags_ooc_before_model_reply(tmp_path):
     agent, store = build_agent(tmp_path)
 
@@ -351,6 +822,47 @@ def test_agent_rewrites_dead_end_status_echo(tmp_path):
     assert len(model.messages) == 2
 
 
+def test_dialogue_state_recovers_agent_reply_from_loop_decision_metadata(tmp_path):
+    agent, store = build_agent(tmp_path)
+    store.append_event(
+        source="loop",
+        kind="loop_decision",
+        content="reply: direct_quote_reply",
+        metadata={"agent_reply": "……？那你现在懂了没"},
+    )
+
+    state = DialogueStateTracker(store).for_turn(user_name="tester", message="懂啥", reply_to_bot=True)
+
+    assert state.obligation == "repair_required"
+    assert state.recent_agent_replies == ("……？那你现在懂了没",)
+
+
+def test_agent_rewrites_followup_reply_that_drops_previous_context(tmp_path):
+    agent, store, model = build_agent_with_profile(tmp_path, "- name: test persona")
+    model.replies = ["……？怎么突然打人", "我是说刚刚那句没说清，不是在说打人"]
+    store.append_event(
+        source="loop",
+        kind="loop_decision",
+        content="reply: direct_quote_reply",
+        metadata={"agent_reply": "……？那你现在懂了没"},
+    )
+
+    result = asyncio.run(
+        agent.respond_to_incoming(
+            user_name="tester",
+            message="懂啥",
+            reply_to_bot=True,
+        )
+    )
+
+    assert result.action == "reply"
+    assert result.reply == "我是说刚刚那句没说清，不是在说打人"
+    assert result.metadata["dialogue_state"]["obligation"] == "repair_required"
+    assert "unanswered_followup" in result.metadata["quality_review"]["rule_hits"]
+    assert result.metadata["quality_rewrite_used"]
+    assert len(model.messages) == 2
+
+
 def test_agent_does_not_treat_alias_in_prompt_injection_as_direct_call(tmp_path):
     agent, _store, model = build_agent_with_profile(
         tmp_path,
@@ -392,7 +904,7 @@ def test_agent_loop_command_detail_is_metadata_not_message_text(tmp_path):
     assert result.metadata["prompt_tokens"] == 12
     assert "hello .detail" not in fake_model.messages[-1]["content"]
     assert "hello" in fake_model.messages[-1]["content"]
-    assert '"attention"' in fake_model.messages[-1]["content"]
+    assert "attention:" in fake_model.messages[-1]["content"]
     assert store.recent_events()[0].content == "hello"
     assert "memory_lines" not in result.metadata
     assert "memory_context" in result.metadata
@@ -408,6 +920,21 @@ def test_agent_loop_ignore_command_skips_model_and_user_event(tmp_path):
     assert result.reason == "ignored_by_command"
     assert not result.used_model
     assert result.metadata["ignored"]
+    events = store.recent_events()
+    assert [event.kind for event in events] == ["assistant_no_reply"]
+
+
+def test_agent_loop_short_ignore_command_skips_model_and_user_event(tmp_path):
+    agent, store = build_agent(tmp_path)
+    agent.model_client = FailingModelClient()
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="tester", message="hello.i"))
+
+    assert result.action == "no_reply"
+    assert result.reason == "ignored_by_command"
+    assert not result.used_model
+    assert result.metadata["ignored"]
+    assert result.metadata["command_suffixes"] == [".i"]
     events = store.recent_events()
     assert [event.kind for event in events] == ["assistant_no_reply"]
 
@@ -506,6 +1033,7 @@ def test_agent_reboot_request_skips_model(tmp_path):
 
     assert result.action == "reply"
     assert result.reason == "reboot_requested"
+    assert result.reply == "重启了，等我一下"
     assert not result.used_model
     assert result.metadata["reboot_requested"]
     assert result.metadata["reboot_scope"] == "agent_only"
@@ -522,8 +1050,8 @@ def test_agent_loop_thinking_zero_uses_automatic_low_budget_for_simple_message(t
     assert result.metadata["max_thinking_level"] == 0
     assert result.metadata["thinking_level"] == 1
     assert result.metadata["thinking_complexity_level"] == 1
-    assert result.metadata["max_tokens"] == 96
-    assert fake_model.kwargs["max_tokens"] == 96
+    assert result.metadata["max_tokens"] == 180
+    assert fake_model.kwargs["max_tokens"] == 180
     assert "Thinking mode: lowest" in fake_model.messages[-1]["content"]
 
 
@@ -537,7 +1065,7 @@ def test_explicit_high_think_forces_high_budget_for_current_message(tmp_path):
     assert result.metadata["requested_thinking_level"] == 3
     assert result.metadata["max_thinking_level"] == 3
     assert result.metadata["thinking_level"] == 3
-    assert result.metadata["max_tokens"] == 640
+    assert result.metadata["max_tokens"] == 768
     assert not result.metadata["placeholder_needed"]
 
 
@@ -555,10 +1083,10 @@ def test_final_prompt_requires_pragmatic_reading_before_technical_answer(tmp_pat
     asyncio.run(agent.respond_to_incoming(user_name="tester", message="你问画师怎么用ai吗 .enforce"))
 
     final_prompt = fake_model.messages[-1]["content"]
-    assert "讽刺" in final_prompt
-    assert "不要只回答字面问题" in final_prompt
-    assert "do not write a tutorial-style answer" in final_prompt
-    assert "do not answer with only a confused marker" in final_prompt
+    assert "practical intent" in final_prompt
+    assert "Do not answer only the literal words" in final_prompt
+    assert "Do not write a tutorial-style answer" in final_prompt
+    assert "Do not answer with only a confused marker" in final_prompt
     assert "A single marker such as '诶？' is not enough" in final_prompt
 
 
@@ -577,7 +1105,7 @@ def test_pragmatic_context_overrides_no_think_short_path(tmp_path):
 
     assert result.metadata["pragmatic_context_needed"]
     assert result.metadata["thinking_level"] == 2
-    assert result.metadata["max_tokens"] == 220
+    assert result.metadata["max_tokens"] == 320
 
 
 def test_context_builder_user_prompt_preserves_sarcasm_context(tmp_path):
@@ -591,13 +1119,14 @@ def test_context_builder_user_prompt_preserves_sarcasm_context(tmp_path):
 
     built = agent.context_builder.build("tester", "你问画师怎么用ai吗")
     system_prompt = built.messages[0]["content"]
-    user_prompt = built.messages[1]["content"]
+    runtime_prompt = built.messages[1]["content"]
+    user_prompt = built.messages[2]["content"]
 
-    assert "语用判断" in system_prompt
-    assert "讽刺" in system_prompt
-    assert "真实矛盾" in system_prompt
-    assert "真实语气和意图" in user_prompt
-    assert "不要只回一个疑问词" in user_prompt
+    assert "Pragmatic reading" in system_prompt
+    assert "sarcasm" in system_prompt
+    assert "practical intent" in user_prompt
+    assert "Use recent chat only to resolve" in runtime_prompt
+    assert "Do not answer with only a confused word" in user_prompt
     assert any("画师教你怎么用 AI" in line for line in built.recent_lines)
 
 
@@ -641,7 +1170,7 @@ def test_agent_set_updates_default_thinking_level(tmp_path):
     assert result.metadata["max_thinking_level"] == 0
     assert result.metadata["thinking_level"] == 1
     assert result.metadata["activity"] == 0.25
-    assert fake_model.kwargs["max_tokens"] == 96
+    assert fake_model.kwargs["max_tokens"] == 180
     assert any(event.kind == "agent_settings_update" for event in store.recent_events())
 
 
@@ -719,11 +1248,28 @@ def test_agent_update_settings_records_source(tmp_path):
 
     result = agent.update_settings(default_thinking_level=2, activity=0.6, source="test")
 
-    assert result == {"default_thinking_level": 2, "activity": 0.6}
+    assert result["default_thinking_level"] == 2
+    assert result["activity"] == 0.6
+    assert result["debug_mode"] == 0
     event = store.recent_events(limit=1)[0]
     assert event.kind == "agent_settings_update"
     assert event.metadata["source"] == "test"
     assert event.metadata["updates"] == {"default_thinking_level": 2, "activity": 0.6}
+
+
+def test_agent_debug_mode_command_updates_settings(tmp_path):
+    agent, store = build_agent(tmp_path)
+    agent.model_client = FailingModelClient()
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="tester", message=".dm 1"))
+
+    assert result.action == "reply"
+    assert result.reason == "debug_mode_updated"
+    assert result.metadata["settings"]["debug_mode"] == 1
+    assert agent.settings.debug_mode == 1
+    event = next(event for event in store.recent_events() if event.kind == "agent_settings_update")
+    assert event.kind == "agent_settings_update"
+    assert event.metadata["updates"] == {"debug_mode": 1}
 
 
 def test_agent_score_records_behavior_feedback_without_reply(tmp_path):
@@ -806,7 +1352,7 @@ def test_agent_loop_web_context_enters_decision_prompt(tmp_path):
     assert result.metadata["web_query"] == "Qwen Wikipedia"
     assert result.metadata["thinking_level"] == 2
     assert "Qwen - Wikipedia" in fake_model.messages[-1]["content"]
-    assert "web_used: true" in fake_model.messages[-1]["content"]
+    assert "web_evidence: query=Qwen Wikipedia; sources=1" in fake_model.messages[-1]["content"]
 
 
 def test_agent_gate_no_reply_does_not_fetch_web(tmp_path):
@@ -1093,8 +1639,22 @@ def test_agent_loop_invalid_decision_fails_closed_after_repair_failure(tmp_path)
     result = asyncio.run(agent.respond_to_incoming(user_name="tester", message="ambient sentence"))
 
     assert result.action == "no_reply"
-    assert result.reason == "gate_invalid_decision"
+    assert result.reason == "gate_invalid_fail_closed"
     assert result.metadata["gate_decision"]["raw_decision"]["decision_parse_status"] == "repair_failed"
+    assert result.metadata["gate_decision"]["raw_decision"]["engagement_decision"]["reply_probability"] == 0.0
+    assert not result.reply
+    assert store.recent_events()[-1].kind == "assistant_no_reply"
+
+
+def test_agent_loop_invalid_decision_repair_unavailable_fails_closed(tmp_path):
+    agent, store = build_agent(tmp_path)
+    agent.model_client = PlainTextThenFailingRepairModelClient()
+
+    result = asyncio.run(agent.respond_to_incoming(user_name="tester", message="ambient sentence"))
+
+    assert result.action == "no_reply"
+    assert result.reason == "gate_invalid_fail_closed"
+    assert result.metadata["gate_decision"]["raw_decision"]["decision_parse_status"] == "repair_unavailable"
     assert not result.reply
     assert store.recent_events()[-1].kind == "assistant_no_reply"
 
@@ -1145,6 +1705,22 @@ def test_agent_gate_strips_thinking_before_json_parse(tmp_path):
     assert result.reason == "other_person"
 
 
+def test_agent_gate_tolerates_unescaped_quotes_in_reason(tmp_path):
+    agent, _store = build_agent(tmp_path)
+    raw = (
+        '{"action":"reply","reason":"/no_think. The message "理我bb" is a direct call.",'
+        '"attention":"direct","attention_score":0.95}'
+    )
+
+    parsed = agent._parse_model_decision(raw)
+
+    assert parsed["action"] == "reply"
+    assert parsed["attention"] == "direct"
+    assert parsed["attention_score"] == 0.95
+    assert parsed["decision_parse_status"] == "loose_extracted_json"
+    assert "理我bb" in parsed["reason"]
+
+
 def test_context_excludes_qq_no_reply_turns(tmp_path):
     agent, store = build_agent(tmp_path)
     store.append_event(
@@ -1177,7 +1753,7 @@ def test_context_excludes_qq_no_reply_turns(tmp_path):
     assert any("ambient sentence" in line for line in built.recent_lines)
     assert all("assistant_no_reply" not in line for line in built.recent_lines)
     assert any("direct sentence" in line for line in built.recent_lines)
-    assert any("direct reply" in line for line in built.recent_lines)
+    assert all("direct reply" not in line for line in built.recent_lines)
 
 
 def test_context_includes_visible_context_only_messages(tmp_path):

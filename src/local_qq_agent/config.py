@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any
 
@@ -269,56 +270,66 @@ class MemoryConfig:
 
 
 @dataclass(frozen=True)
-class QQConfig:
-    window_title_regex: str
-    expected_group_name: str
+class OneBotConfig:
+    reverse_ws_path: str
+    access_token: str
+    target_group_id: str
+    target_group_name: str
     target_sender_name: str
     bot_sender_name: str
-    dry_run: bool
-    send_requires_armed: bool
-    verify_after_send: bool
-    probe_max_depth: int
-    probe_max_children: int
-    poll_interval_seconds: float
     max_messages_per_tick: int
     ignore_existing_on_start: bool
-    idle_poll_interval_seconds: float = 5.0
-    idle_poll_after_ticks: int = 3
-    read_timeout_seconds: float = 8.0
+    action_timeout_seconds: float = 8.0
+    send_timeout_seconds: float = 15.0
     duplicate_suppression_seconds: float = 3600.0
     turn_quiet_period_seconds: float = 6.0
-    scrollback_on_new_messages: bool = True
-    scrollback_pages_on_new_messages: int = 2
+    startup_scrollback_readable_messages: int = 30
+    event_log_limit: int = 200
     bot_sender_aliases: tuple[str, ...] = ()
 
     @classmethod
-    def load(cls, path: str | Path = "config/qq.yaml") -> "QQConfig":
+    def load(cls, path: str | Path = "config/onebot.yaml") -> "OneBotConfig":
         raw = read_yaml(path)
         local_path = Path(path).with_name(f"{Path(path).stem}.local.yaml")
         if local_path.exists():
             raw = {**raw, **read_yaml(local_path)}
         return cls(
-            window_title_regex=require_string(raw, "window_title_regex"),
-            expected_group_name=str(raw.get("expected_group_name", "")),
+            reverse_ws_path=str(raw.get("reverse_ws_path", "/onebot/v11/ws")),
+            access_token=os.getenv("ONEBOT_ACCESS_TOKEN", str(raw.get("access_token", ""))).strip(),
+            target_group_id=str(raw.get("target_group_id", "")).strip(),
+            target_group_name=str(raw.get("target_group_name", "")).strip(),
             target_sender_name=str(raw.get("target_sender_name", "")),
             bot_sender_name=str(raw.get("bot_sender_name", "")),
-            dry_run=optional_bool(raw, "dry_run", True),
-            send_requires_armed=optional_bool(raw, "send_requires_armed", True),
-            verify_after_send=optional_bool(raw, "verify_after_send", True),
-            probe_max_depth=optional_int(raw, "probe_max_depth", 4),
-            probe_max_children=optional_int(raw, "probe_max_children", 250),
-            poll_interval_seconds=optional_float(raw, "poll_interval_seconds", 1.0),
-            idle_poll_interval_seconds=optional_float(raw, "idle_poll_interval_seconds", 5.0),
-            idle_poll_after_ticks=optional_int(raw, "idle_poll_after_ticks", 3),
             max_messages_per_tick=optional_int(raw, "max_messages_per_tick", 2),
             ignore_existing_on_start=optional_bool(raw, "ignore_existing_on_start", True),
-            read_timeout_seconds=optional_float(raw, "read_timeout_seconds", 8.0),
+            action_timeout_seconds=optional_float(raw, "action_timeout_seconds", 8.0),
+            send_timeout_seconds=optional_float(raw, "send_timeout_seconds", 15.0),
             duplicate_suppression_seconds=optional_float(raw, "duplicate_suppression_seconds", 3600.0),
             turn_quiet_period_seconds=optional_float(raw, "turn_quiet_period_seconds", 6.0),
-            scrollback_on_new_messages=optional_bool(raw, "scrollback_on_new_messages", True),
-            scrollback_pages_on_new_messages=optional_int(raw, "scrollback_pages_on_new_messages", 2),
+            startup_scrollback_readable_messages=optional_int(raw, "startup_scrollback_readable_messages", 30),
+            event_log_limit=optional_int(raw, "event_log_limit", 200),
             bot_sender_aliases=optional_string_tuple(raw, "bot_sender_aliases"),
         )
+
+
+def save_onebot_group_selection(
+    *,
+    group_id: str,
+    group_name: str,
+    path: str | Path = "config/onebot.local.yaml",
+) -> Path:
+    selected_id = str(group_id).strip()
+    if not selected_id:
+        raise ValueError("group_id must not be empty")
+    resolved = project_path(path)
+    existing = read_yaml(resolved) if resolved.exists() else {}
+    existing["target_group_id"] = selected_id
+    existing["target_group_name"] = str(group_name).strip()
+    resolved.write_text(
+        yaml.safe_dump(existing, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -408,6 +419,11 @@ class ProviderConfig:
     degrade_at_ratio: float
     per_message_input_token_budget: int
     enforce_input_budget: bool
+    raw_local_max_tokens: int
+    raw_local_temperature: float
+    raw_local_top_p: float
+    raw_local_stop: tuple[str, ...]
+    raw_local_extra_payload: dict[str, Any]
     require_duplicate_soak_for_cloud_loop: bool
     duplicate_soak_passed: bool
 
@@ -435,12 +451,27 @@ class ProviderConfig:
             runtime = {}
         if not isinstance(runtime, dict):
             raise ConfigError("runtime must be a mapping")
+        raw_local = raw.get("raw_local", {})
+        if raw_local is None:
+            raw_local = {}
+        if not isinstance(raw_local, dict):
+            raise ConfigError("raw_local must be a mapping")
+        raw_local_stop = raw_local.get("stop", [])
+        if raw_local_stop is None:
+            raw_local_stop = []
+        if not isinstance(raw_local_stop, list) or not all(isinstance(item, str) for item in raw_local_stop):
+            raise ConfigError("raw_local.stop must be a list of strings")
+        raw_local_extra = raw_local.get("extra_payload", {})
+        if raw_local_extra is None:
+            raw_local_extra = {}
+        if not isinstance(raw_local_extra, dict):
+            raise ConfigError("raw_local.extra_payload must be a mapping")
         safety = raw.get("safety", {})
         if not isinstance(safety, dict):
             raise ConfigError("safety must be a mapping")
 
         provider = str(raw.get("active_provider", "unloaded")).strip().casefold()
-        if provider not in {"unloaded", "local", "grok", "hybrid", "grok_responses", "hybrid_responses"}:
+        if provider not in {"unloaded", "local", "local_raw", "qwen", "grok", "hybrid", "grok_responses", "hybrid_responses"}:
             raise ConfigError(f"unsupported provider: {provider}")
         reasoning_choices = {"none", "low", "medium", "high"}
 
@@ -472,6 +503,11 @@ class ProviderConfig:
             degrade_at_ratio=min(max(optional_float(budget, "degrade_at_ratio", 0.8), 0.0), 1.0),
             per_message_input_token_budget=optional_int(runtime, "per_message_input_token_budget", 12000),
             enforce_input_budget=optional_bool(runtime, "enforce_input_budget", True),
+            raw_local_max_tokens=optional_int(raw_local, "max_tokens", 512),
+            raw_local_temperature=float(raw_local.get("temperature", 0.7)),
+            raw_local_top_p=float(raw_local.get("top_p", 0.9)),
+            raw_local_stop=tuple(item for item in raw_local_stop if item),
+            raw_local_extra_payload=dict(raw_local_extra),
             require_duplicate_soak_for_cloud_loop=optional_bool(
                 safety,
                 "require_duplicate_soak_for_cloud_loop",

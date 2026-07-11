@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 import re
 from typing import Any
 
+from local_qq_agent.agent.event_filters import is_runtime_agent_reply, is_runtime_group_message
 from local_qq_agent.memory.store import EventRecord, SQLiteMemoryStore
 
 
@@ -25,9 +26,18 @@ class DialogueState:
 
 
 class DialogueStateTracker:
-    def __init__(self, store: SQLiteMemoryStore, *, recent_event_limit: int = 80) -> None:
+    def __init__(
+        self,
+        store: SQLiteMemoryStore,
+        *,
+        recent_event_limit: int = 300,
+        min_event_id: int = 0,
+        include_api_events: bool = False,
+    ) -> None:
         self.store = store
         self.recent_event_limit = max(8, recent_event_limit)
+        self.min_event_id = max(0, int(min_event_id))
+        self.include_api_events = bool(include_api_events)
 
     def for_turn(self, *, user_name: str, message: str, reply_to_bot: bool) -> DialogueState:
         events = self.store.recent_events(limit=self.recent_event_limit)
@@ -71,18 +81,50 @@ class DialogueStateTracker:
     def _recent_agent_replies(self, events: list[EventRecord]) -> list[str]:
         replies: list[str] = []
         for event in events:
-            if event.kind not in {"assistant_reply", "assistant_blocked"}:
-                continue
-            text = event.content.strip()
+            text = self._agent_reply_text(event)
             if not text or text.startswith("Command resolved:"):
+                continue
+            if replies and replies[-1] == text:
                 continue
             replies.append(text)
         return replies[-4:]
 
+    def _agent_reply_text(self, event: EventRecord) -> str:
+        if not is_runtime_agent_reply(
+            event,
+            min_event_id=self.min_event_id,
+            include_api_events=self.include_api_events,
+        ):
+            return ""
+        if event.kind in {"assistant_reply", "assistant_blocked"}:
+            return event.content.strip()
+        if event.kind != "loop_decision":
+            return ""
+
+        reply = event.metadata.get("agent_reply")
+        if isinstance(reply, str) and reply.strip():
+            return reply.strip()
+
+        result = event.metadata.get("result")
+        if isinstance(result, dict):
+            reply = result.get("reply")
+            if isinstance(reply, str) and reply.strip():
+                return reply.strip()
+            metadata = result.get("metadata")
+            if isinstance(metadata, dict):
+                cleaned = metadata.get("cleaned_reply")
+                if isinstance(cleaned, str) and cleaned.strip():
+                    return cleaned.strip()
+        return ""
+
     def _recent_user_turns(self, events: list[EventRecord], *, user_name: str) -> list[str]:
         turns: list[str] = []
         for event in events:
-            if event.kind != "group_message":
+            if not is_runtime_group_message(
+                event,
+                min_event_id=self.min_event_id,
+                include_api_events=self.include_api_events,
+            ):
                 continue
             sender = str(event.metadata.get("sender_name") or event.source).strip()
             if sender != user_name:
@@ -121,6 +163,10 @@ class DialogueStateTracker:
             "回答",
             "说清楚",
             "解释",
+            "啥",
+            "啥意思",
+            "什么意思",
+            "懂啥",
         )
         return any(marker in text for marker in interrogatives)
 
@@ -134,7 +180,9 @@ class DialogueStateTracker:
         user_turns: list[str],
         question_like: bool,
     ) -> list[str]:
-        if obligation == "none" and not agent_replies:
+        if obligation == "none" and not question_like:
+            return []
+        if obligation == "none" and not agent_replies and not user_turns:
             return []
 
         lines = [
@@ -154,7 +202,7 @@ class DialogueStateTracker:
                 "dialogue_rule: The latest turn looks question-like. Use recent context to decide whether it asks about the character's previous words."
             )
 
-        if agent_replies:
+        if agent_replies and obligation in {"answer_required", "repair_required"}:
             lines.append(
                 "consistency_rule: Treat recent_agent_replies as things the character just said. "
                 "If they are unclear or conflict, repair the wording and preserve continuity instead of inventing a new incompatible self-fact."

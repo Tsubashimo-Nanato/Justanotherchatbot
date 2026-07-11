@@ -1,6 +1,6 @@
 import asyncio
 
-from local_qq_agent.config import QQConfig
+from local_qq_agent.config import OneBotConfig
 from local_qq_agent.memory import SQLiteMemoryStore
 from local_qq_agent.server.agent_loop import AgentLoop
 from local_qq_agent.server.instance_guard import AgentInstanceGuard
@@ -51,21 +51,34 @@ def build_loop(tmp_path, *, active=True):
         active_callback = lambda: bool(active)
     return AgentLoop(
         agent=None,
-        qq=None,
+        gateway=FakeGateway(),
         store=store,
-        config=QQConfig(
-            window_title_regex="QQ",
-            expected_group_name="target group",
+        config=OneBotConfig(
+            reverse_ws_path="/onebot/v11/ws",
+            access_token="",
+            target_group_id="123",
+            target_group_name="target group",
             target_sender_name="target user",
             bot_sender_name="bot user",
-            dry_run=True,
-            send_requires_armed=True,
-            verify_after_send=True,
-            probe_max_depth=6,
-            probe_max_children=100,
-            poll_interval_seconds=1.0,
             max_messages_per_tick=1,
             ignore_existing_on_start=False,
         ),
         is_active_instance=active_callback,
     )
+
+
+class FakeStatus:
+    target_group_id = "123"
+    target_group_name = "target group"
+    ready = True
+
+    def to_dict(self):
+        return {"ready": True, "target_group_id": "123", "target_group_name": "target group"}
+
+
+class FakeGateway:
+    def add_message_listener(self, listener):
+        self.listener = listener
+
+    def status(self):
+        return FakeStatus()

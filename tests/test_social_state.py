@@ -60,6 +60,7 @@ def test_contact_initialization_sets_default_affinity_once(tmp_path):
     assert first.source == "target_contact_seed"
     assert second.affinity == 1.0
     assert second.source == "target_contact_seed"
+    assert [event.kind for event in store.recent_events()].count("user_profile_seen") == 1
 
 
 def test_context_builder_includes_social_state_lines(tmp_path):
@@ -90,6 +91,51 @@ def test_context_builder_keeps_stable_prefix_when_runtime_context_changes(tmp_pa
     assert "user affinity for tester: 0.90" in second.messages[1]["content"]
 
 
+def test_context_builder_does_not_include_unrelated_recent_memory(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    builder = ContextBuilder(store, build_guard())
+    store.add_memory(kind="fact", summary="Tsubashimo Nanato: 蓝色 represents 114514", confidence=0.9)
+    store.add_memory(kind="working_context", summary="Tsubashimo Nanato: recent personal context: 早上没吃饭", confidence=0.7)
+
+    built = builder.build("Tsubashimo Nanato", "今天吃什么比较好")
+
+    assert any("早上没吃饭" in line for line in built.memory_lines)
+    assert not any("蓝色" in line for line in built.memory_lines)
+
+
+def test_context_builder_keeps_relevant_mapping_memory(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    builder = ContextBuilder(store, build_guard())
+    store.add_memory(kind="fact", summary="Tsubashimo Nanato: 蓝色 represents 114514", confidence=0.9)
+    store.add_memory(kind="fact", summary="Tsubashimo Nanato: 红色 represents 1919810", confidence=0.9)
+
+    built = builder.build("Tsubashimo Nanato", "红色呢")
+
+    assert any("红色" in line and "1919810" in line for line in built.memory_lines)
+
+
+def test_context_builder_memory_summary_can_use_recent_memories(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    builder = ContextBuilder(store, build_guard())
+    store.add_memory(kind="fact", summary="Tsubashimo Nanato: 蓝色 represents 114514", confidence=0.9)
+    store.add_memory(kind="plan", summary="Tsubashimo Nanato: plan: 下午去学校", confidence=0.7)
+
+    built = builder.build("Tsubashimo Nanato", "最后总结一下你刚刚记住了什么")
+
+    assert any("蓝色" in line for line in built.memory_lines)
+    assert any("下午去学校" in line for line in built.memory_lines)
+
+
+def test_context_builder_schedule_reference_can_use_plan_memory(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    builder = ContextBuilder(store, build_guard())
+    store.add_memory(kind="plan", summary="Tsubashimo Nanato: plan: 下午去学校", confidence=0.7)
+
+    built = builder.build("Tsubashimo Nanato", "我下午那个安排是什么")
+
+    assert any("下午去学校" in line for line in built.memory_lines)
+
+
 def test_user_profiles_include_seen_messages_and_manual_profile(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
     tracker = SocialStateTracker(store)
@@ -112,3 +158,38 @@ def test_user_profiles_include_seen_messages_and_manual_profile(tmp_path):
     assert profiles["visible user"]["affinity"] == 0.5
     assert profiles["manual user"]["affinity"] == 0.8
     assert profiles["manual user"]["language_preference"] == "mixed"
+
+
+def test_context_builder_api_events_are_opt_in(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    guard = build_guard()
+    store.append_event(
+        source="tester",
+        kind="group_message",
+        content="first api turn",
+        metadata={
+            "origin": "api",
+            "agent_action": "reply",
+            "sender_name": "tester",
+            "clean_text": "first api turn",
+        },
+    )
+
+    default_context = ContextBuilder(store, guard).build("tester", "what did I say")
+    opt_in_context = ContextBuilder(store, guard, include_api_events=True).build("tester", "what did I say")
+
+    assert not any("first api turn" in line for line in default_context.recent_lines)
+    assert any("first api turn" in line for line in opt_in_context.recent_lines)
+def test_onebot_user_id_keeps_profile_stable_when_group_card_changes(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    tracker = SocialStateTracker(store)
+
+    first = tracker.ensure_contact(user_name="old card", user_id="12345", initial_affinity=0.8)
+    renamed = tracker.ensure_contact(user_name="new card", user_id="12345", initial_affinity=0.5)
+
+    assert first.user_name == "old card"
+    assert renamed.user_name == "old card"
+    relationships = [item for item in store.recent_memories(limit=20) if item.kind == "relationship"]
+    assert len(relationships) == 1
+    assert relationships[0].metadata["external_user_id"] == "12345"
+    assert "new card" in relationships[0].metadata["aliases"]

@@ -103,8 +103,125 @@ class SQLiteMemoryStore:
 
                 CREATE INDEX IF NOT EXISTS idx_memories_kind
                     ON memories(kind);
+
+                CREATE TABLE IF NOT EXISTS transport_turns (
+                    canonical_turn_id TEXT PRIMARY KEY,
+                    message_id TEXT NOT NULL,
+                    self_id TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    sender_name TEXT NOT NULL,
+                    message_text TEXT NOT NULL,
+                    source_message_ids_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_transport_turns_group_message
+                    ON transport_turns(group_id, message_id);
                 """
             )
+
+    def observe_transport_turn(
+        self,
+        *,
+        canonical_turn_id: str,
+        message_id: str,
+        self_id: str,
+        group_id: str,
+        user_id: str,
+        sender_name: str,
+        message_text: str,
+        source_message_ids: list[str] | None = None,
+        state: str = "observed",
+        metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        """Insert a platform message once. False means this event was already observed."""
+        if not canonical_turn_id.strip():
+            raise ValueError("canonical_turn_id must not be empty")
+        now = utc_now()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO transport_turns(
+                    canonical_turn_id, message_id, self_id, group_id, user_id,
+                    sender_name, message_text, source_message_ids_json, state,
+                    first_seen_at, updated_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    canonical_turn_id,
+                    str(message_id),
+                    str(self_id),
+                    str(group_id),
+                    str(user_id),
+                    sender_name,
+                    message_text,
+                    json.dumps(source_message_ids or [str(message_id)]),
+                    state,
+                    now,
+                    now,
+                    encode_metadata(metadata),
+                ),
+            )
+            return cursor.rowcount > 0
+
+    def update_transport_turn(
+        self,
+        canonical_turn_id: str,
+        *,
+        state: str,
+        metadata: dict[str, Any] | None = None,
+        source_message_ids: list[str] | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT metadata_json, source_message_ids_json FROM transport_turns WHERE canonical_turn_id = ?",
+                (canonical_turn_id,),
+            ).fetchone()
+            if row is None:
+                return
+            merged = decode_metadata(row["metadata_json"])
+            merged.update(metadata or {})
+            ids_json = row["source_message_ids_json"]
+            if source_message_ids is not None:
+                ids_json = json.dumps([str(item) for item in source_message_ids])
+            connection.execute(
+                """
+                UPDATE transport_turns
+                SET state = ?, updated_at = ?, metadata_json = ?, source_message_ids_json = ?
+                WHERE canonical_turn_id = ?
+                """,
+                (state, utc_now(), encode_metadata(merged), ids_json, canonical_turn_id),
+            )
+
+    def recent_transport_turns(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM transport_turns ORDER BY updated_at DESC LIMIT ?
+                """,
+                (max(1, limit),),
+            ).fetchall()
+        return [
+            {
+                "canonical_turn_id": row["canonical_turn_id"],
+                "message_id": row["message_id"],
+                "self_id": row["self_id"],
+                "group_id": row["group_id"],
+                "user_id": row["user_id"],
+                "sender_name": row["sender_name"],
+                "message_text": row["message_text"],
+                "source_message_ids": json.loads(row["source_message_ids_json"]),
+                "state": row["state"],
+                "first_seen_at": row["first_seen_at"],
+                "updated_at": row["updated_at"],
+                "metadata": decode_metadata(row["metadata_json"]),
+            }
+            for row in rows
+        ]
 
     def append_event(
         self,

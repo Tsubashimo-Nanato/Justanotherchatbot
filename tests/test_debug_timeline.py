@@ -53,9 +53,16 @@ def test_debug_timeline_keeps_human_readable_decision_fields(tmp_path):
 
     assert timeline[0]["who"] == "Tsubashimo Nanato"
     assert timeline[0]["message"] == "going to work"
+    assert timeline[0]["status"] == "queued"
+    assert "read Tsubashimo Nanato: going to work" in timeline[0]["summary_lines"][0]
+    assert "queue: queued" in timeline[0]["summary_lines"][1]
     assert "window_title" not in timeline[0]
     assert timeline[1]["decision"] == "reply"
     assert timeline[1]["reply"] == "then eat first"
+    assert timeline[1]["status"] == "sent"
+    assert any("decision: reply" in line for line in timeline[1]["summary_lines"])
+    assert any("bot: then eat first" in line for line in timeline[1]["summary_lines"])
+    assert any("tokens:" in line and "api=1200/8/1208" in line for line in timeline[1]["summary_lines"])
     assert timeline[1]["tokens"]["prompt"] == 1200
     assert timeline[1]["tokens"]["local"]["total"] == 34
     assert timeline[1]["tokens"]["api"]["cached"] == 900

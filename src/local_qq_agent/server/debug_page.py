@@ -237,6 +237,12 @@ DEBUG_HTML = """<!doctype html>
       grid-template-columns: 1fr;
       gap: 0 12px;
     }
+    .compact-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .compact-textarea {
+      min-height: 72px;
+    }
     .metric-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -336,6 +342,26 @@ DEBUG_HTML = """<!doctype html>
       color: var(--muted);
       cursor: default;
     }
+    .debug-chat-controls {
+      display: grid;
+      grid-template-columns: minmax(160px, 1fr) minmax(120px, 180px);
+      gap: 10px;
+      align-items: end;
+    }
+    .credential-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 8px;
+    }
+    .credential {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      background: #f6f8fa;
+      overflow-wrap: anywhere;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 12px;
+    }
     .chat-bubble.selected {
       outline: 2px solid var(--blue);
     }
@@ -349,6 +375,15 @@ DEBUG_HTML = """<!doctype html>
     }
     .chat-text {
       white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .chat-detail {
+      margin-top: 6px;
+      padding-top: 6px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
       overflow-wrap: anywhere;
     }
     .mono-small {
@@ -409,7 +444,7 @@ DEBUG_HTML = """<!doctype html>
       <div class="status-pill"><strong>Model</strong><span id="topModel">not loaded</span></div>
       <div class="status-pill"><strong>Provider</strong><span id="topProvider">unloaded</span></div>
       <div class="status-pill"><strong>API Usage</strong><span id="topApiUsage">0 / ?</span></div>
-      <div class="status-pill"><strong>QQ</strong><span id="topQQ">unknown</span></div>
+      <div class="status-pill"><strong>OneBot</strong><span id="topQQ">disconnected</span></div>
       <div class="status-pill"><strong>Loop</strong><span id="topLoop">unknown</span></div>
       <div class="status-pill"><strong>Queue</strong><span id="topQueue">unknown</span></div>
       <div class="status-pill"><strong>Active</strong><span id="topActive">none</span></div>
@@ -422,7 +457,8 @@ DEBUG_HTML = """<!doctype html>
       <nav class="tabs" role="tablist" aria-label="Debug sections">
         <button id="tab-overview" class="tab-button" role="tab" aria-controls="panel-overview" onclick="activateTab('overview')">Overview</button>
         <button id="tab-chat" class="tab-button" role="tab" aria-controls="panel-chat" onclick="activateTab('chat')">Chat Test</button>
-        <button id="tab-qq" class="tab-button" role="tab" aria-controls="panel-qq" onclick="activateTab('qq')">QQ / Loop</button>
+        <button id="tab-debug-chat" class="tab-button" role="tab" aria-controls="panel-debug-chat" onclick="activateTab('debug-chat')">Debug Chat</button>
+        <button id="tab-qq" class="tab-button" role="tab" aria-controls="panel-qq" onclick="activateTab('qq')">OneBot / Loop</button>
         <button id="tab-provider" class="tab-button" role="tab" aria-controls="panel-provider" onclick="activateTab('provider')">Provider</button>
         <button id="tab-model" class="tab-button" role="tab" aria-controls="panel-model" onclick="activateTab('model')">Model</button>
         <button id="tab-settings" class="tab-button" role="tab" aria-controls="panel-settings" onclick="activateTab('settings')">Settings / Social</button>
@@ -435,13 +471,13 @@ DEBUG_HTML = """<!doctype html>
         <div id="panel-overview" class="tab-panel" role="tabpanel" aria-labelledby="tab-overview">
           <section>
             <h2>Overview</h2>
-            <p>Refresh checks model, memory, QQ, web and loop state. Runtime shows process, GPU and latest token metrics.</p>
+            <p>Refresh checks model, memory, OneBot, web and loop state. Runtime shows process, GPU and latest token metrics.</p>
             <div class="actions">
               <button id="refreshButton" onclick="loadStatus()">Refresh</button>
               <button id="runtimeButton" class="secondary" onclick="loadModelRuntime()">Model runtime</button>
               <button id="eventsButton" class="secondary" onclick="loadEvents()">Recent events</button>
               <button id="memoryButton" class="secondary" onclick="loadMemory()">Memory</button>
-              <button id="qqStatusButton" class="secondary" onclick="loadQQStatus()">QQ status</button>
+              <button id="qqStatusButton" class="secondary" onclick="loadQQStatus()">OneBot status</button>
             </div>
           </section>
 
@@ -449,11 +485,28 @@ DEBUG_HTML = """<!doctype html>
             <h2>Quick State</h2>
             <div class="metric-grid">
               <div class="metric"><span class="label">Model profile</span><span id="metricModel" class="value">unknown</span></div>
-              <div class="metric"><span class="label">QQ armed</span><span id="metricQQ" class="value">unknown</span></div>
+              <div class="metric"><span class="label">OneBot ready</span><span id="metricQQ" class="value">unknown</span></div>
               <div class="metric"><span class="label">API usage</span><span id="metricApiUsage" class="value">unknown</span></div>
               <div class="metric"><span class="label">Loop stage</span><span id="metricLoop" class="value">unknown</span></div>
               <div class="metric"><span class="label">Latest decision</span><span id="metricDecision" class="value">none</span></div>
             </div>
+          </section>
+
+          <section>
+            <h2>Public Remote Debug</h2>
+            <p>Starts a local Basic Auth proxy and exposes it through Cloudflare Tunnel when cloudflared is available.</p>
+            <div class="actions">
+              <button id="remoteDebugStartButton" class="danger" onclick="remoteDebugStart()">Expose debug UI</button>
+              <button id="remoteDebugStopButton" class="secondary" onclick="remoteDebugStop()">Stop public debug</button>
+              <button id="remoteDebugStatusButton" class="secondary" onclick="remoteDebugStatus()">Remote debug status</button>
+            </div>
+            <div class="credential-grid">
+              <div class="credential"><strong>URL</strong><br><span id="remoteDebugUrl">not running</span></div>
+              <div class="credential"><strong>User</strong><br><span id="remoteDebugUser">-</span></div>
+              <div class="credential"><strong>Password</strong><br><span id="remoteDebugPassword">-</span></div>
+              <div class="credential"><strong>Status</strong><br><span id="remoteDebugState">unknown</span></div>
+            </div>
+            <div id="remoteDebugSummary" class="summary-box activity">Remote debug is not loaded.</div>
           </section>
         </div>
 
@@ -509,29 +562,67 @@ DEBUG_HTML = """<!doctype html>
           </section>
         </div>
 
+        <div id="panel-debug-chat" class="tab-panel" role="tabpanel" aria-labelledby="tab-debug-chat">
+          <section>
+            <h2>Debug Chat Instance</h2>
+            <p>One-on-one chat for debugging the active bot. It reads current persona and memory, but does not write main memory or touch the QQ loop.</p>
+            <div class="actions">
+              <button id="debugChatStartButton" onclick="debugChatStart()">Start debug chat</button>
+              <button id="debugChatStopButton" class="secondary" onclick="debugChatStop()">Stop and clear session</button>
+              <button id="debugChatStatusButton" class="secondary" onclick="debugChatStatus()">Debug chat status</button>
+            </div>
+            <div id="debugChatStatusBox" class="summary-box activity">Debug chat is not loaded.</div>
+          </section>
+
+          <section>
+            <h2>Live Chat</h2>
+            <div id="debugChatTranscript" class="chat-window">Start the debug chat instance first.</div>
+            <div class="debug-chat-controls">
+              <div>
+                <label for="debugChatUser">User name</label>
+                <input id="debugChatUser" value="debugger">
+              </div>
+              <div>
+                <label for="debugChatMaxTokens">Max tokens</label>
+                <input id="debugChatMaxTokens" type="number" min="1" max="2048" value="700">
+              </div>
+              <div class="wide">
+                <label for="debugChatMessage">Message</label>
+                <textarea id="debugChatMessage" placeholder="Talk to the bot without touching QQ or memory."></textarea>
+              </div>
+            </div>
+            <button id="debugChatSendButton" onclick="debugChatSend()">Send debug message</button>
+          </section>
+
+          <section>
+            <h2>Last Debug Result</h2>
+            <div id="debugChatMetrics" class="summary-box activity">No debug chat result yet.</div>
+          </section>
+        </div>
+
         <div id="panel-qq" class="tab-panel" role="tabpanel" aria-labelledby="tab-qq">
           <section>
-            <h2>QQ Control</h2>
-            <p>Open the target QQ group window first. Send obeys arm state, group verification and config dry_run.</p>
+            <h2>NapCat / OneBot</h2>
+            <p>NapCat connects to this service through reverse WebSocket. No QQ window automation is used.</p>
             <div class="actions">
-              <button id="qqArmButton" onclick="qqArm()">Arm</button>
-              <button id="qqDisarmButton" class="danger" onclick="qqDisarm()">Disarm</button>
-              <button id="qqProbeButton" class="secondary" onclick="qqProbe()">Probe window</button>
-              <button id="qqReadButton" class="secondary" onclick="qqRead()">Read visible QQ</button>
-              <button id="qqScrollbackButton" class="secondary" onclick="qqScrollback()">Read scrollback</button>
-              <button class="secondary" onclick="loadQQStatus()">QQ status</button>
+              <button id="qqStatusButtonPanel" onclick="loadQQStatus()">Connection status</button>
+              <button id="onebotGroupsButton" class="secondary" onclick="loadOneBotGroups()">List groups</button>
+              <button id="onebotEventsButton" class="secondary" onclick="loadOneBotEvents()">Recent events</button>
             </div>
-            <label for="qqText">QQ text</label>
+            <label for="onebotGroupId">Target group ID</label>
+            <input id="onebotGroupId" placeholder="Select an ID returned by List groups">
+            <button id="onebotSelectGroupButton" class="secondary" onclick="selectOneBotGroup()">Select group</button>
+            <label for="qqText">Test message</label>
             <textarea id="qqText">dry run test message</textarea>
-            <button id="qqSendButton" class="danger" onclick="qqSend()">Send through QQ adapter</button>
+            <button id="qqSendButton" class="danger" onclick="qqSend()">Send through OneBot</button>
           </section>
 
           <section>
             <h2>Agent Loop</h2>
-            <p>Reads the configured QQ group, records visible context, and processes queued target messages.</p>
+            <p>Consumes OneBot events, batches consecutive turns, and processes them in order.</p>
             <div class="actions">
-              <button id="loopStartButton" onclick="loopStart()">Start loop</button>
-              <button id="loopStopButton" class="danger" onclick="loopStop()">Stop loop</button>
+              <button id="loopStartButton" onclick="loopStart()">Loop on</button>
+              <button id="loopStopButton" class="danger" onclick="loopStop()">Loop off</button>
               <button id="loopTickButton" class="secondary" onclick="loopTick()">Tick once</button>
               <button id="loopScrollbackButton" class="secondary" onclick="loopCollectScrollback()">Collect scrollback</button>
               <button id="loopStatusButton" class="secondary" onclick="loopStatus()">Loop status</button>
@@ -547,17 +638,22 @@ DEBUG_HTML = """<!doctype html>
         <div id="panel-provider" class="tab-panel" role="tabpanel" aria-labelledby="tab-provider">
           <section>
             <h2>Provider Runtime</h2>
-            <p>Deploy now starts the active hybrid local model by default. Hybrid uses local gate/utility calls and Grok for final replies when an API key is configured.</p>
+            <p>Qwen persona mode is the default local production path. Legacy raw Qwen is only for model diagnostics; hybrid Grok keeps the API final-reply route available.</p>
             <label for="providerSelect">Active provider</label>
             <select id="providerSelect">
               <option value="unloaded">unloaded</option>
-              <option value="local">local</option>
-              <option value="hybrid">hybrid: local gate + Grok final</option>
+              <option value="local_raw">legacy raw qwen: no persona/context</option>
+              <option value="qwen">qwen: persona + long context</option>
+              <option value="hybrid">hybrid grok: qwen local + API final</option>
+              <option value="local">legacy local</option>
               <option value="grok">grok</option>
             </select>
             <div class="actions">
               <button id="providerStatusButton" class="secondary" onclick="loadProviderStatus()">Provider status</button>
               <button id="providerSwitchButton" class="danger" onclick="switchProvider()">Switch provider</button>
+              <button class="secondary" onclick="switchProviderTo('qwen')">Qwen persona ON</button>
+              <button class="secondary" onclick="switchProviderTo('local_raw')">Legacy raw Qwen</button>
+              <button class="secondary" onclick="switchProviderTo('hybrid')">Hybrid Grok ON</button>
               <button id="providerTestButton" onclick="testProvider()">Test provider</button>
               <button id="providerSoakButton" class="secondary" onclick="runProviderSoak()">Run duplicate soak</button>
             </div>
@@ -608,6 +704,34 @@ DEBUG_HTML = """<!doctype html>
           </section>
 
           <section>
+            <h2>Raw Local Chat</h2>
+            <p>Calls the local OpenAI-compatible endpoint with one user message only. No persona, memory, web, gate, or custom system prompt is added.</p>
+            <label for="rawLocalMessage">Message</label>
+            <textarea id="rawLocalMessage">你好，直接用模型本身的能力随便聊两句。</textarea>
+            <div class="form-grid compact-grid">
+              <div>
+                <label for="rawLocalMaxTokens">Max new tokens</label>
+                <input id="rawLocalMaxTokens" type="number" min="1" max="4096" value="512">
+              </div>
+              <div>
+                <label for="rawLocalTemperature">Temperature</label>
+                <input id="rawLocalTemperature" type="number" min="0" max="2" step="0.05" value="0.7">
+              </div>
+              <div>
+                <label for="rawLocalTopP">Top P</label>
+                <input id="rawLocalTopP" type="number" min="0" max="1" step="0.05" value="0.9">
+              </div>
+            </div>
+            <label for="rawLocalStop">Stop sequences, one per line</label>
+            <textarea id="rawLocalStop" class="compact-textarea"></textarea>
+            <div class="actions">
+              <button id="rawLocalChatButton" onclick="rawLocalChat()">Run raw local chat</button>
+              <button class="secondary" onclick="switchProviderTo('local_raw')">Use legacy raw Qwen in QQ loop</button>
+              <button class="secondary" onclick="switchProviderTo('qwen')">Use Qwen persona in QQ loop</button>
+            </div>
+          </section>
+
+          <section>
             <h2>Offload Benchmark</h2>
             <p>Temporarily restarts the model server across current IQ2M GPU/RAM profiles, records speed and memory snapshots, then restores the active model profile.</p>
             <label for="offloadProfiles">Profiles</label>
@@ -631,6 +755,11 @@ qwen3-30b-iq2m-cpu-ram</textarea>
             </select>
             <label for="activityLevel">Activity <span id="activityValue" class="inline-value">0.35</span></label>
             <input id="activityLevel" type="range" min="0" max="1" step="0.05" value="0.35" oninput="updateSettingLabels()">
+            <label for="debugMode">Debug mode</label>
+            <select id="debugMode">
+              <option value="0">0 default: reply policy for all users</option>
+              <option value="1">1 target only: show no-reply reasons</option>
+            </select>
             <div class="actions">
               <button id="settingsApplyButton" onclick="applyAgentSettings()">Apply settings</button>
               <button id="settingsLoadButton" class="secondary" onclick="loadAgentSettings()">Load settings</button>
@@ -860,6 +989,8 @@ qwen3-30b-iq2m-cpu-ram</textarea>
     let latestLoopStatus = null;
     let latestTimelineItems = [];
     let selectedTimelineItem = null;
+    let latestDebugChatStatus = null;
+    let latestRemoteDebugStatus = null;
     const maxOutputEntries = 60;
 
     function activateTab(name) {
@@ -949,6 +1080,12 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       }
       if (operation === "provider_status" || operation === "provider_switch" || operation === "provider_key") {
         return summarizeProviderOutput(result);
+      }
+      if (operation.startsWith("debug_chat")) {
+        return summarizeDebugChatOutput(result);
+      }
+      if (operation.startsWith("remote_debug")) {
+        return summarizeRemoteDebugOutput(result);
       }
       return summarizeGenericOutput(operation, result);
     }
@@ -1105,11 +1242,16 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       const onclick = selectable ? ` onclick="selectTimelineItem(${index})"` : "";
       const label = isAgent ? "bot" : (item.who || "unknown");
       const text = item.reply || item.message || item.reason || "";
+      const details = Array.isArray(item.summary_lines) ? item.summary_lines.slice(1, 4) : [];
+      const detailHtml = details.length
+        ? `<div class="chat-detail">${details.map((line) => escapeHtml(shortLine(line, 180))).join("<br>")}</div>`
+        : "";
       const decision = item.decision && kind !== "group_message" ? ` · ${escapeHtml(item.decision)}` : "";
       return `
         <button class="${classes.join(" ")}" type="button"${onclick}>
           <div class="chat-meta"><span>${escapeHtml(shortTime(item.time))} · #${item.event_id} · ${escapeHtml(label)}${decision}</span><span>${item.sent === true ? "sent" : ""}</span></div>
           <div class="chat-text">${escapeHtml(text || "(empty)")}</div>
+          ${detailHtml}
         </button>
       `;
     }
@@ -1135,7 +1277,97 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       renderChatTimeline(latestTimelineItems);
     }
 
+    function renderDebugChatStatus(status) {
+      latestDebugChatStatus = status || null;
+      const transcript = Array.isArray(status?.transcript) ? status.transcript : [];
+      const statusLines = [
+        `enabled: ${status?.enabled ?? false}`,
+        `session: ${status?.session_id || ""}`,
+        `messages: ${status?.message_count ?? transcript.length}`,
+        `log: ${status?.log_path || ""}`,
+      ];
+      document.getElementById("debugChatStatusBox").textContent = statusLines.join("\\n");
+      renderDebugChatTranscript(transcript);
+      renderDebugChatMetrics(status?.latest_result || null);
+    }
+
+    function renderDebugChatTranscript(transcript) {
+      const element = document.getElementById("debugChatTranscript");
+      if (!element) {
+        return;
+      }
+      if (!Array.isArray(transcript) || !transcript.length) {
+        element.textContent = latestDebugChatStatus?.enabled ? "No debug chat messages yet." : "Start the debug chat instance first.";
+        return;
+      }
+      element.innerHTML = transcript.map((turn) => {
+        const classes = ["chat-bubble"];
+        if (turn.role === "assistant") {
+          classes.push("agent");
+        }
+        return `
+          <div class="${classes.join(" ")}">
+            <div class="chat-meta"><span>${escapeHtml(shortTime(turn.created_at))} 路 ${escapeHtml(turn.role || "")}</span></div>
+            <div class="chat-text">${escapeHtml(turn.content || "")}</div>
+          </div>
+        `;
+      }).join("");
+      scrollToBottom(element);
+    }
+
+    function renderDebugChatMetrics(result) {
+      const element = document.getElementById("debugChatMetrics");
+      if (!element) {
+        return;
+      }
+      if (!result) {
+        element.textContent = "No debug chat result yet.";
+        return;
+      }
+      const usage = result.usage || {};
+      const tps = result.tokens_per_second || {};
+      const lines = [
+        `reply: ${result.reply || ""}`,
+        `would_reply: ${result.would_reply ?? "?"}`,
+        `reason: ${result.debug_reason || ""}`,
+        `parse: ${result.parse_status || ""}`,
+        `model: ${result.model || ""}`,
+        `elapsed: ${result.elapsed_seconds ?? "?"}s, latency: ${result.latency_seconds ?? "?"}s`,
+        `tokens: prompt=${usage.prompt_tokens ?? usage.input_tokens ?? "?"}, completion=${usage.completion_tokens ?? usage.output_tokens ?? "?"}, total=${usage.total_tokens ?? "?"}`,
+        `tok/s: prompt=${tps.prompt_tokens ?? tps.input_tokens ?? "?"}, completion=${tps.completion_tokens ?? tps.output_tokens ?? "?"}, total=${tps.total_tokens ?? "?"}`,
+        `rewrite: ${result.rewrite?.used ?? false} ${result.rewrite?.reason || ""}`,
+        `memory read: ${result.memory?.count ?? 0} lines`,
+      ];
+      element.textContent = lines.join("\\n");
+      scrollToBottom(element);
+    }
+
+    function renderRemoteDebugStatus(status) {
+      latestRemoteDebugStatus = status || null;
+      document.getElementById("remoteDebugUrl").textContent = status?.public_url || "not running";
+      document.getElementById("remoteDebugUser").textContent = status?.username || "-";
+      document.getElementById("remoteDebugPassword").textContent = status?.password || "-";
+      document.getElementById("remoteDebugState").textContent = status?.running ? "running" : (status?.error || "stopped");
+      const lines = [
+        `running: ${status?.running ?? false}`,
+        `proxy: ${status?.proxy_running ?? false} ${status?.local_proxy_url || ""}`,
+        `tunnel: ${status?.tunnel_running ?? false}`,
+        `public: ${status?.public_url || ""}`,
+        `user: ${status?.username || ""}`,
+        `password: ${status?.password || ""}`,
+        `cloudflared: ${status?.cloudflared || ""}`,
+        `error: ${status?.error || "none"}`,
+      ];
+      document.getElementById("remoteDebugSummary").textContent = lines.join("\\n");
+    }
+
     function formatTimelineItem(item) {
+      if (Array.isArray(item.summary_lines) && item.summary_lines.length) {
+        return item.summary_lines.map((line) => shortLine(line, 240)).join("\\n");
+      }
+      if (item.summary) {
+        return shortLine(item.summary, 320);
+      }
       const time = shortTime(item.time);
       const who = item.who || "unknown";
       const message = item.message ? ` said "${shortLine(item.message, 120)}"` : "";
@@ -1209,6 +1441,45 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         `provider: ${provider.active_provider || "unknown"} model=${grok.model || "unknown"}`,
         `api key: ${grok.api_key_configured ? grok.api_key_masked || "configured" : "missing"}`,
         `usage: prompt=${formatInteger(budget.prompt_tokens)} completion=${formatInteger(budget.completion_tokens)} total=${formatInteger(budget.total_tokens)}`,
+      ];
+    }
+
+    function summarizeDebugChatOutput(result) {
+      if (!result || typeof result !== "object") {
+        return ["debug chat: no result"];
+      }
+      const latest = result.latest_result || result;
+      const usage = latest.usage || {};
+      const tps = latest.tokens_per_second || {};
+      const lines = [
+        `debug chat: enabled=${result.enabled ?? latest.enabled ?? "?"} session=${result.session_id || latest.session_id || ""}`,
+      ];
+      if (latest.reply) {
+        lines.push(`reply: ${shortLine(latest.reply)}`);
+      }
+      if (latest.debug_reason) {
+        lines.push(`reason: ${shortLine(latest.debug_reason)}`);
+      }
+      if (latest.model || latest.latency_seconds !== undefined) {
+        lines.push(`model: ${latest.model || "unknown"} latency=${latest.latency_seconds ?? "?"}s elapsed=${latest.elapsed_seconds ?? "?"}s`);
+      }
+      if (Object.keys(usage).length) {
+        lines.push(`tokens: prompt=${usage.prompt_tokens ?? usage.input_tokens ?? "?"} completion=${usage.completion_tokens ?? usage.output_tokens ?? "?"} total=${usage.total_tokens ?? "?"} tok/s=${tps.completion_tokens ?? tps.output_tokens ?? "?"}`);
+      }
+      lines.push(`log: ${latest.log_path || result.log_path || ""}`);
+      return lines;
+    }
+
+    function summarizeRemoteDebugOutput(result) {
+      if (!result || typeof result !== "object") {
+        return ["remote debug: no result"];
+      }
+      return [
+        `remote debug: running=${result.running ?? false} proxy=${result.proxy_running ?? false} tunnel=${result.tunnel_running ?? false}`,
+        `url: ${result.public_url || "not available"}`,
+        `user: ${result.username || "-"}`,
+        `password: ${result.password || "-"}`,
+        `error: ${result.error || "none"}`,
       ];
     }
 
@@ -1654,23 +1925,39 @@ qwen3-30b-iq2m-cpu-ram</textarea>
           `loop running: ${(result.loop_status || {}).running ?? "unknown"}`
         ].join("\\n");
       }
+      if (operation === "raw_local_chat") {
+        const usage = result.usage || {};
+        const tps = result.tokens_per_second || {};
+        return [
+          "Raw local chat completed.",
+          `model: ${result.model || "unknown"}`,
+          `latency: ${result.latency_seconds ?? "unknown"}s`,
+          `usage: ${formatUsageLine(usage)}`,
+          `completion tok/s: ${tps.completion_tokens ?? "unknown"}`,
+          "",
+          result.content || ""
+        ].join("\\n");
+      }
       if (operation === "provider_status" || operation === "provider_switch" || operation === "provider_key") {
         const provider = result.provider || result;
         const budget = provider.budget || {};
         const grok = provider.grok || {};
         const routing = provider.routing || {};
+        const rawLocal = provider.raw_local || {};
         const latestUsage = latestTraceUsage(provider.latest_trace || {});
         return [
           "Provider updated.",
           `active: ${provider.active_provider || "unknown"}`,
           `routing: gate=${routing.gate || "?"} final=${routing.final || "?"} utility=${routing.utility || "?"}`,
+          `raw local: enabled=${rawLocal.enabled ?? false} max=${rawLocal.max_tokens ?? "?"} temp=${rawLocal.temperature ?? "?"} top_p=${rawLocal.top_p ?? "?"}`,
           `grok model: ${grok.model || "unknown"}`,
           `api key: ${grok.api_key_configured ? grok.api_key_masked || "configured" : "missing"}`,
           `usage telemetry: total=${formatInteger(budget.total_tokens)}, prompt=${formatInteger(budget.prompt_tokens)}, completion=${formatInteger(budget.completion_tokens)}`,
           `smoke budget reference: ${formatInteger(budget.budget)} (${formatPercentRatio(budget.used_ratio)} used)`,
           `runtime input cap: ${formatInteger(provider.runtime?.per_message_input_token_budget)} est. tokens/message`,
           `latest trace usage: ${latestUsage ? formatUsageLine(latestUsage) : "none"}`,
-          `cloud loop allowed: ${(provider.safety || {}).cloud_loop_allowed ?? false}`
+          `cloud loop allowed: ${(provider.safety || {}).cloud_loop_allowed ?? false}`,
+          `QQ announcement: ${(result.announcement || {}).sent ?? false} ${(result.announcement || {}).reason || ""}`
         ].join("\\n");
       }
       if (operation === "provider_duplicate_soak") {
@@ -1702,7 +1989,8 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         return [
           "Runtime settings loaded.",
           `default thinking: ${result.default_thinking_level ?? "unknown"}`,
-          `activity: ${Number(result.activity ?? 0).toFixed(2)}`
+          `activity: ${Number(result.activity ?? 0).toFixed(2)}`,
+          `debug mode: ${result.debug_mode ?? 0}`
         ].join("\\n");
       }
       if (operation === "social_state" || operation === "social_state_update") {
@@ -1749,6 +2037,9 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       if (settings.activity !== undefined) {
         document.getElementById("activityLevel").value = String(settings.activity);
       }
+      if (settings.debug_mode !== undefined) {
+        document.getElementById("debugMode").value = String(settings.debug_mode);
+      }
       updateSettingLabels();
     }
 
@@ -1781,11 +2072,14 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       const safety = provider.safety || {};
       const routing = provider.routing || {};
       const runtime = provider.runtime || {};
+      const rawLocal = provider.raw_local || {};
       const latestTrace = provider.latest_trace || {};
       const apiUsageLines = formatApiUsage(provider).split("\\n");
       const lines = [
         `provider: ${provider.active_provider || "unloaded"}`,
         `routing: gate=${routing.gate || "?"} final=${routing.final || "?"} utility=${routing.utility || "?"}`,
+        `raw local: enabled=${rawLocal.enabled ?? false} max=${rawLocal.max_tokens ?? "?"} temp=${rawLocal.temperature ?? "?"} top_p=${rawLocal.top_p ?? "?"}`,
+        `raw local context: ${rawLocal.instructions || "unknown"} / ${rawLocal.context || "unknown"}`,
         `grok model: ${grok.model || "unknown"}`,
         `grok endpoint: ${grok.endpoint || "chat_completions"}`,
         `reasoning: simple=${grok.reasoning?.simple_chat || "?"} final=${grok.reasoning?.final_reply || "?"} web=${grok.reasoning?.web_fact || "?"}`,
@@ -2044,7 +2338,7 @@ qwen3-30b-iq2m-cpu-ram</textarea>
 
       const baseStatus = cachedStatus || {};
       const loop = cachedLoopStatus || baseStatus.agent_loop || {};
-      const qq = baseStatus.qq || {};
+      const qq = baseStatus.onebot || {};
       const modelProfile = baseStatus.model_profile || {};
       const provider = baseStatus.provider || {};
       const activity = loop.activity || {};
@@ -2055,7 +2349,7 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       const modelText = `${modelProfile.active_profile || "unknown"} / ${modelProfile.model || "unknown"}`;
       const providerText = `${provider.active_provider || "unloaded"} ${provider.grok?.model || ""}`.trim();
       const apiUsageText = formatApiUsagePill(provider);
-      const qqText = `armed=${qq.armed ?? "?"} group=${qq.group_matched ?? "?"}`;
+      const qqText = `connected=${qq.connected ?? false} ready=${qq.ready ?? false} group=${qq.target_group_id || "unset"}`;
       const loopText = `running=${loop.running ?? "?"} ${activity.stage || ""}`.trim();
       const pendingCount = loop.pending_message_count ?? 0;
       const queuedCount = loop.queued_message_count ?? 0;
@@ -2080,6 +2374,12 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       setText("metricLoop", loopText);
       setText("metricDecision", latestText);
       syncProviderStatus(provider);
+      if (baseStatus.remote_debug) {
+        renderRemoteDebugStatus(baseStatus.remote_debug);
+      }
+      if (baseStatus.debug_chat) {
+        renderDebugChatStatus(baseStatus.debug_chat);
+      }
     }
 
     function setText(id, value) {
@@ -2428,11 +2728,19 @@ qwen3-30b-iq2m-cpu-ram</textarea>
         const result = await requestJson("/api/provider/switch", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({provider, restart_loop: true})
+          body: JSON.stringify({provider, restart_loop: true, announce_to_qq: true})
         });
         syncProviderStatus(result.provider);
         return result;
       });
+    }
+
+    async function switchProviderTo(provider) {
+      const select = document.getElementById("providerSelect");
+      if (select) {
+        select.value = provider;
+      }
+      await switchProvider();
     }
 
     async function saveProviderKey() {
@@ -2488,6 +2796,25 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       }));
     }
 
+    async function rawLocalChat() {
+      const stop = document.getElementById("rawLocalStop").value
+        .split(/\\r?\\n/)
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0);
+      const body = {
+        message: document.getElementById("rawLocalMessage").value,
+        max_tokens: Number(document.getElementById("rawLocalMaxTokens").value),
+        temperature: Number(document.getElementById("rawLocalTemperature").value),
+        top_p: Number(document.getElementById("rawLocalTopP").value),
+        stop
+      };
+      await runTimed("raw_local_chat", "rawLocalChatButton", async () => requestJson("/api/model/raw-chat", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body)
+      }));
+    }
+
     async function runOffloadBenchmark() {
       const profiles = document.getElementById("offloadProfiles").value
         .split(/\\r?\\n/)
@@ -2512,7 +2839,8 @@ qwen3-30b-iq2m-cpu-ram</textarea>
     async function applyAgentSettings() {
       const body = {
         default_thinking_level: Number(document.getElementById("thinkLevel").value),
-        activity: Number(document.getElementById("activityLevel").value)
+        activity: Number(document.getElementById("activityLevel").value),
+        debug_mode: Number(document.getElementById("debugMode").value)
       };
       await runTimed("agent_settings_update", "settingsApplyButton", async () => {
         const result = await requestJson("/api/agent/settings", {
@@ -2613,10 +2941,10 @@ qwen3-30b-iq2m-cpu-ram</textarea>
     }
 
     async function loadQQStatus() {
-      await runTimed("qq_status", "qqStatusButton", async () => {
-        const result = await requestJson("/api/qq/status");
-        show("status", {qq: result});
-        renderTopStatus({qq: result}, null);
+      await runTimed("onebot_status", "qqStatusButton", async () => {
+        const result = await requestJson("/api/onebot/status");
+        show("status", {onebot: result});
+        renderTopStatus({onebot: result}, null);
         return result;
       });
     }
@@ -2723,33 +3051,86 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       }));
     }
 
-    async function qqArm() {
-      await runTimed("qq_arm", "qqArmButton", async () => requestJson("/api/qq/arm", {method: "POST"}));
-      await refreshTopStatus();
+    async function debugChatStatus() {
+      const result = await runTimed("debug_chat_status", "debugChatStatusButton", async () => requestJson("/api/debug-chat/status"));
+      if (result) {
+        renderDebugChatStatus(result);
+      }
     }
 
-    async function qqDisarm() {
-      await runTimed("qq_disarm", "qqDisarmButton", async () => requestJson("/api/qq/disarm", {method: "POST"}));
-      await refreshTopStatus();
+    async function debugChatStart() {
+      const result = await runTimed("debug_chat_start", "debugChatStartButton", async () => requestJson("/api/debug-chat/start", {method: "POST"}));
+      if (result) {
+        renderDebugChatStatus(result);
+      }
     }
 
-    async function qqProbe() {
-      await runTimed("qq_probe", "qqProbeButton", async () => requestJson("/api/qq/probe", {method: "POST"}));
-      await refreshTopStatus();
+    async function debugChatStop() {
+      const result = await runTimed("debug_chat_stop", "debugChatStopButton", async () => requestJson("/api/debug-chat/stop", {method: "POST"}));
+      if (result) {
+        renderDebugChatStatus(result);
+      }
     }
 
-    async function qqRead() {
-      await runTimed("qq_read", "qqReadButton", async () => requestJson("/api/qq/read"));
-      await refreshTopStatus();
+    async function debugChatSend() {
+      const maxTokens = Number(document.getElementById("debugChatMaxTokens").value);
+      const body = {
+        user_name: document.getElementById("debugChatUser").value,
+        message: document.getElementById("debugChatMessage").value,
+        max_tokens: Number.isFinite(maxTokens) ? maxTokens : 700
+      };
+      const result = await runTimed("debug_chat_message", "debugChatSendButton", async () => requestJson("/api/debug-chat/message", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body)
+      }));
+      if (result) {
+        document.getElementById("debugChatMessage").value = "";
+        renderDebugChatStatus(result);
+      }
     }
 
-    async function qqScrollback() {
-      await runTimed("qq_scrollback", "qqScrollbackButton", async () => requestJson("/api/qq/read/scrollback?pages=3"));
-      await refreshLoopActivity();
+    async function remoteDebugStatus() {
+      const result = await runTimed("remote_debug_status", "remoteDebugStatusButton", async () => requestJson("/api/remote-debug/status"));
+      if (result) {
+        renderRemoteDebugStatus(result);
+      }
+    }
+
+    async function remoteDebugStart() {
+      const result = await runTimed("remote_debug_start", "remoteDebugStartButton", async () => requestJson("/api/remote-debug/start", {method: "POST"}));
+      if (result) {
+        renderRemoteDebugStatus(result);
+      }
+    }
+
+    async function remoteDebugStop() {
+      const result = await runTimed("remote_debug_stop", "remoteDebugStopButton", async () => requestJson("/api/remote-debug/stop", {method: "POST"}));
+      if (result) {
+        renderRemoteDebugStatus(result);
+      }
+    }
+
+    async function loadOneBotGroups() {
+      await runTimed("onebot_groups", "onebotGroupsButton", async () => requestJson("/api/onebot/groups"));
+    }
+
+    async function loadOneBotEvents() {
+      await runTimed("onebot_events", "onebotEventsButton", async () => requestJson("/api/onebot/events/recent?limit=50"));
+    }
+
+    async function selectOneBotGroup() {
+      const groupId = document.getElementById("onebotGroupId").value.trim();
+      await runTimed("onebot_group_select", "onebotSelectGroupButton", async () => requestJson("/api/onebot/group/select", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({group_id: groupId})
+      }));
+      await refreshTopStatus();
     }
 
     async function qqSend() {
-      await runTimed("qq_send", "qqSendButton", async () => requestJson("/api/qq/send", {
+      await runTimed("onebot_send", "qqSendButton", async () => requestJson("/api/onebot/send-test", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({text: document.getElementById("qqText").value})
@@ -2857,6 +3238,8 @@ qwen3-30b-iq2m-cpu-ram</textarea>
       loadStatus();
       loadGlobalSocialState();
       loadSocialUsers();
+      remoteDebugStatus();
+      debugChatStatus();
       refreshLoopActivity();
       refreshDebugTimeline();
       window.setInterval(refreshLoopActivity, 1000);
